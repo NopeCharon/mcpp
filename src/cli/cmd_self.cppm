@@ -8,6 +8,7 @@ module;
 export module mcpp.cli.cmd_self;
 
 import std;
+import mcpp.build.engine_package;
 import mcpplibs.cmdline;
 import mcpp.doctor;
 import mcpp.toolchain.fingerprint;   // MCPP_VERSION
@@ -58,6 +59,10 @@ nlohmann::json env_data_readonly() {
                            ("xlings" + std::string(mcpp::platform::exe_suffix)))},
         {"config",       s(config)},
         {"buildCache",   s(mcpp::home::cache_root())},
+        // The engine interface a build program imports, as a package directory
+        // (mcpp#797): written by the first build program of this version, read
+        // by an editor (`mcpp:core` in the build database).
+        {"engineModules", s(mcpp::build::engine::package_dir())},
         {"mcppVersion",  std::string(mcpp::toolchain::MCPP_VERSION)},
         // What a build with nothing configured resolves on this host (WS8):
         // the one function the first run uses. Probing for a usable MSVC is
@@ -111,10 +116,14 @@ export int cmd_why(const mcpplibs::cmdline::ParsedArgs& parsed) {
         if (topic == "sources" || topic == "tool" || topic == "payload")
             return mcpp::doctor::why_sources_json(topic, parsed.positional(1),
                                                   parsed.option_or_empty("features").value());
+        if (topic == "build-programs" || topic == "compat")
+            return mcpp::doctor::why_build_programs_or_compat_json(
+                topic, parsed.option_or_empty("features").value());
         if (!topic.empty() && topic != "toolchain") {
             std::println(stderr,
-                "error: --format json is defined for `mcpp why toolchain` and "
-                "`mcpp why sources|tool|payload`; '{}' has no machine-readable "
+                "error: --format json is defined for `mcpp why toolchain`, "
+                "`mcpp why sources|tool|payload`, `mcpp why build-programs` and "
+                "`mcpp why compat`; '{}' has no machine-readable "
                 "shape yet", topic);
             return 2;
         }

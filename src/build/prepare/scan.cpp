@@ -18,6 +18,7 @@ import mcpp.modgraph.glob;
 import mcpp.modgraph.graph;
 import mcpp.modgraph.scanner;
 import mcpp.modgraph.validate;
+import mcpp.modgraph.library_interface;
 import mcpp.toolchain.hostflags;   // the compile-token producer the package std module reuses
 import mcpp.toolchain.cppfly;
 import mcpp.toolchain.detect;
@@ -91,7 +92,7 @@ static std::expected<bool, std::string> step11_scan_sources(PrepareState& state)
         };
         std::map<std::size_t, std::vector<std::size_t>> codeEdges;
         for (auto const& e : state.dependencyEdges) {
-            if (!e.requestedArtifacts.empty() || e.buildOnly) continue;
+            if (!e.requestedArtifacts.empty() || e.buildTable) continue;
             codeEdges[e.consumerPackageIndex].push_back(e.dependencyPackageIndex);
         }
         for (std::size_t i = 0; i < state.packages.size(); ++i) {
@@ -950,24 +951,27 @@ static void step11_public_module_check(PrepareState& state) {
     std::map<std::string, std::set<std::string>> publicOf;
     for (std::size_t i = 1; i < state.packages.size(); ++i) {
         auto const& pr = state.packages[i];
-        if (!workspace_member_of(state, pr.root).empty()) continue;
-        const auto rootFile = (pr.root / mcpp::manifest::resolve_lib_root_path(pr.manifest, pr.root))
-                                  .lexically_normal();
-        std::error_code ec;
-        if (!std::filesystem::is_regular_file(rootFile, ec)) continue;
-        const mcpp::modgraph::SourceUnit* rootUnit = nullptr;
-        for (auto const& u : g.units)
-            if (u.path.lexically_normal() == rootFile && u.provides) { rootUnit = &u; break; }
-        if (!rootUnit) continue;
-        std::set<std::string> pub{primary(rootUnit->provides->logicalName)};
-        std::vector<std::string> work(pub.begin(), pub.end());
-        while (!work.empty()) {
-            auto mod = work.back(); work.pop_back();
-            for (auto const* u : unitsOf[mod])
-                for (auto const& re : u->reexports)
-                    if (auto p = primary(re.logicalName); pub.insert(p).second) work.push_back(p);
+        // A declared interface root that names no file: the package's own build
+        // refuses it (modgraph::validate); here, where the package is a
+        // dependency, it is reported (mcpp#797, SPEC-008 D14).
+        if (!pr.manifest.lib.path.empty()) {
+            std::error_code lec;
+            const auto declared = pr.root / mcpp::manifest::resolve_lib_root_path(pr.manifest, pr.root);
+            if (!std::filesystem::is_regular_file(declared, lec))
+                mcpp::diag::warning("build/interface", std::format(
+                    "'{}' states [lib] path = '{}', which names no file; it states no "
+                    "interface root to its consumers", qualified(pr.manifest),
+                    pr.manifest.lib.path.generic_string()));
         }
-        publicOf[qualified(pr.manifest)] = std::move(pub);
+        if (!workspace_member_of(state, pr.root).empty()) continue;
+        // One definition of what a library offers (mcpp.modgraph.library_interface).
+        const auto iface = mcpp::modgraph::library_interface(
+            g, pr.manifest, pr.root, qualified(pr.manifest),
+            i < state.activeFeaturesByPackage.size() ? state.activeFeaturesByPackage[i]
+                                                     : std::vector<std::string>{});
+        // A dependency without an interface root states no interface.
+        if (iface.rootModule.empty()) continue;
+        publicOf[qualified(pr.manifest)] = iface.publicModules;
     }
 
     std::set<std::string> warned;
@@ -997,6 +1001,7 @@ static void step11_public_module_check(PrepareState& state) {
 std::expected<void, std::string> phase11_scan(PrepareState& state) {
     auto needsStdModule = step11_scan_sources(state);
     if (!needsStdModule) return std::unexpected(needsStdModule.error());
+    if (auto r = refuse_plugin_units_in_target(state); !r) return std::unexpected(r.error());
     step11_public_module_check(state);
 
     if (auto r = step11_dependency_standard_scope_check(state); !r)

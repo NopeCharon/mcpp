@@ -8,6 +8,7 @@ import :state;
 import mcpp.build.prepare_inputs;
 
 import std;
+import mcpp.build.engine_package;
 import mcpp.diag;
 import mcpp.build.refusal;
 import mcpp.build.version_floor;
@@ -297,6 +298,12 @@ static std::expected<void, std::string> step1_define_early_toolchain_closures(Pr
         if (auto c = state.get_cfg(true)) roots.push_back((*c)->xlingsHome() / "data" / "xpkgs");
         for (auto& d : mcpp::config::project_xlings_data_roots(state.workRoot))
             roots.push_back(d / "xpkgs");
+        if (!state.overrides.project_index_root.empty())
+            for (auto& d : mcpp::config::project_xlings_data_roots(state.overrides.project_index_root))
+                roots.push_back(d / "xpkgs");
+        // The engine interface's package: written once per mcpp version and
+        // never edited, like a payload (mcpp#797).
+        roots.push_back(mcpp::build::engine::root());
         return roots;
     }();
 
@@ -1003,12 +1010,13 @@ static std::expected<void, std::string> step1_target_and_static_overrides(Prepar
     // Target-axis default resolution when no --target flag was passed:
     // [build] target (project default, ≙ cargo build.target) >
     // [toolchain] default_target (global config) > host.
-    if (state.overrides.target_triple.empty() && !state.m->buildConfig.target.empty())
+    if (state.overrides.target_triple.empty() && !state.m->buildConfig.target.empty()
+        && !state.overrides.host_target)
         state.overrides.target_triple = state.m->buildConfig.target;
     // Remembered, not requested: this one came out of the global config, so
     // it must not outrank anything the user wrote down (see the pin below).
     bool targetFromGlobalDefault = false;
-    if (state.overrides.target_triple.empty()) {
+    if (state.overrides.target_triple.empty() && !state.overrides.host_target) {
         if (auto cfg = state.get_cfg(true); cfg && !(*cfg)->defaultTarget.empty()) {
             state.overrides.target_triple = (*cfg)->defaultTarget;
             targetFromGlobalDefault = true;
@@ -1217,6 +1225,14 @@ static std::expected<void, std::string> step1_device_axis_and_layer_merge(Prepar
 }
 
 std::expected<void, std::string> phase1_toolchain_spec_and_axes(PrepareState& state) {
+    // P3 (mcpp#797): a build plugin built as the root is planned for this
+    // machine with the engine interface, decided before the toolchain is.
+    if (!state.m->package.virtualRoot)
+        if (auto r = configure_build_plugin_root(
+                state, *state.m, *state.root,
+                feature_closure(*state.m, parse_feature_request(state.overrides.features)));
+            !r)
+            return std::unexpected(r.error());
     if (auto r = step1_define_early_toolchain_closures(state); !r) return std::unexpected(r.error());
     if (auto r = step1_target_and_static_overrides(state); !r) return std::unexpected(r.error());
     if (auto r = step1_device_axis_and_layer_merge(state); !r) return std::unexpected(r.error());

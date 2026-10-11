@@ -8,6 +8,8 @@ import mcpp.build.prepare_inputs;
 
 import std;
 import mcpp.diag;
+import mcpp.log;
+import mcpp.build.engine_package;
 import mcpp.build.refusal;
 import mcpp.xlings.address_set;
 import mcpp.build.version_floor;
@@ -244,7 +246,7 @@ static void recordDependencyEdge(
         std::size_t consumerDepIndex,
         std::size_t dependencyPackageIndex,
         const mcpp::manifest::DependencySpec& spec,
-        bool buildOnly,
+        bool buildTable,
         const std::string& writtenKey)
 {
         const auto consumerPackageIndex = packageIndexForConsumer(consumerDepIndex);
@@ -263,27 +265,53 @@ static void recordDependencyEdge(
                 .key = writtenKey,
                 .table = spec.declaredIn,
             });
+
+        // A REQUESTED FEATURE THAT IS A BUILD RULE IMPLIES THE LIBRARY.
+        //
+        // A feature declaring `rule_module` is usable only by a build program,
+        // so requesting it asks for the dependency's library there. Requiring
+        // `host-module` beside it was a second spelling of one fact.
+        bool ruleFeature = false;
+        {
+            auto const& depManifest = state.packages[dependencyPackageIndex].manifest;
+            for (auto const& f : spec.features)
+                if (depManifest.featureRuleModule.contains(f)) { ruleFeature = true; break; }
+        }
+        // COMPAT(host-module-in-dependencies): a `[dependencies]` entry asking
+        // for `host-module = true`, or for a rule feature, served the build
+        // program and not the target before the section decided the
+        // configuration (mcpp#797). It keeps that meaning, reported where the
+        // manifest can be edited.
+        // Not in the build programs' graph: every package there is a build-program
+        // instance already, and a library's rule features are what its edge asks.
+        if (!buildTable && !state.overrides.build_program_graph
+            && ((spec.hostModuleDeclared && spec.hostModule) || ruleFeature)) {
+            buildTable = true;
+            state.reportCompatUse("host-module-in-dependencies", consumerPackageIndex,
+                                  std::format("[dependencies] {}", writtenKey));
+        }
+        const bool wantsLibrary = buildTable
+            && (ruleFeature
+                || (spec.hostModuleDeclared ? spec.hostModule
+                                            : spec.tools.empty() && spec.artifacts.empty()));
+
+        // One edge per (consumer, dependency, visibility, configuration). The
+        // same package written in [dependencies] and [build-dependencies] of
+        // one consumer is two edges and two instances (mcpp#797, R2): merging
+        // them made the build-program request read as "not in the target".
         const auto visibility = parseVisibility(spec.visibility);
         auto same = [&](const DependencyEdge& edge) {
             return edge.consumerPackageIndex == consumerPackageIndex
                 && edge.dependencyPackageIndex == dependencyPackageIndex
-                && edge.visibility == visibility;
+                && edge.visibility == visibility
+                && edge.buildTable == buildTable;
         };
         auto it = std::find_if(state.dependencyEdges.begin(), state.dependencyEdges.end(), same);
         if (it != state.dependencyEdges.end()) {
-            // One consumer naming one dependency in BOTH tables. The ordinary
-            // declaration wins, because the build-time path never subtracts
-            // from what the project asked to link — stating the rule the other
-            // way round would let a `[build-dependencies]` line quietly drop a
-            // library the target needs.
-            if (!buildOnly) it->buildOnly = false;
-            // AND THE SECOND DECLARATION'S REQUESTS ARE KEPT (#649 E7). Both
-            // declarations name one edge, so what each asks of the dependency
-            // is asked of that edge: this used to return here and lose the
-            // second one's `tools`, `features`, `host-module` and `reexport`
-            // without a word, under `--strict` too. The rule is the one
-            // `mergeActiveFeatureDeps` already applies to a feature's
-            // restatement: additive fields union, `default-features` stays on
+            // One consumer restating one dependency in one table (an
+            // unconditional entry and a `[target.<sel>.*]` or `[feature-deps]`
+            // row): every declaration's requests are requested of the one edge
+            // (#649 E7). Additive fields union, `default-features` stays on
             // unless every declaration opts out.
             for (auto const& t : spec.tools)
                 if (std::ranges::find(it->requestedTools, t) == it->requestedTools.end())
@@ -297,29 +325,9 @@ static void recordDependencyEdge(
                     == it->requestedFeatures.end())
                     it->requestedFeatures.push_back(f);
             it->defaultFeatures = it->defaultFeatures || spec.defaultFeatures;
-            if (spec.hostModule) it->hostModule = true;
-            else if (dependencyPackageIndex < state.packages.size())
-                for (auto const& f : spec.features)
-                    if (state.packages[dependencyPackageIndex].manifest.featureRuleModule.contains(f)) {
-                        it->hostModule = true;
-                        break;
-                    }
+            it->wantsLibrary = it->wantsLibrary || wantsLibrary;
             it->reexport = it->reexport || spec.reexport;
             return;
-        }
-        // A REQUESTED FEATURE THAT IS A BUILD RULE IMPLIES `host-module`.
-        //
-        // `host-module = true` says "compile this dependency's interface unit
-        // for the host so my build program can import it", and a feature
-        // declaring `rule_module` has already said that is the only way to use
-        // it. Requiring both was a second spelling of one fact, and the failure
-        // when only the feature was written landed in the consumer's build as
-        // an unresolved import rather than in the line that was incomplete.
-        bool hostModule = spec.hostModule;
-        if (!hostModule && dependencyPackageIndex < state.packages.size()) {
-            auto const& depManifest = state.packages[dependencyPackageIndex].manifest;
-            for (auto const& f : spec.features)
-                if (depManifest.featureRuleModule.contains(f)) { hostModule = true; break; }
         }
         state.dependencyEdges.push_back(DependencyEdge{
             .consumerPackageIndex = consumerPackageIndex,
@@ -329,9 +337,9 @@ static void recordDependencyEdge(
             .defaultFeatures = spec.defaultFeatures,
             .requestedTools = spec.tools,
             .requestedArtifacts = spec.artifacts,
-            .hostModule = hostModule,
+            .buildTable = buildTable,
+            .wantsLibrary = wantsLibrary,
             .reexport = spec.reexport,
-            .buildOnly = buildOnly,
         });
 }
 
@@ -615,6 +623,7 @@ static std::expected<void, std::string> mergeActiveFeatureDeps(
                         == dst.features.end())
                         dst.features.push_back(f2);
                 dst.hostModule = dst.hostModule || spec.hostModule;
+                dst.hostModuleDeclared = dst.hostModuleDeclared || spec.hostModuleDeclared;
                 dst.reexport   = dst.reexport   || spec.reexport;
             }
         }
@@ -813,6 +822,16 @@ step4b_resolve_identity(PrepareState& state, WorklistItemCtx& ctx) {
             }
         }
 
+        // THE BUILD PROGRAMS' GRAPH TAKES EACH PACKAGE AT THE VERSION THE BUILD
+        // THAT ASKED RESOLVED (mcpp#797): one package, one version, across the
+        // two graphs, as the lock records it.
+        if (!state.overrides.resolution_pins.empty() && !spec.isPath() && !spec.isGit()) {
+            const auto shortName = spec.shortName.empty() ? name : spec.shortName;
+            const auto k = spec.namespace_.empty() ? shortName : spec.namespace_ + "." + shortName;
+            if (auto pin = state.overrides.resolution_pins.find(k);
+                pin != state.overrides.resolution_pins.end())
+                spec.version = "=" + pin->second;
+        }
         // Pin SemVer constraint before dedup/fetch.
         if (auto r = state.resolveSemver(spec, name); !r) {
             return std::unexpected(r.error());
@@ -1043,7 +1062,7 @@ step4b_identity_version_merge(PrepareState& state, WorklistItemCtx& ctx,
                     if (!secPackage) return std::unexpected(secPackage.error());
                     state.packages.push_back(std::move(*secPackage));
                     recordDependencyEdge(state, item.consumerDepIndex, depPackageIndex,
-                                         spec, item.buildOnly, name);
+                                         spec, item.fromBuildTable, name);
                     auto linkFlagsAdded = propagateLinkFlags(state, secStage, *state.dep_manifests.back());
 
                     ResolvedKey mangledKey{key.ns, mangledPackage};
@@ -1086,7 +1105,7 @@ step4b_identity_version_merge(PrepareState& state, WorklistItemCtx& ctx,
                     // no re-fetch needed; just record this consumer edge.
                     recordDependencyEdge(state, item.consumerDepIndex,
                                          it->second.depIndex + 1,
-                                         spec, item.buildOnly, name);
+                                         spec, item.fromBuildTable, name);
                     return {};
                 }
 
@@ -1146,7 +1165,7 @@ step4b_identity_version_merge(PrepareState& state, WorklistItemCtx& ctx,
                 state.packages[it->second.depIndex + 1] = std::move(*mergedPackage);
                 recordDependencyEdge(state, item.consumerDepIndex,
                                      it->second.depIndex + 1,
-                                     spec, item.buildOnly, name);
+                                     spec, item.fromBuildTable, name);
 
                 it->second.version            = *merged;
                 it->second.linkFlagsAdded     = std::move(linkFlagsAdded);
@@ -1284,7 +1303,7 @@ step4b_handle_already_resolved(PrepareState& state, WorklistItemCtx& ctx,
                 if (it->second.depIndex + 1 < state.packages.size()) {
                     recordDependencyEdge(state, item.consumerDepIndex,
                                          it->second.depIndex + 1,
-                                         spec, item.buildOnly, name);
+                                         spec, item.fromBuildTable, name);
                 }
                 return {};
             }
@@ -1360,7 +1379,7 @@ step4b_handle_already_resolved(PrepareState& state, WorklistItemCtx& ctx,
             if (it->second.depIndex + 1 < state.packages.size()) {
                 recordDependencyEdge(state, item.consumerDepIndex,
                                      it->second.depIndex + 1,
-                                     spec, item.buildOnly, name);
+                                     spec, item.fromBuildTable, name);
             }
             return {};
     return {};
@@ -1610,8 +1629,10 @@ step4b_acquire_dependency_source(PrepareState& state, WorklistItemCtx& ctx) {
             // git-hosted workspace inherits from ITS repository, anchored at
             // the clone.
             auto inheritAsMember = [&](const mcpp::manifest::Manifest& ws,
-                                       const std::filesystem::path& wsRoot) {
-                return inherit_as_workspace_member(*dep_manifest, ws, wsRoot, dep_root);
+                                       const std::filesystem::path& wsRoot,
+                                       bool reportPosition) {
+                return inherit_as_workspace_member(*dep_manifest, ws, wsRoot, dep_root,
+                                                   reportPosition);
             };
             // A rooted workspace's own package, the member "." of a workspace
             // plan (§15), is the workspace's manifest: it reads its own
@@ -1623,13 +1644,15 @@ step4b_acquire_dependency_source(PrepareState& state, WorklistItemCtx& ctx) {
                 mcpp::project::merge_workspace_deps(*dep_manifest, *state.wsManifest,
                                                     state.runtimeWorkspaceRoot);
                 mcpp::project::inherit_as_root_package(*dep_manifest,
-                                                       state.runtimeWorkspaceRoot);
+                                                       state.runtimeWorkspaceRoot,
+                                                       /*asBuildRoot=*/false);
             } else if (depIsMember) {
-                if (auto bad = inheritAsMember(*state.wsManifest, state.runtimeWorkspaceRoot))
+                if (auto bad = inheritAsMember(*state.wsManifest, state.runtimeWorkspaceRoot,
+                                               /*reportPosition=*/false))
                     return std::unexpected(*bad);
             } else if (!gitMember.empty()) {
                 if (auto rm = mcpp::manifest::load(gitMemberCloneRoot / "mcpp.toml")) {
-                    if (auto bad = inheritAsMember(*rm, gitMemberCloneRoot))
+                    if (auto bad = inheritAsMember(*rm, gitMemberCloneRoot, /*reportPosition=*/true))
                         return std::unexpected(*bad);
                 }
             }
@@ -1815,16 +1838,33 @@ step4b_finalize_dependency(PrepareState& state, WorklistItemCtx& ctx) {
                          : sourceKind == "path" ? ctx.dep_root.string()
                          : std::string{},
         });
+        // The engine interface (mcpp#797) is addressed in the dependency cache
+        // as it always was: by the engine's name and version, in the global
+        // cache, because its directory is immutable for that version.
+        if (sourceKind == "path" && mcpp::build::engine::is_engine_package(ctx.dep_root)) {
+            auto& ident = state.dep_cache_identities.back();
+            ident.indexName   = std::string(mcpp::build::engine::kCacheIndex);
+            ident.packageName = std::string(mcpp::build::engine::kCachePackage);
+            ident.version     = state.dep_manifests.back()->package.version;
+            ident.sourceKind  = "version";
+            ident.sourceRef.clear();
+        }
         const auto depPackageIndex = state.packages.size();
         auto depPackage = makePackageRoot(state, ctx.dep_root, *state.dep_manifests.back());
         if (!depPackage) return std::unexpected(depPackage.error());
         if (selectedMember) {
+            // P3 (mcpp#797): a selected member that is a build plugin.
+            if (auto r = configure_build_plugin_root(
+                    state, *state.dep_manifests.back(), ctx.dep_root,
+                    feature_closure(*state.dep_manifests.back(), {}));
+                !r)
+                return std::unexpected(r.error());
             depPackage->selectedMember = true;
             depPackage->memberProducts = state.selectedMembers.at(*selectedMember);
         }
         state.packages.push_back(std::move(*depPackage));
         recordDependencyEdge(state, item.consumerDepIndex, depPackageIndex, spec,
-                             item.buildOnly, name);
+                             item.fromBuildTable, name);
 
         // Record this dep as resolved so future encounters of the same
         // (ns, name) hit the fast path (skip / merge / conflict).
@@ -1923,7 +1963,8 @@ step4b_finalize_dependency(PrepareState& state, WorklistItemCtx& ctx) {
             state.worklist.push_back({child_name, childReq,
                                 thisDepLabel + " (build-dep)",
                                 childReq.version, selfIdx, ctx.dep_root,
-                                item.devOnly, /*buildOnly=*/true});
+                                item.devOnly, /*buildOnly=*/true,
+                                /*fromBuildTable=*/true});
         }
     return {};
 }
@@ -1959,149 +2000,6 @@ static std::expected<void, std::string> step4b_cycle_check(PrepareState& state) 
         }
     }
     return {};
-}
-
-static void step4b_define_lookup_closures(PrepareState& state) {
-    state.bareBindingsFor = [&](std::size_t consumer) {
-        std::vector<std::string> fqns;
-        if (consumer < state.provisionGraph.visible.size())
-            for (auto const& pr : state.provisionGraph.visible[consumer]) {
-                if (pr.provider >= state.packages.size()) continue;
-                auto const& n = state.packages[pr.provider].manifest.package.name;
-                if (std::find(fqns.begin(), fqns.end(), n) == fqns.end())
-                    fqns.push_back(n);
-            }
-        return prov::bind_bare_names(fqns);
-    };
-    // THE NAMES UNDER WHICH ONE PROVIDER IS PUBLISHED TO ONE CONSUMER, derived
-    // once for every channel (#647 E4.3). The manifest's `name`, the qualified
-    // `namespace.name` when the manifest writes the two apart, and the bare
-    // tail where the namespace ladder binds it to this provider for this
-    // consumer. `dep_dir`/`dep_linkage` and `dep_bin` used to derive this list
-    // separately; #642 added the qualified spelling to the first and the second
-    // kept publishing `MCPP_DEP_INSTALLER_BIN_*` alone for a package written
-    // `namespace = "spike"`, `name = "installer"`, so
-    // `dep_bin("spike.installer", ...)` read nothing.
-    state.publishedNamesFor =
-        [&](std::size_t provider,
-            const std::map<std::string, prov::BareBinding>& bind) {
-        std::vector<std::string> out;
-        auto const& manifest = state.packages[provider].manifest;
-        auto const& canon = manifest.package.name;
-        out.push_back(canon);
-        if (auto qualified = mcpp::build::qualified_package_name(manifest);
-            qualified != canon)
-            out.push_back(std::move(qualified));
-        if (auto tail = prov::tail_of(canon); tail != canon) {
-            auto it = bind.find(tail);
-            if (it != bind.end() && it->second.owner == canon)
-                out.push_back(std::move(tail));
-        }
-        return out;
-    };
-
-    // A package whose DECLARED targets are all programs (#649 E6). See the
-    // worklist, where such a package is not walked into a consumer's graph.
-    state.isProgramOnlyPackage = [](const mcpp::manifest::Manifest& pm) {
-        if (pm.targetsInferred || pm.targets.empty()) return false;
-        return std::ranges::none_of(pm.targets, [](const mcpp::manifest::Target& t) {
-            return t.kind == mcpp::manifest::Target::Library
-                || t.kind == mcpp::manifest::Target::SharedLibrary;
-        });
-    };
-    // A package some edge asked for programs to SHIP (mcpp#711). Its programs
-    // are linked in this plan, so it is scanned and configured here like any
-    // library dependency, even when every target it declares is a program.
-    state.isArtifactPackage = [&](std::size_t i) {
-        return std::ranges::any_of(state.dependencyEdges, [&](const DependencyEdge& e) {
-            return e.dependencyPackageIndex == i && !e.requestedArtifacts.empty();
-        });
-    };
-    // Compiled in this plan: not a package of programs, or one whose programs
-    // this plan ships.
-    state.isWorkspaceMemberPackage = [&](std::size_t i) {
-        if (i == 0 || i >= state.packages.size() || !state.workspacePlan()) return false;
-        if (state.packages[i].selectedMember) return true;
-        const auto& r = state.packages[i].root;
-        if (r.lexically_normal() == state.runtimeWorkspaceRoot.lexically_normal()) return true;
-        return !workspace_member_of(state, r).empty();
-    };
-    // A selected workspace member is compiled here whatever its targets are
-    // (workspace design 2026-09-29 §15).
-    state.compilesHere = [&](std::size_t i) {
-        return i == 0 || !state.isProgramOnlyPackage(state.packages[i].manifest)
-            || state.isArtifactPackage(i) || state.packages[i].selectedMember;
-    };
-
-
-    state.appendUniquePath =
-        [](std::vector<std::filesystem::path>& dirs,
-           const std::filesystem::path& dir) -> bool
-    {
-        if (std::find(dirs.begin(), dirs.end(), dir) != dirs.end()) return false;
-        dirs.push_back(dir);
-        return true;
-    };
-
-    state.appendUniquePaths =
-        [&](std::vector<std::filesystem::path>& dirs,
-            const std::vector<std::filesystem::path>& additions) -> bool
-    {
-        bool changed = false;
-        for (auto const& dir : additions) {
-            changed = state.appendUniquePath(dirs, dir) || changed;
-        }
-        return changed;
-    };
-
-    // "Which compile-visible channels a build.mcpp directive lands in" is a
-    // property of the DIRECTIVE TABLE, not of this call site, so both the mark
-    // and the fold now live with the table in mcpp.build.directives. This pair
-    // used to be defined here and was already incomplete — the comment it
-    // replaced admitted that link/source residues stayed at the call sites,
-    // which is the #242 two-derivations shape.
-    //
-    // The fold is PRIVATE by design (Cargo discipline — a build-time program
-    // must not widen the package's public interface): privateBuild only, never
-    // publicUsage. The after-dirs ride the typed #249 channel, which owns the
-    // per-dialect degradations (cl.exe /I, NASM -I).
-    using DirectiveMark = mcpp::build::directives::Mark;
-    state.markDirectiveTail = [](const mcpp::manifest::Manifest& mm) {
-        return mcpp::build::directives::mark(mm);
-    };
-    state.foldDirectiveTailIntoPrivateBuild =
-        [](mcpp::modgraph::PackageRoot& pkg, const mcpp::manifest::Manifest& ran,
-           const DirectiveMark& t)
-    {
-        mcpp::build::directives::fold_private_tail(pkg.privateBuild, ran, t);
-    };
-
-    // mcpp#241: the (name → dir) pairs a package's build.mcpp receives as
-    // MCPP_DEP_<NAME>_DIR. ONE owner: the dependency loop and the root call
-    // site had drifted into two near-identical copies of this, and #355 was
-    // about to add a third. Each dependency is emitted under BOTH its
-    // canonical name and its namespace-stripped tail, so
-    // `mcpp::dep_dir("compat.zlib")` and `mcpp::dep_dir("zlib")` both resolve
-    // regardless of which spelling the author used in `deps`.
-    //
-    // #359: the set is now the consumer's VISIBLE provisions rather than its
-    // direct edges, so a re-exported dependency's directory reaches it too.
-    // That is what makes a rule package able to find data files belonging to a
-    // dependency the user never declared — protoc's well-known .proto files
-    // are exactly such a directory, and `grpcgen` reads them through dep_dir.
-    //
-    // The bare tail is emitted only when the namespace ladder binds it here.
-    // Emitting it unconditionally was safe while only the root's own
-    // declarations reached build.mcpp; with re-export, two packages that never
-    // heard of each other can share a tail and the later emplace_back would
-    // silently win.
-    // The xlings half of fillDepDirs. Same question ("where did my declared
-    // dependency's payload land"), different namespace and store layout, so it
-    // cannot ride the mcpp dependency channel — but it must be an INTERFACE on
-    // the build.mcpp side for the same reason that one is: a program that
-    // reconstructs the store path is coupled to internals mcpp is free to
-    // change. See mcpp::build::hostprogram::xpkg_dir.
-
 }
 
 static std::expected<void, std::string>
@@ -2263,6 +2161,10 @@ step4b_define_provisioning_closures(PrepareState& state) {
                 }
                 auto& consumer = state.packages[edge.consumerPackageIndex];
                 auto const& dependency = state.packages[edge.dependencyPackageIndex];
+                // A build dependency serves the build program, which is planned
+                // in its own graph: its include directories and interface
+                // defines do not reach this consumer's target compile (mcpp#797).
+                if (edge.buildTable) continue;
                 // A package of programs publishes no usage requirements to its
                 // consumers (#649 E6): nothing of it is compiled or linked here.
                 if (edge.dependencyPackageIndex > 0
@@ -2437,7 +2339,7 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
         injectCliForwards(n, req);
         state.worklist.push_back({n, req, mainPkgLabel + " (build-dep)",
                             req.version, kMainConsumer, {}, /*devOnly=*/false,
-                            /*buildOnly=*/true});
+                            /*buildOnly=*/true, /*fromBuildTable=*/true});
     }
 
 
