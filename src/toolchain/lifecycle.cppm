@@ -1269,10 +1269,16 @@ export int toolchain_set_default(const mcpp::config::GlobalConfig& cfg,
 // `mcpp toolchain remove <spec> [--target <triple>]` — uninstall a payload.
 export int toolchain_remove(const mcpp::config::GlobalConfig& cfg,
                             const std::string& pos0,
+                            const std::string& pos1,
                             const std::string& targetArg = {}) {
     auto xlEnv = mcpp::config::make_xlings_env(cfg);
-        auto parsedSpec = mcpp::toolchain::parse_toolchain_spec(pos0);
-        if (parsedSpec && mcpp::toolchain::is_system_toolchain(*parsedSpec)) {
+        auto parsedSpec = mcpp::toolchain::parse_toolchain_spec(pos0, pos1);
+        if (!parsedSpec) {
+            mcpp::ui::error(std::format(
+                "{}; e.g. `mcpp toolchain remove gcc 16.1.0`", parsedSpec.error()));
+            return 2;
+        }
+        if (mcpp::toolchain::is_system_toolchain(*parsedSpec)) {
             mcpp::ui::error(
                 "msvc@system is the machine's own Visual Studio, managed by the "
                 "Visual Studio Installer — mcpp cannot remove it.\n"
@@ -1280,8 +1286,14 @@ export int toolchain_remove(const mcpp::config::GlobalConfig& cfg,
                 "    mcpp toolchain remove msvc@<toolset>");
             return 1;
         }
-        if (!parsedSpec || parsedSpec->version.empty()) {
-            mcpp::ui::error(std::format("invalid spec '{}'", pos0));
+        // A family alone is a well-formed spec that names no payload. Say
+        // that, rather than "invalid spec 'gcc'", which reads as if the family
+        // itself were wrong (#284).
+        if (parsedSpec->version.empty()) {
+            mcpp::ui::error(std::format(
+                "`toolchain remove` needs the exact version to uninstall; "
+                "e.g. `mcpp toolchain remove {0} <version>` or `{0}@<version>`",
+                mcpp::toolchain::family_name(parsedSpec->family)));
             return 2;
         }
         mcpp::toolchain::print_compat_hint(*parsedSpec);

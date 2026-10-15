@@ -71,6 +71,10 @@ echo "$out" | grep -q '16.1.0' || { echo "FAIL: list missing version: $out"; exi
 grep -q 'Default' /tmp/_def.log || { cat /tmp/_def.log; echo "FAIL: no Default msg"; exit 1; }
 out=$("$MCPP" toolchain list 2>&1)
 echo "$out" | grep -q '\*' || { echo "FAIL: default mark missing: $out"; exit 1; }
+"$MCPP" toolchain default gcc 16.1.0 > /tmp/_def_split.log 2>&1 || {
+    cat /tmp/_def_split.log; echo "FAIL: space-separated default failed"; exit 1; }
+grep -q 'Default' /tmp/_def_split.log || {
+    cat /tmp/_def_split.log; echo "FAIL: no Default msg for space-separated form"; exit 1; }
 
 # 6) Build now succeeds (project has no [toolchain]; uses global default)
 "$MCPP" build > /tmp/_build.log 2>&1 || { cat /tmp/_build.log; echo "FAIL: build failed"; exit 1; }
@@ -98,8 +102,29 @@ echo "$out" | grep -q 'default toolchain   = gcc@16.1.0' || {
 
 # 9) Remove
 rm -rf target
-"$MCPP" toolchain remove gcc@16.1.0 > /tmp/_rm.log 2>&1
-grep -q 'Removed' /tmp/_rm.log || { cat /tmp/_rm.log; echo "FAIL: no Removed msg"; exit 1; }
+# A family alone names no payload: the error says the version is missing,
+# not that the spec is invalid (which reads as a wrong family name, #284).
+rc=0
+"$MCPP" toolchain remove gcc > /tmp/_rm_nover.log 2>&1 || rc=$?
+[[ "$rc" -eq 2 ]] || { cat /tmp/_rm_nover.log; echo "FAIL: remove without a version should exit 2 (got $rc)"; exit 1; }
+grep -q 'needs the exact version' /tmp/_rm_nover.log || {
+    cat /tmp/_rm_nover.log; echo "FAIL: remove without a version did not name the missing version"; exit 1; }
+"$MCPP" toolchain remove gcc 16.1.0 > /tmp/_rm.log 2>&1
+grep -q 'Removed' /tmp/_rm.log || { cat /tmp/_rm.log; echo "FAIL: no Removed msg for space-separated form"; exit 1; }
+# The issue's cross-target spelling should parse too and reach the payload
+# lookup, even when that target is not installed in this test workspace.
+rc=0
+"$MCPP" toolchain remove gcc 16.1.0 --target x86_64-linux-musl > /tmp/_rm_target.log 2>&1 || rc=$?
+[[ "$rc" -ne 0 ]] || { echo "FAIL: removing an absent target toolchain should fail"; exit 1; }
+grep -q 'is not installed' /tmp/_rm_target.log || {
+    cat /tmp/_rm_target.log; echo "FAIL: split form with --target did not reach installed-payload check"; exit 1; }
+# The compact spelling remains valid too; after removal it should reach the
+# installed-payload check rather than fail spec parsing.
+rc=0
+"$MCPP" toolchain remove gcc@16.1.0 > /tmp/_rm_at.log 2>&1 || rc=$?
+[[ "$rc" -ne 0 ]] || { echo "FAIL: removing an absent toolchain should fail"; exit 1; }
+grep -q 'is not installed' /tmp/_rm_at.log || {
+    cat /tmp/_rm_at.log; echo "FAIL: @-form remove did not reach installed-payload check"; exit 1; }
 
 # 10) After removing, the toolchain dir is gone, but config.toml still
 #     points to it as default. Verify list shows nothing for that compiler now.
