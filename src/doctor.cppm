@@ -23,7 +23,6 @@ import mcpp.build.runtime_validation;
 import mcpp.config;
 import mcpp.fallback.probe_sysroot;
 import mcpp.fallback.xlings_binary;
-import mcpp.fallback.install_integrity;
 import mcpp.fetcher.progress;
 import mcpp.home;
 import mcpp.libs.json;
@@ -42,7 +41,8 @@ import mcpp.toolchain.linkmodel;
 import mcpp.toolchain.stdmod;
 import mcpp.toolchain.abi;
 import mcpp.ui;
-import mcpp.xlings;
+import mcpp.provider;
+import mcpp.provider.select;
 
 namespace mcpp::doctor {
 
@@ -239,8 +239,8 @@ export int doctor_report() {
         }
         {
             std::error_code sdkEc;
-            auto msvcRoot = mcpp::home::root()
-                / "registry" / "data" / "xpkgs" / "xim-x-msvc";
+            auto msvcRoot = mcpp::provider::layout().tool_in(
+                mcpp::provider::home_store().value_or(std::filesystem::path{}), "msvc");
             for (auto& v : std::filesystem::directory_iterator(msvcRoot, sdkEc)) {
                 if (!v.is_directory(sdkEc)) continue;
                 auto ver = v.path().filename().string();
@@ -266,8 +266,8 @@ export int doctor_report() {
 
         mcpp::ui::status("Checking", "mingw (xim:mingw-gcc)");
         {
-            auto pkgs = mcpp::home::root()
-                / "registry" / "data" / "xpkgs" / "xim-x-mingw-gcc";
+            auto pkgs = mcpp::provider::layout().tool_in(
+                mcpp::provider::home_store().value_or(std::filesystem::path{}), "mingw-gcc");
             std::error_code ec;
             bool any = false;
             if (std::filesystem::exists(pkgs, ec)) {
@@ -288,8 +288,8 @@ export int doctor_report() {
             auto triple = std::string(mcpp::platform::host_arch) + "-linux-musl";
             auto label  = std::format("linux cross (xim:{}-gcc)", triple);
             mcpp::ui::status("Checking", label);
-            auto pkgs = mcpp::home::root() / "registry" / "data" / "xpkgs"
-                      / std::format("xim-x-{}-gcc", triple);
+            auto pkgs = mcpp::provider::layout().tool_in(
+                mcpp::provider::home_store().value_or(std::filesystem::path{}), triple + "-gcc");
             std::error_code ec;
             bool any = false;
             if (std::filesystem::exists(pkgs, ec)) {
@@ -375,19 +375,16 @@ export int doctor_report() {
         // that resolves what it needs has nothing to report), so doctor is
         // where the state is visible without a failing run.
         mcpp::ui::status("Checking", "package indexes");
-        const auto dataRoot = mcpp::xlings::paths::index_data(
-            mcpp::config::make_xlings_env(*cfg));
         std::error_code idxEc;
         bool anyIndex = false;
-        for (auto const& entry : std::filesystem::directory_iterator(dataRoot, idxEc)) {
-            if (!entry.is_directory(idxEc)) continue;
-            if (!std::filesystem::exists(entry.path() / "pkgs", idxEc)) continue;
+        for (auto const& root : mcpp::provider::open(mcpp::config::make_xlings_env(*cfg))->index_roots()) {
+            if (!std::filesystem::exists(root / "pkgs", idxEc)) continue;
             anyIndex = true;
-            const auto name = entry.path().filename().string();
-            auto contract = mcpp::pm::read_index_contract(entry.path());
+            const auto name = root.filename().string();
+            auto contract = mcpp::pm::read_index_contract(root);
             if (!contract || contract->minMcpp.empty()) {
                 ok(std::format("index '{}' declares no mcpp floor", name));
-            } else if (mcpp::pm::index_usable(entry.path())) {
+            } else if (mcpp::pm::index_usable(root)) {
                 ok(std::format("index '{}' requires mcpp >= {}", name, contract->minMcpp));
             } else {
                 warn(std::format(
@@ -398,6 +395,26 @@ export int doctor_report() {
             }
         }
         if (!anyIndex) ok("no package index synced yet");
+
+        // Where the home is, and what it reuses (design 2026-10-16 §8, §10, §11).
+        mcpp::ui::status("Checking", "home");
+        if ((*cfg).systemHome) ok(std::format("{} is the machine's system home", (*cfg).mcppHome.string()));
+        if ((*cfg).upstreams.empty())
+            ok("self-contained: no upstream ([xlings] upstream)");
+        for (auto const& u : (*cfg).upstreams) ok(std::format("upstream {}", u.string()));
+        const auto caps = mcpp::platform::fs_caps((*cfg).mcppHome);
+        if (caps.native())
+            ok(std::format("{} on {}: every write is the filesystem's own",
+                           (*cfg).mcppHome.string(), caps.type.empty() ? "this filesystem" : caps.type));
+        else
+            ok(std::format("{} on {}: {}{}{}", (*cfg).mcppHome.string(), caps.type.empty() ? "this filesystem" : caps.type,
+                           caps.rename_no_replace ? "" : "publishes by hard link or a rename to a free name; ",
+                           caps.rename_exchange ? "" : "exchanges by moving aside; ",
+                           caps.symlinks ? "" : "no symbolic links (no reuse from an upstream)"));
+        if constexpr (mcpp::platform::is_windows)
+            ok(std::format("Windows long paths: {}", mcpp::platform::windows::long_paths_enabled()
+                               ? "on (LongPathsEnabled = 1)"
+                               : "off (LongPathsEnabled = 0; mcpp does not change it)"));
     }
 
     mcpp::ui::status("Checking", "cache health");
@@ -526,7 +543,7 @@ export int doctor_report() {
     //      (std::filesystem::exists follows symlinks → false for dangling).
     mcpp::ui::status("Checking", "toolchain runtime deps");
     if (cfg) {
-        auto pkgsDir = (*cfg).xlingsHome() / "data" / "xpkgs";
+        auto pkgsDir = mcpp::provider::open(mcpp::config::make_xlings_env(*cfg))->store();
         std::error_code ec;
         bool sawAny = false;
         bool anyMissing = false;
@@ -534,17 +551,16 @@ export int doctor_report() {
         if (std::filesystem::exists(pkgsDir, ec)) {
             // Mirror `mcpp toolchain list`: each xim-x-<name>/<version>/bin
             // holds one installed toolchain frontend (clang++/g++/musl-gcc-…).
-            for (auto& entry : std::filesystem::directory_iterator(pkgsDir, ec)) {
-                auto name = entry.path().filename().string();
-                if (name.rfind("xim-x-", 0) != 0) continue;          // toolchains only
-                auto id = mcpp::toolchain::identify_xim_payload(
-                    name.substr(std::string("xim-x-").size()));
+            for (const auto& entry : mcpp::provider::layout().entries(pkgsDir)) {
+                if (entry.ns != "xim") continue;          // toolchains only
+                auto id = mcpp::toolchain::identify_xim_payload(entry.name);
                 if (!id) continue;                                   // not a compiler pkg
 
-                for (auto& vEntry : std::filesystem::directory_iterator(entry.path(), ec)) {
+                {
+                    const auto& vDir = entry.dir;
                     mcpp::toolchain::ToolchainSpec s;
                     s.family  = id->family;
-                    s.version = vEntry.path().filename().string();
+                    s.version = vDir.filename().string();
                     s.target  = id->target;
                     // payload_frontend, not toolchain_frontend(root/"bin"):
                     // cl.exe is four levels down at
@@ -554,7 +570,7 @@ export int doctor_report() {
                     // in `toolchain list`; doctor kept its own copy, so the
                     // two commands disagreed about the same machine.
                     auto binR = mcpp::toolchain::payload_frontend(
-                        vEntry.path(), mcpp::toolchain::to_xim_package(s));
+                        vDir, mcpp::toolchain::to_xim_package(s));
                     // DOCTOR IS THE COMMAND FOR EXACTLY THIS. A payload whose
                     // own description does not parse is a finding, and
                     // skipping it would make the one command that reports on
@@ -623,9 +639,9 @@ export int doctor_report() {
             }
         }
 
-        // Dangling symlinks under registry/subos/default/lib — these point
-        // into xim payload lib dirs; a removed package leaves them broken.
-        auto subosLib = (*cfg).xlingsHome() / "subos" / "default" / "lib";
+        // Dangling symlinks under the provider environment's lib — these
+        // point into payload lib dirs; a removed package leaves them broken.
+        auto subosLib = mcpp::provider::open(mcpp::config::make_xlings_env(*cfg))->sysroot() / "lib";
         if (std::filesystem::exists(subosLib, ec)) {
             bool anyDangling = false;
             for (auto& e : std::filesystem::directory_iterator(subosLib, ec)) {
@@ -654,7 +670,7 @@ export int doctor_report() {
     // musl-gcc payload on a Linux, macOS or Windows mcpp.
     mcpp::ui::status("Checking", "gcc include-fixed headers");
     if (cfg) {
-        auto pkgsDir = (*cfg).xlingsHome() / "data" / "xpkgs";
+        auto pkgsDir = mcpp::provider::open(mcpp::config::make_xlings_env(*cfg))->store();
         std::error_code ec;
         bool sawAnyGcc = false;
         bool anyFrozen = false;
@@ -664,23 +680,21 @@ export int doctor_report() {
             // directory `identify_xim_payload` recognises, filtered to the
             // GCC family (native, musl-gcc, mingw-(cross-)gcc, and any
             // `<triple>-gcc` cross payload all answer Family::Gcc).
-            for (auto& entry : std::filesystem::directory_iterator(pkgsDir, ec)) {
-                auto name = entry.path().filename().string();
-                if (name.rfind("xim-x-", 0) != 0) continue;
-                auto id = mcpp::toolchain::identify_xim_payload(
-                    name.substr(std::string("xim-x-").size()));
+            for (const auto& entry : mcpp::provider::layout().entries(pkgsDir)) {
+                if (entry.ns != "xim") continue;
+                auto id = mcpp::toolchain::identify_xim_payload(entry.name);
                 if (!id || id->family != mcpp::toolchain::Family::Gcc) continue;
 
-                for (auto& vEntry : std::filesystem::directory_iterator(entry.path(), ec)) {
-                    if (!vEntry.is_directory(ec)) continue;
+                {
+                    const auto& vDir = entry.dir;
                     sawAnyGcc = true;
-                    auto findings = find_fixincludes_banners(vEntry.path());
+                    auto findings = find_fixincludes_banners(vDir);
                     if (findings.empty()) continue;
                     anyFrozen = true;
 
                     mcpp::toolchain::ToolchainSpec s;
                     s.family  = id->family;
-                    s.version = vEntry.path().filename().string();
+                    s.version = vDir.filename().string();
                     s.target  = id->target;
                     auto specStr = s.spec_str();
                     auto targetFlag = id->target.empty()
@@ -1124,11 +1138,11 @@ export int why_toolchain_json(std::string_view target, std::string_view tcSpec) 
     // same question of the same authority rather than re-deriving an answer
     // that can drift from the one the build uses.
     const auto lm = mcpp::toolchain::resolve_link_model(tc);
-    auto path_origin = [](const std::filesystem::path& p) -> std::string_view {
+    auto path_origin = [](const std::filesystem::path& p) -> std::string {
         if (p.empty()) return "none";
-        const auto sp = p.generic_string();
-        if (sp.find("registry/data/xpkgs") != std::string::npos) return "payload";
-        if (sp.find("registry/subos")      != std::string::npos) return "subos";
+        const auto kind = mcpp::provider::layout().kind_of(p);
+        if (kind == "payload") return "payload";
+        if (kind == "environment") return "subos";  // provider-boundary-ok: doctor --json's published origin value
         return "host";
     };
     const auto& srPath =
@@ -1644,14 +1658,6 @@ export int self_init(bool force) {
         return 1;
     }
 
-    // Clean any incomplete xpkg installations (interrupted downloads, etc.).
-    auto xpkgsBase = cfg->xlingsHome() / "data" / "xpkgs";
-    int cleaned = mcpp::fallback::clean_all_incomplete(xpkgsBase);
-    if (cleaned > 0) {
-        mcpp::ui::info("Cleaned", std::format(
-            "{} incomplete installation(s)", cleaned));
-    }
-
     // Verify result.
     auto problem = mcpp::config::check_base_init(*cfg);
     if (!problem.empty()) {
@@ -1670,6 +1676,42 @@ std::string upper_ascii(std::string s) {
     return s;
 }
 
+
+// `mcpp self store dedupe [--apply]` (design 2026-10-16 §8.5): the payloads
+// this home installed itself that an upstream has the same of -- namespace,
+// name, version and revision, complete there -- listed; with --apply each is
+// replaced by a link to the upstream's, atomically, one at a time.
+export int store_dedupe(bool apply) {
+    auto cfg = mcpp::config::load_or_init(/*quiet=*/true);
+    if (!cfg) {
+        mcpp::ui::error(cfg.error().message);
+        return 4;
+    }
+    if (cfg->upstreams.empty()) {
+        std::println("no upstream is configured ([xlings] upstream in config.toml); nothing to compare with");
+        return 0;
+    }
+    auto provider = mcpp::provider::open(mcpp::config::make_xlings_env(*cfg));
+    const auto found = provider->duplicates();
+    int failed = 0;
+    for (const auto& d : found) {
+        if (!apply) {
+            std::println("{}  =  {}", d.local.string(), d.upstream.string());
+            continue;
+        }
+        if (auto why = provider->link_to_upstream(d); why.empty())
+            std::println("linked {} -> {}", d.local.string(), d.upstream.string());
+        else {
+            mcpp::ui::error(why);
+            ++failed;
+        }
+    }
+    if (found.empty()) std::println("no payload here is also in an upstream");
+    else if (!apply)
+        std::println("{} payload(s) could be links to an upstream's; `mcpp self store dedupe --apply` makes them so",
+                     found.size());
+    return failed == 0 ? 0 : 1;
+}
 
 // `mcpp self config [--mirror CN|GLOBAL]` (mirror = raw option value).
 export int self_config(std::string mirror) {
@@ -1691,7 +1733,7 @@ export int self_config(std::string mirror) {
     // file via xlings.
     //
     // TODO(mirror-default): the default "CN" lives in
-    // mcpp::xlings::seed_xlings_json — see the matching note there for the
+    // mcpp::provider::xlings::seed_xlings_json — see the matching note there for the
     // long-term plan (flip default to GLOBAL, or auto-detect on first init).
     auto cfg = mcpp::config::load_or_init(
         /*quiet=*/false, mcpp::fetcher::make_bootstrap_progress_callback(), mirror);
@@ -1702,11 +1744,11 @@ export int self_config(std::string mirror) {
 
     auto env = mcpp::config::make_xlings_env(*cfg);
     if (mirror.empty()) {
-        auto rc = mcpp::xlings::config_show(env);
+        auto rc = mcpp::provider::open(env)->show_config();
         return rc == 0 ? 0 : 1;
     }
 
-    auto rc = mcpp::xlings::config_set_mirror(env, mirror, /*quiet=*/true);
+    auto rc = mcpp::provider::open(env)->set_mirror(mirror, /*quiet=*/true);
     if (rc != 0) {
         mcpp::ui::error(std::format("failed to set xlings mirror to {}", mirror));
         return 1;

@@ -50,7 +50,8 @@ import mcpp.build.backend;      // BuildOptions for the tool sub-build
 import mcpp.build.ninja;        // make_ninja_backend — driving that sub-build
 import mcpp.lockfile;
 import mcpp.config;
-import mcpp.xlings;
+import mcpp.provider;
+import mcpp.provider.select;
 import mcpp.runtime.binding;
 import mcpp.platform.runtime_search;
 import mcpp.toolchain.post_install;
@@ -206,19 +207,31 @@ std::expected<void, std::string> step13_windows_resources(PrepareState& state, B
             if (!t.windowsCodePage.empty()) return t.windowsCodePage;
             return (hostToolBuild && t.is_program() && !ownManifest) ? "utf-8" : "legacy";
         };
+        // `windows_long_paths` (design 2026-10-16 §11), with the same
+        // defaults: a host tool is long-path aware unless it says otherwise.
+        auto longPathsOf = [&](const mcpp::manifest::Target& t) {
+            const auto& stated = t.windowsLongPaths;
+            if (stated) return *stated;
+            return hostToolBuild && t.is_program() && !ownManifest;
+        };
         // A test program carries the code page `[test] windows_code_page`
         // gave it, and nothing by default: the host-tool default is a
         // program's.
         auto takesCodePage = [](const mcpp::manifest::Target& t) {
             return t.is_program() || t.kind == mcpp::manifest::Target::TestBinary;
         };
+        // Whether an image carries an application manifest of mcpp's: a
+        // UTF-8 code page or long paths asked for.
+        auto manifested = [&](const mcpp::manifest::Target& t) {
+            return codePageOf(t) == "utf-8" || longPathsOf(t);
+        };
         const bool anyUtf8Image = std::ranges::any_of(M.targets, [&](const auto& t) {
-            return takesCodePage(t) && codePageOf(t) == "utf-8";
+            return takesCodePage(t) && manifested(t);
         });
         // Author scripts reach programs and shared libraries, never a test
         // program, so only a program's manifest can collide with one.
         const bool anyUtf8Program = std::ranges::any_of(M.targets, [&](const auto& t) {
-            return t.is_program() && codePageOf(t) == "utf-8";
+            return t.is_program() && manifested(t);
         });
         if (M.resources.declared() || anyUtf8Image) {
             namespace rsrc = mcpp::build::resources;
@@ -319,7 +332,7 @@ std::expected<void, std::string> step13_windows_resources(PrepareState& state, B
                     return lu.kind == mcpp::build::LinkUnit::TestBinary && owns(lu)
                         && std::ranges::any_of(M.targets, [&](const auto& t) {
                                return t.name == lu.targetName && takesCodePage(t)
-                                   && codePageOf(t) == "utf-8";
+                                   && manifested(t);
                            });
                 });
                 if (peUnits.empty()) {
@@ -415,14 +428,17 @@ std::expected<void, std::string> step13_windows_resources(PrepareState& state, B
                 // the version block belong to a specific artifact, and the
                 // manifest to a specific executable.
                 const bool synthVersion = R.declared() && R.synthesize_version_info();
-                auto wantsUtf8 = [&](const mcpp::build::LinkUnit& lu) {
+                auto targetOf = [&](const mcpp::build::LinkUnit& lu) -> const mcpp::manifest::Target* {
                     if (lu.kind != mcpp::build::LinkUnit::Binary
-                        && lu.kind != mcpp::build::LinkUnit::TestBinary) return false;
-                    if (!lu.artifactOf.empty()) return false;
+                        && lu.kind != mcpp::build::LinkUnit::TestBinary) return nullptr;
+                    if (!lu.artifactOf.empty()) return nullptr;
                     for (auto const& t : M.targets)
-                        if (t.name == lu.targetName)
-                            return takesCodePage(t) && codePageOf(t) == "utf-8";
-                    return false;
+                        if (t.name == lu.targetName && takesCodePage(t)) return &t;
+                    return nullptr;
+                };
+                auto wantsUtf8 = [&](const mcpp::build::LinkUnit& lu) {
+                    const auto* t = targetOf(lu);
+                    return t && manifested(*t);
                 };
                 if (!iconAbs.empty() || synthVersion || anyUtf8Image) {
                     // A version key mcpp cannot order (an upstream build number)
@@ -464,7 +480,9 @@ std::expected<void, std::string> step13_windows_resources(PrepareState& state, B
                         if (utf8) {
                             manifestAbs = resDir / (imageName + ".mcpp.manifest");
                             std::filesystem::create_directories(manifestAbs.parent_path(), mkEc);
-                            const auto manifestText = rsrc::utf8_code_page_manifest();
+                            const auto* t = targetOf(lu);
+                            const auto manifestText = rsrc::application_manifest(
+                                codePageOf(*t) == "utf-8", longPathsOf(*t));
                             std::string had;
                             if (std::ifstream in(manifestAbs, std::ios::binary); in)
                                 had.assign(std::istreambuf_iterator<char>(in), {});

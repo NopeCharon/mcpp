@@ -42,8 +42,9 @@ import mcpp.build.build_program;
 import mcpp.build.backend;      // BuildOptions for the tool sub-build
 import mcpp.build.ninja;        // make_ninja_backend — driving that sub-build
 import mcpp.config;
-import mcpp.xlings;
-import mcpp.xlings.runtime_selection;
+import mcpp.provider;
+import mcpp.provider.select;
+import mcpp.provider.runtime_selection;
 import mcpp.runtime.binding;
 import mcpp.toolchain.post_install;
 import mcpp.platform;
@@ -173,13 +174,13 @@ static std::expected<void, std::string> step1_define_early_toolchain_closures(Pr
     // was started with, byte for byte.
     //
     // NOT RE-DERIVED AT THE TWO DELIVERY SITES BELOW, AND NOT FROM
-    // `[xlings] deps`. `mcpp::xlings::runtime` is the sole runtime-selection
+    // `[xlings] deps`. `mcpp::provider::runtime` is the sole runtime-selection
     // policy and `RuntimeBinding::subosDir` is its resolved answer; a second
     // derivation is how a build ends up with two subos and no way to say which
     // one it used. The per-package payload paths a program may also need are
     // already answered, separately, by `MCPP_XPKG_*_DIR`.
     state.projectSubosBin = [&]() -> std::string {
-        using Mode = mcpp::xlings::runtime::RuntimeSelection::Mode;
+        using Mode = mcpp::provider::runtime::RuntimeSelection::Mode;
         if (state.runtimeBindingSnapshot.selection.mode != Mode::NamedSubos)
             return {};
         auto bin = state.runtimeBindingSnapshot.subosDir / "bin";
@@ -192,50 +193,30 @@ static std::expected<void, std::string> step1_define_early_toolchain_closures(Pr
     state.runtimeLibDir = state.runtimeBindingSnapshot.libraryDirs.empty()
         ? std::filesystem::path{} : state.runtimeBindingSnapshot.libraryDirs.front();
 
-    // THE DECLARED RUNTIME PAYLOAD IS PROVIDED BEFORE THE FIRST FIXUP THAT
-    // CONSUMES IT (mcpp#660), and not earlier: a build whose toolchain needs
-    // no C runtime payload must not download one. At most once per build. An
+    // THE DECLARED RUNTIME PAYLOAD IS PROVIDED WITH THE TOOLCHAIN THAT RUNS ON
+    // IT (mcpp#660), and not earlier: a build whose toolchain needs no C
+    // runtime payload must not download one. At most once per build. An
     // inherited binding is not exempt, because the parent build may have used
     // a toolchain that needed no payload. The two values derived above are
     // refreshed with the binding, because detection and the fingerprint read
-    // them after the fixups.
+    // them afterwards.
     state.runtimePayloadProvided = false;
-    state.provide_runtime_payload = [&](const mcpp::toolchain::XimToolchainPackage& pkg) {
-        if (state.runtimePayloadProvided) return;
-        if (mcpp::toolchain::post_install_fixup_kind(pkg).empty()) return;
+    state.provide_runtime_payload = [&](const mcpp::toolchain::XimToolchainPackage& pkg)
+        -> std::expected<void, std::string> {
+        if (state.runtimePayloadProvided) return {};
+        if (mcpp::toolchain::runtime_payload_kind(pkg).empty()) return {};
         state.runtimePayloadProvided = true;
         auto cfgP = state.get_cfg(true);
-        if (!cfgP) return;
-        if (!mcpp::toolchain::ensure_declared_runtime(**cfgP, state.runtimeBindingSnapshot))
-            return;
+        if (!cfgP) return {};
+        auto changed = mcpp::toolchain::ensure_declared_runtime(**cfgP, state.runtimeBindingSnapshot);
+        if (!changed) return std::unexpected(changed.error());
+        if (!*changed) return {};
         state.runtimePayload = state.runtimeBindingSnapshot.libc;
         state.runtimeLibDir = state.runtimeBindingSnapshot.libraryDirs.empty()
             ? std::filesystem::path{} : state.runtimeBindingSnapshot.libraryDirs.front();
+        return {};
     };
 
-    // mcpp#427: a toolchain fixup that could not run is a DEGRADATION, not a
-    // failure — the build continues without it. But it has to be said, or the
-    // eventual `stdlib.h: No such file or directory` arrives with no way to
-    // connect it to its cause.
-    //
-    // Deduplicated by payload: `ensure_post_install_fixup` is called from up
-    // to four seams in one build (manifest toolchain, default toolchain,
-    // MinGW first-run, build.mcpp host toolchain) and they routinely resolve
-    // the SAME payload. Saying it once is the rule mcpp#417 already paid for.
-    auto fixupNoticed = std::make_shared<std::set<std::string>>();
-    state.report_fixup = [fixupNoticed](
-            const mcpp::toolchain::FixupOutcome& outcome,
-            const std::filesystem::path& payloadRoot) {
-        if (outcome.skippedReason.empty()) return;
-        if (!fixupNoticed->insert(payloadRoot.generic_string()).second) return;
-        // Only the fact this line ADDS. The `Runtime` note above already gave
-        // the cause and the remedy for the same absence; repeating them here
-        // would be the second copy of one message, which is the habit mcpp#417
-        // exists to break.
-        mcpp::ui::info("Toolchain", std::format(
-            "used as installed — not patched against a C runtime ({})",
-            outcome.skippedReason));
-    };
 
 
     // Toolchain resolution priority: see the table at the top of this
@@ -295,12 +276,16 @@ static std::expected<void, std::string> step1_define_early_toolchain_closures(Pr
     // the same fact twice is how two of them start disagreeing.
     state.storeRoots = [&]() -> std::vector<std::filesystem::path> {
         std::vector<std::filesystem::path> roots;
-        if (auto c = state.get_cfg(true)) roots.push_back((*c)->xlingsHome() / "data" / "xpkgs");
-        for (auto& d : mcpp::config::project_xlings_data_roots(state.workRoot))
-            roots.push_back(d / "xpkgs");
-        if (!state.overrides.project_index_root.empty())
-            for (auto& d : mcpp::config::project_xlings_data_roots(state.overrides.project_index_root))
-                roots.push_back(d / "xpkgs");
+        auto c = state.get_cfg(true);
+        if (c) for (auto& s : mcpp::provider::open(mcpp::config::make_xlings_env(**c))->stores()) roots.push_back(s);
+        auto project = [&](const std::filesystem::path& dir) {
+            for (auto& s : mcpp::provider::layout().stores_of(dir / ".mcpp"))
+                roots.push_back(s);
+            for (auto& d : mcpp::config::project_xlings_data_roots(dir))
+                roots.push_back(mcpp::provider::layout().store_in(d));
+        };
+        project(state.workRoot);
+        if (!state.overrides.project_index_root.empty()) project(state.overrides.project_index_root);
         // The engine interface's package: written once per mcpp version and
         // never edited, like a payload (mcpp#797).
         roots.push_back(mcpp::build::engine::root());
@@ -417,7 +402,7 @@ static std::expected<void, std::string> step1_define_early_toolchain_closures(Pr
         auto c = state.get_cfg(true);
         if (!c) return mcpp::toolchain::msvc::has_usable_msvc();
         return mcpp::toolchain::msvc::msvc_available_here(
-            (*c)->xlingsHome() / "data" / "xpkgs");
+            mcpp::provider::open(mcpp::config::make_xlings_env(**c))->store());
     };
 
     // THE PLATFORM'S CANONICAL NATIVE DEFAULT — a spec string only; no
@@ -1439,13 +1424,8 @@ step2_resolve_explicit_spec(PrepareState& state, ToolchainResolveCtx& ctx) {
             // manifest [toolchain] path previously ran none, so a freshly
             // auto-installed payload kept its stale install-time cfg /
             // unpatched runtime libs.
-            state.provide_runtime_payload(pkg);
-            if (auto fixed = mcpp::toolchain::ensure_post_install_fixup(
-                    **cfg, payload->root, pkg,
-                    state.runtimeBindingSnapshot.runtimeId, state.runtimeLibDir); !fixed)
-                return std::unexpected(std::format(
-                    "toolchain post-install fixup: {}", fixed.error()));
-            else state.report_fixup(*fixed, payload->root);
+            if (auto provided = state.provide_runtime_payload(pkg); !provided)
+                return std::unexpected(provided.error());
             // Canonical rendering, whatever spelling the manifest/config used:
             // "Resolved gcc@16.1.0 → x86_64-linux-musl → <frontend>".
             //
@@ -1668,13 +1648,8 @@ step2_first_run_auto_install(PrepareState& state) {
         // `mcpp toolchain install` performs — without it a fresh sandbox
         // gcc cannot find the C library (stdlib.h: No such file or
         // directory) and a fresh llvm keeps its stale install-time cfg.
-        state.provide_runtime_payload(defaultPkg);
-        if (auto fixed = mcpp::toolchain::ensure_post_install_fixup(
-                **cfg, payload->root, defaultPkg,
-                state.runtimeBindingSnapshot.runtimeId, state.runtimeLibDir); !fixed)
-            return std::unexpected(std::format(
-                "default toolchain post-install fixup: {}", fixed.error()));
-        else state.report_fixup(*fixed, payload->root);
+        if (auto provided = state.provide_runtime_payload(defaultPkg); !provided)
+            return std::unexpected(provided.error());
 
         // Persist the default so we don't ask again next time.
         if (auto wr = mcpp::config::write_default_toolchain(**cfg, defaultSpec); wr) {
@@ -2010,7 +1985,7 @@ step2_retarget_for_retargetable_driver(PrepareState& state) {
                       // a path with a space in it.
                       state.tc->stdModuleTargetFlags =
                           " " + state.tc->crossTargetFlag
-                          + " -isysroot " + mcpp::xlings::shq(sdk->string());
+                          + " -isysroot " + mcpp::platform::shell::quote(sdk->string());
                   }
               }
           }
@@ -2054,7 +2029,7 @@ step2_retarget_for_retargetable_driver(PrepareState& state) {
                           *want, sysroot_override(*state.m, *want));
                   !want_sysroot.empty()) {
                   if (auto cfg3 = state.get_cfg(true); cfg3) {
-                      auto ref = mcpp::xlings::paths::parse_xpkg_ref(want_sysroot);
+                      auto ref = mcpp::provider::parse_ref(want_sysroot);
                       auto xl  = mcpp::config::make_xlings_env(**cfg3);
                       // INSTALLED, NOT MERELY LOOKED UP — THE SAME CHANNEL
                       // THE ROW'S TOOLCHAIN PIN GOES THROUGH.
@@ -2089,7 +2064,7 @@ step2_retarget_for_retargetable_driver(PrepareState& state) {
                               want_sysroot, /*autoInstall=*/true, &srProgress))
                           dir = p->root;
                       else
-                          dir = mcpp::xlings::paths::xpkg_payload(xl, ref);
+                          dir = mcpp::provider::payload(*mcpp::provider::open(xl), ref);
                       if (dir) {
                           if (auto spec = mcpp::freestanding::resolve(*want)) {
                               const auto inc =
@@ -2243,13 +2218,8 @@ step2_msvc_abi_without_msvc_repair(PrepareState& state) {
                   gnuPkg.target(),
                   mcpp::toolchain::payload_frontend_dir(payloadR->root, gnuPkg).string()));
           }
-          state.provide_runtime_payload(gnuPkg);
-          if (auto fixed = mcpp::toolchain::ensure_post_install_fixup(
-                  **cfgR, payloadR->root, gnuPkg,
-                  state.runtimeBindingSnapshot.runtimeId, state.runtimeLibDir); !fixed)
-              return std::unexpected(std::format(
-                  "MinGW toolchain post-install fixup: {}", fixed.error()));
-          else state.report_fixup(*fixed, payloadR->root);
+          if (auto provided = state.provide_runtime_payload(gnuPkg); !provided)
+              return std::unexpected(provided.error());
 
           // Persist both axes so the repair happens once, not on every build.
           if (mcpp::config::write_default_toolchain(**cfgR, pins::kFirstRunWinGnu))

@@ -21,7 +21,7 @@ inputs:
   xlings-version:
     description: xlings release to bootstrap from
     required: false
-    # Must equal `pinned::kXlingsVersion` in src/xlings/xlings.cppm — enforced by
+    # Must equal `pinned::kXlingsVersion` in src/provider/xlings/xlings.cppm — enforced by
     # .github/tools/check_version_pins.sh, not by this comment. (The previous
     # comment here listed the files to keep in lock-step, and that list was
     # already incomplete; that is why the check exists.)
@@ -33,7 +33,7 @@ inputs:
     # `package.name`, so one of the two was simply unreachable — and which one
     # depended on the machine, which is why CI failed on `compat:lua` on
     # Windows and `mcpplibs.capi:lua` on Linux. Never pin below that.
-    default: '2026.10.10.2'
+    default: '2026.10.16.1'
 
 outputs:
   sandbox-key:

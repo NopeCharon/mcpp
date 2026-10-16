@@ -25,8 +25,9 @@ import mcpp.ui;
 import mcpp.wire;
 import mcpp.libs.json;
 import mcpp.log;
-import mcpp.xlings;
-import mcpp.xlings.runtime_selection;
+import mcpp.provider;
+import mcpp.provider.select;
+import mcpp.provider.runtime_selection;
 import mcpp.runtime.binding;
 
 namespace mcpp::toolchain {
@@ -105,7 +106,7 @@ list_installed_versions(const std::filesystem::path& pkgsDir,
                         std::string_view ximName)
 {
     std::vector<std::string> out;
-    auto root = pkgsDir / std::format("xim-x-{}", ximName);
+    auto root = mcpp::provider::layout().tool_in(pkgsDir, ximName);
     std::error_code ec;
     if (!std::filesystem::exists(root, ec)) return out;
     for (auto& v : std::filesystem::directory_iterator(root, ec)) {
@@ -118,17 +119,13 @@ list_installed_versions(const std::filesystem::path& pkgsDir,
 // Falls back to an empty list silently — the caller will then either error
 // out with a clear message or just keep the partial as-is.
 //
-// Index layout in mcpp's sandbox is two-tier:
-//   <reg>/data/xim-pkgindex/pkgs/<n[0]>/<name>.lua          — primary
-//   <reg>/data/xim-index-repos/<sub-index>/pkgs/<n[0]>/<name>.lua
-// We scan both so a package living in either tier resolves.
+// Where a descriptor may be is the provider's answer (its primary index, then
+// its sub-indexes), so a package living in either resolves.
 std::vector<std::string>
 list_available_xpkg_versions(const mcpp::config::GlobalConfig& cfg,
                              std::string_view ximName)
 {
     if (ximName.empty()) return {};
-    std::string subdir(1, ximName[0]);
-    std::string fname = std::string(ximName) + ".lua";
 
     auto try_load = [&](const std::filesystem::path& p)
         -> std::optional<std::vector<std::string>>
@@ -147,18 +144,9 @@ list_available_xpkg_versions(const mcpp::config::GlobalConfig& cfg,
             body, mcpp::platform::HostPlatform::current());
     };
 
-    auto data = cfg.xlingsHome() / "data";
-    if (auto v = try_load(data / "xim-pkgindex" / "pkgs" / subdir / fname); v)
-        return std::move(*v);
-
-    std::error_code ec;
-    auto repos = data / "xim-index-repos";
-    if (std::filesystem::exists(repos, ec)) {
-        for (auto& repo : std::filesystem::directory_iterator(repos, ec)) {
-            auto cand = repo.path() / "pkgs" / subdir / fname;
-            if (auto v = try_load(cand); v) return std::move(*v);
-        }
-    }
+    auto data = mcpp::provider::open(mcpp::config::make_xlings_env(cfg))->data_root();
+    for (const auto& cand : mcpp::provider::layout().descriptor_candidates(data, ximName))
+        if (auto v = try_load(cand); v) return std::move(*v);
     return {};
 }
 
@@ -452,7 +440,7 @@ bool version_greater(const std::string& a, const std::string& b) {
 // the two come to disagree about what is installed.
 export int toolchain_list(const mcpp::config::GlobalConfig& cfg,
                           bool json = false) {
-    auto pkgsDir = cfg.xlingsHome() / "data" / "xpkgs";
+    auto pkgsDir = mcpp::provider::open(mcpp::config::make_xlings_env(cfg))->store();
     auto effective = effective_default_toolchain(cfg);
 
     // The default is a PAIR: toolchain axis (family@version) + target axis.
@@ -478,24 +466,20 @@ export int toolchain_list(const mcpp::config::GlobalConfig& cfg,
     };
     std::vector<Payload> payloads;
     std::error_code ec;
-    if (std::filesystem::exists(pkgsDir, ec)) {
-        for (auto& entry : std::filesystem::directory_iterator(pkgsDir, ec)) {
-            auto name = entry.path().filename().string();
-            if (auto sep = name.find("-x-"); sep != std::string::npos)
-                name = name.substr(sep + 3);
-            auto id = mcpp::toolchain::identify_xim_payload(name);
+    {
+        for (const auto& entry : mcpp::provider::layout().entries(pkgsDir)) {
+            auto id = mcpp::toolchain::identify_xim_payload(entry.name);
             if (!id) continue;                       // ninja/glibc/… — not a toolchain
-            for (auto& vEntry : std::filesystem::directory_iterator(entry.path(), ec)) {
-                if (!vEntry.is_directory(ec)) continue;
+            {
                 mcpp::toolchain::ToolchainSpec s;
                 s.family  = id->family;
-                s.version = vEntry.path().filename().string();
+                s.version = entry.version;
                 s.target  = id->target;
                 auto pkg = mcpp::toolchain::to_xim_package(s);
                 // From the payload ROOT, not `root/bin`: msvc keeps cl.exe
                 // four levels deeper, and asking for `root/bin` skipped every
                 // installed toolset silently.
-                auto bin = mcpp::toolchain::payload_frontend(vEntry.path(), pkg);
+                auto bin = mcpp::toolchain::payload_frontend(entry.dir, pkg);
                 // A MALFORMED DESCRIPTOR IS REPORTED, NOT SKIPPED. This
                 // enumeration's `continue` means "nothing usable here", and a
                 // payload whose own description does not parse would then be
@@ -876,16 +860,25 @@ int attach_target_arg(mcpp::toolchain::ToolchainSpec& spec,
 // already locates a payload, off Linux, and for a provider other than glibc,
 // so a home in its normal state starts no process.
 //
-// A failed install is reported at verbose level and is not an error here. The
-// consumer that needs the payload, the fixup, reports its absence with the
-// exact coordinate, and a caller whose toolchain needs no C runtime payload
-// is unaffected. Returns whether `binding` changed.
-export bool ensure_declared_runtime(const mcpp::config::GlobalConfig& cfg,
-                                    mcpp::platform::runtime::RuntimeBinding& binding) {
+// A toolchain that runs on this runtime cannot start without it (design
+// 2026-10-16 §7.2: its loader is the runtime's), so a failed install is the
+// caller's error, naming the exact coordinate that provides the payload. The
+// callers ask only for a toolchain that runs on it. Returns whether `binding`
+// changed.
+export std::expected<bool, std::string>
+ensure_declared_runtime(const mcpp::config::GlobalConfig& cfg,
+                        mcpp::platform::runtime::RuntimeBinding& binding) {
     namespace rt = mcpp::platform::runtime;
     if constexpr (!mcpp::platform::is_linux) return false;
-    if (!binding.libraryDirs.empty()) return false;
     if (rt::runtime_provider(binding.runtimeId) != "glibc") return false;
+    // The toolchains the provider installs run on this runtime (design
+    // 2026-10-16 §7.2), not on whatever it installs newest; pinned once its
+    // payload is there, which is what the provider's links point at.
+    const auto provider = mcpp::provider::open(mcpp::config::make_xlings_env(cfg));
+    if (!binding.libraryDirs.empty()) {
+        provider->pin_runtime(binding.runtimeId, /*relink=*/false);
+        return false;
+    }
 
     const auto target = "xim:" + binding.runtimeId;
     mcpp::log::verbose("toolchain", std::format(
@@ -893,13 +886,10 @@ export bool ensure_declared_runtime(const mcpp::config::GlobalConfig& cfg,
         binding.runtimeId, target));
     mcpp::fetcher::Fetcher fetcher(cfg);
     mcpp::fetcher::InstallProgressHandler progress;
-    if (auto installed = fetcher.resolve_xpkg_path(target, /*autoInstall=*/true, &progress);
-        !installed) {
-        mcpp::log::verbose("toolchain", std::format(
-            "installing the declared runtime {} failed: {}",
-            target, installed.error().message));
-        return false;
-    }
+    if (auto installed = fetcher.resolve_xpkg_path(target, /*autoInstall=*/true, &progress); !installed)
+        return std::unexpected(std::format(
+            "the C runtime the toolchain runs on, {}, is not installed: {}", target, installed.error().message));
+    provider->pin_runtime(binding.runtimeId, /*relink=*/true);
     auto again = rt::resolve_runtime_binding(binding.selection, {}, cfg.xlingsHome());
     if (!again) return false;
     binding = std::move(*again);
@@ -999,8 +989,7 @@ export int toolchain_install(const mcpp::config::GlobalConfig& cfg,
         // by now whatever held it has exited, so free the bytes before adding
         // another few hundred MB.
         {
-            auto vdir = mcpp::xlings::paths::xim_tool(
-                mcpp::config::make_xlings_env(cfg), pkg.ximName, pkg.ximVersion);
+            auto vdir = mcpp::provider::open(mcpp::config::make_xlings_env(cfg))->pinned(pkg.ximName, pkg.ximVersion);
             sweep_parked_payloads(vdir.parent_path(), vdir);
         }
         auto payload = fetcher.resolve_xpkg_path(pkg.target(), /*autoInstall=*/true, &progress);
@@ -1074,45 +1063,20 @@ export int toolchain_install(const mcpp::config::GlobalConfig& cfg,
             return 1;
         }
 
-        // Post-install fixup (patchelf / specs / cfg regeneration) — ONE
-        // pipeline shared by every toolchain install path, dispatched and
-        // made idempotent inside ensure_post_install_fixup.
-        //
-        // RESOLVE THE RUNTIME BINDING HERE, do not let the fixup guess.
-        // The fixup is a CONSUMER of RuntimeBinding (`prepare.cppm` says so
-        // where it does the same thing) and it no longer derives an identity
-        // of its own — so a caller that passes nothing gets no fixup at all.
-        // `mcpp toolchain install` is the path that needs it MOST: without
-        // the patchelf/specs wiring a fresh sandbox gcc cannot find the C
-        // library. There is no project here, so the selection is mcpp's
-        // default SubOS, which is exactly what `RuntimeSelection{}` means.
-        std::string runtimeId;
-        std::filesystem::path runtimeLibDir;
-        if (auto rb = mcpp::platform::runtime::resolve_runtime_binding(
-                mcpp::xlings::runtime::RuntimeSelection{}, {}, cfg.xlingsHome())) {
-            if (!mcpp::toolchain::post_install_fixup_kind(pkg).empty())
-                ensure_declared_runtime(cfg, *rb);
-            runtimeId = rb->runtimeId;
-            if (!rb->libraryDirs.empty()) runtimeLibDir = rb->libraryDirs.front();
-        }   // a binding that cannot be resolved degrades below, it does not stop
-            // the install — same rule the build path follows.
-
-        if (auto fixed = mcpp::toolchain::ensure_post_install_fixup(
-                cfg, payload->root, pkg, runtimeId, runtimeLibDir); !fixed) {
-            mcpp::ui::error(std::format(
-                "post-install fixup failed: {}", fixed.error()));
-            return 1;
-        } else if (!fixed->skippedReason.empty()) {
-            // The user asked for this install explicitly, so the degradation
-            // is louder here than on a build — but it is still a warning, and
-            // the install itself succeeded.
-            mcpp::ui::warning(std::format(
-                "installed, but not bound to a C runtime: {}.\n"
-                "         The install itself succeeded. To complete the wiring, "
-                "run `xlings self doctor --fix` from inside this SubOS, then "
-                "re-run this command (openxlings/xlings#547).",
-                fixed->skippedReason));
-        }
+        // The toolchain runs on the runtime its provider bound it to (design
+        // 2026-10-16 §7.2); mcpp writes nothing into it. What it needs is
+        // that runtime installed: `mcpp toolchain install` is the path that
+        // needs it MOST, before any build has provided it. There is no project
+        // here, so the selection is mcpp's default environment, which is what
+        // `RuntimeSelection{}` means.
+        if (!mcpp::toolchain::runtime_payload_kind(pkg).empty()) {
+            if (auto rb = mcpp::platform::runtime::resolve_runtime_binding(
+                    mcpp::provider::runtime::RuntimeSelection{}, {}, cfg.xlingsHome()))
+                if (auto provided = ensure_declared_runtime(cfg, *rb); !provided) {
+                    mcpp::ui::error(provided.error());
+                    return 1;
+                }
+        }   // a binding that cannot be resolved degrades, as on the build path
 
         mcpp::ui::status("Installed",
             std::format("{} → {}", pkg.display_spec(), bin.string()));
@@ -1133,7 +1097,7 @@ export int toolchain_install(const mcpp::config::GlobalConfig& cfg,
 export int toolchain_set_default(const mcpp::config::GlobalConfig& cfg,
                                  const std::string& pos0, const std::string& pos1,
                                  const std::string& targetArg = {}) {
-    auto pkgsDir = cfg.xlingsHome() / "data" / "xpkgs";
+    auto pkgsDir = mcpp::provider::open(mcpp::config::make_xlings_env(cfg))->store();
     auto xlEnv = mcpp::config::make_xlings_env(cfg);
         // Accept three input shapes (mirrors `install`):
         //   mcpp toolchain default gcc@16.1.0
@@ -1215,7 +1179,7 @@ export int toolchain_set_default(const mcpp::config::GlobalConfig& cfg,
             pkg = mcpp::toolchain::to_xim_package(*spec);
         }
 
-        auto installDir = mcpp::xlings::paths::xim_tool(xlEnv, pkg.ximName, pkg.ximVersion);
+        auto installDir = mcpp::provider::open(xlEnv)->pinned(pkg.ximName, pkg.ximVersion);
         // A RESOLVABLE COMPILER, not a directory that exists. A removal that
         // could not delete the last empty directories leaves a skeleton
         // behind (see remove_payload_tree), and `exists()` would call that
@@ -1300,7 +1264,7 @@ export int toolchain_remove(const mcpp::config::GlobalConfig& cfg,
         if (int rc = attach_target_arg(*parsedSpec, targetArg); rc != 0) return rc;
         auto pkg = mcpp::toolchain::to_xim_package(*parsedSpec);
         auto spec = parsedSpec->display();
-        auto installDir = mcpp::xlings::paths::xim_tool(xlEnv, pkg.ximName, pkg.ximVersion);
+        auto installDir = mcpp::provider::open(xlEnv)->pinned(pkg.ximName, pkg.ximVersion);
         std::error_code ec;
         if (!std::filesystem::exists(installDir, ec)) {
             mcpp::ui::error(std::format("{} is not installed", spec));
