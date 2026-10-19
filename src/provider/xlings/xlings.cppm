@@ -142,7 +142,11 @@ namespace pinned {
     // (`payload_currency`), drops dangling records in every transaction and
     // says so (`scope_repaired`), and summarizes the binding state
     // (`binding_state`) for `mcpp self doctor` (design 2026-10-17).
-    inline constexpr std::string_view kXlingsVersion   = "2026.10.17.1";
+    // Eleventh, at 2026.10.19.1 (openxlings/xlings#684). Resource probes and
+    // download socket budgets share the provider's actual transport. Read-only
+    // queries do not adopt a home or create an operation journal; older custom
+    // providers are queried for metadata only in an isolated temporary home.
+    inline constexpr std::string_view kXlingsVersion   = "2026.10.19.1";
     inline constexpr std::string_view kNasmVersion     = "3.02";
 }
 
@@ -484,10 +488,61 @@ using BootstrapProgress = mcpp::provider::BootstrapProgress;
 
 using BootstrapProgressCallback = mcpp::provider::BootstrapProgressCallback;
 
-// Run xlings install with progress callback (used by bootstrap functions).
-// When not `quiet` and stderr is a TTY, an elapsed-time spinner is shown
-// during the (otherwise silent) direct install so first-run doesn't look
-// frozen.
+// Parent-owned byte progress protection, independent of provider heartbeats
+// and socket reads (DNS or a trickle of headers may produce neither body bytes
+// nor a socket timeout). Time is injectable for the state-machine tests.
+class DownloadWatchdog {
+    struct File {
+        double bytes = 0;
+        int attempt = 0;
+        bool finished = false;
+        std::chrono::steady_clock::time_point progress;
+    };
+    std::map<std::string, File> files_;
+    std::chrono::milliseconds idle_;
+public:
+    explicit DownloadWatchdog(std::chrono::milliseconds idle = std::chrono::seconds(30)) : idle_(idle) {}
+    void observe(const BootstrapProgress& progress,
+                 std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) {
+        for (const auto& f : progress.files) {
+            auto [it, added] = files_.try_emplace(f.name);
+            auto& state = it->second;
+            if (added || f.sourceAttempt != state.attempt || f.downloadedBytes > state.bytes)
+                state.progress = now;
+            state.bytes = f.downloadedBytes;
+            state.attempt = f.sourceAttempt;
+            state.finished = f.finished || !f.started;
+        }
+    }
+    bool expired(std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const {
+        return std::ranges::any_of(files_, [&](const auto& f) {
+            return !f.second.finished && now - f.second.progress >= idle_;
+        });
+    }
+};
+
+class InstallDeadline {
+    DownloadWatchdog downloads_;
+    std::chrono::steady_clock::time_point started_;
+    std::chrono::milliseconds preparation_;
+    bool downloadSeen_ = false, localWork_ = false;
+public:
+    explicit InstallDeadline(std::chrono::milliseconds preparation = std::chrono::seconds(120),
+        std::chrono::milliseconds idle = std::chrono::seconds(30),
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now())
+        : downloads_(idle), started_(start), preparation_(preparation) {}
+    void observe(std::string_view line,
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
+    bool expired(std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const {
+        return downloads_.expired(now)
+            || (!downloadSeen_ && !localWork_ && now - started_ >= preparation_);
+    }
+};
+
+mcpp::provider::NetworkReport network_check(const Env& env, std::chrono::milliseconds budget);
+
+// One structured install with native source/byte progress, an optional
+// callback (otherwise the common download renderer), and parent-owned bounds.
 int install_with_progress(const Env& env, std::string_view target,
                           const BootstrapProgressCallback& cb,
                           bool quiet = false);
@@ -660,7 +715,8 @@ std::expected<std::string, std::string> run_capture(const std::string& cmd);
 // What the xlings at `binary` is (`xlings interface --version`, protocol
 // 1.10+): its version, protocol, capabilities, features and home layouts;
 // `answered` false for an xlings before the handshake.
-mcpp::provider::ProviderInfo describe(const std::filesystem::path& binary);
+mcpp::provider::ProviderInfo describe(const std::filesystem::path& binary,
+    std::chrono::milliseconds budget = std::chrono::seconds(3));
 
 // Why that xlings cannot serve this mcpp (design 2026-10-16 §12): empty when
 // it can. The pinned version, and every feature mcpp relies on.
@@ -911,26 +967,66 @@ std::optional<std::string> index_revision(const std::filesystem::path& indexDir)
 
 // ─── The handshake ──────────────────────────────────────────────────
 
-mcpp::provider::ProviderInfo describe(const std::filesystem::path& binary) {
+mcpp::provider::ProviderInfo describe(const std::filesystem::path& binary,
+                                    std::chrono::milliseconds budget) {
+    using namespace std::chrono;
+    const auto deadline = steady_clock::now() + budget;
+    // Older clients can adopt or journal a home before answering a query.
+    // The handshake describes the binary, so ask it outside the user's home.
+    static std::mutex mutex;
+    static std::map<std::tuple<std::filesystem::path, std::uintmax_t,
+        std::filesystem::file_time_type>, mcpp::provider::ProviderInfo> cache;
+    std::lock_guard lock(mutex);
     mcpp::provider::ProviderInfo info;
-    auto out = run_capture(std::format("{} interface --version {}", shq(binary.string()),
-                                       mcpp::platform::null_redirect));
-    if (!out) return info;
-    auto j = nlohmann::json::parse(*out, nullptr, false);
-    if (!j.is_object()) return info;
-    const auto strings = [&](const char* key) {
-        std::vector<std::string> v;
-        if (j.contains(key) && j[key].is_array())
-            for (auto& e : j[key]) if (e.is_string()) v.push_back(e.get<std::string>());
-        return v;
-    };
-    info.version = j.value("version", std::string{});
-    info.protocol = j.value("protocol_version", std::string{});
-    info.capabilities = strings("capabilities");
-    info.features = strings("features");
-    if (j.contains("home_layouts") && j["home_layouts"].is_array())
-        for (auto& e : j["home_layouts"]) if (e.is_number_integer()) info.homeLayouts.push_back(e.get<int>());
-    info.answered = !info.version.empty();
+    std::error_code ec;
+    const auto executable = std::filesystem::absolute(binary, ec);
+    if (ec) return info;
+    const auto size = std::filesystem::file_size(executable, ec);
+    if (ec) return info;
+    const auto modified = std::filesystem::last_write_time(executable, ec);
+    if (ec) return info;
+    const auto key = std::tuple{executable, size, modified};
+    if (auto it = cache.find(key); it != cache.end()) return it->second;
+    const auto temporary = std::filesystem::temp_directory_path(ec);
+    if (ec) return info;
+    const auto home = temporary / std::format("mcpp-provider-handshake-{}-{}",
+        steady_clock::now().time_since_epoch().count(), std::random_device{}());
+    if (!std::filesystem::create_directory(home, ec) || ec) return info;
+    struct Cleanup {
+        std::filesystem::path home;
+        ~Cleanup() { std::error_code error; std::filesystem::remove_all(home, error); }
+    } cleanup{home};
+    try {
+        std::vector<std::pair<std::string, std::string>> vars;
+        for (const auto& v : invocation_env(Env{binary, home, {}}))
+            vars.emplace_back(v.name, v.present ? v.value : "");
+        const auto remaining = duration_cast<milliseconds>(deadline - steady_clock::now());
+        if (remaining <= milliseconds::zero()) return info;
+        bool timedOut = false;
+        const auto command = std::format("{} interface --version {}",
+            mcpp::platform::shell::quote_through_shell(mcpp::home::spelling(executable)),
+            mcpp::platform::null_redirect);
+        const auto output = mcpp::platform::process::capture_shell_deadline(
+            command, vars, remaining, &timedOut, mcpp::home::spelling(home));
+        const auto j = !timedOut && output.exit_code == 0
+            ? nlohmann::json::parse(output.output, nullptr, false) : nlohmann::json{};
+        if (j.is_object()) {
+            const auto strings = [&](const char* field) {
+                std::vector<std::string> values;
+                if (j.contains(field) && j[field].is_array())
+                    for (const auto& value : j[field]) if (value.is_string()) values.push_back(value.get<std::string>());
+                return values;
+            };
+            info.version = j.value("version", std::string{});
+            info.protocol = j.value("protocol_version", std::string{});
+            info.capabilities = strings("capabilities");
+            info.features = strings("features");
+            if (j.contains("home_layouts") && j["home_layouts"].is_array())
+                for (const auto& value : j["home_layouts"]) if (value.is_number_integer()) info.homeLayouts.push_back(value.get<int>());
+            info.answered = !info.version.empty();
+        }
+    } catch (const std::exception&) { info = {}; }
+    cache.emplace(key, info);
     return info;
 }
 
@@ -939,7 +1035,8 @@ std::string unmet(const mcpp::provider::ProviderInfo& info) {
     if (mcpp::xpkg_version::compare_keys(info.version, pinned::kXlingsVersion) < 0)
         return std::format("is {}, older than {}", info.version, pinned::kXlingsVersion);
     for (auto feature : {"index_dir", "index_store", "upstreams", "payload_status", "sync_index",
-                         "payload_currency", "binding_state"})
+                         "payload_currency", "binding_state", "network_diagnostics",
+                         "download_socket_budgets", "read_only_queries"})
         if (std::ranges::find(info.features, feature) == info.features.end())
             return std::format("does not offer `{}`", feature);
     if (std::ranges::find(info.capabilities, "install_packages") == info.capabilities.end())
@@ -1472,10 +1569,23 @@ std::filesystem::path sandbox_init_marker(const Env& env) {
 // ─── Shell command builders ─────────────────────────────────────────
 
 std::vector<InvocationVar> invocation_env(const Env& env) {
+    auto cap = [](const char* key, int limit) {
+        auto value = mcpp::platform::env::get(key);
+        int existing = 0;
+        if (value) {
+            const auto [end, ec] = std::from_chars(value->data(), value->data() + value->size(), existing);
+            if (ec == std::errc{} && end == value->data() + value->size() && existing > 0)
+                limit = std::min(limit, existing);
+        }
+        return std::to_string(limit);
+    };
     return {
         {"XLINGS_HOME", env.home.string(), true},
         {"XLINGS_PROJECT_DIR", env.projectDir.string(), !env.projectDir.empty()},
         {"XLINGS_ACTIVE_SUBOS", "", false},
+        {"XLINGS_DOWNLOAD_CONNECT_TIMEOUT", cap("XLINGS_DOWNLOAD_CONNECT_TIMEOUT", 8), true},
+        {"XLINGS_DOWNLOAD_IDLE_TIMEOUT", cap("XLINGS_DOWNLOAD_IDLE_TIMEOUT", 30), true},
+        {"XLINGS_DOWNLOAD_LOW_SPEED", mcpp::platform::env::get("XLINGS_DOWNLOAD_LOW_SPEED").value_or("off"), true},
     };
 }
 
@@ -1671,10 +1781,19 @@ std::optional<Event> parse_event_line(std::string_view line) {
 
 // ─── Subprocess call ────────────────────────────────────────────────
 
+namespace {
+std::optional<BootstrapProgress> download_progress_of(std::string_view line);
+}
+
 std::expected<CallResult, std::string>
 call(const Env& env, std::string_view capability,
      std::string_view argsJson, EventHandler* handler)
 {
+    if (capability == "system_status" || capability == "payload_status") {
+        const auto info = describe(env.binary);
+        if (std::ranges::find(info.features, "read_only_queries") == info.features.end())
+            return std::unexpected("the provider does not offer read_only_queries; status was not queried");
+    }
     ScopedInvocationEnv scope(env);   // #614
     // STDERR GOES TO A FILE, NOT TO THE NULL DEVICE AND NOT INTO STDOUT (#614).
     // Stdout is parsed line by line as NDJSON, so merging stderr into it could
@@ -1701,10 +1820,25 @@ call(const Env& env, std::string_view capability,
         mcpp::platform::env::note_network_access();
 
     CallResult result;
+    const bool installing = capability == "install_packages";
+    const bool syncing = capability == "sync_index" || capability == "update_packages";
+    InstallDeadline deadline;
+    std::map<std::string, int> sourceAttempts;
     bool timedOut = false;
     int rc = mcpp::platform::process::run_streaming_bounded(cmd,
         [&](std::string_view line) {
             if (line.empty()) return;
+            if (installing) {
+                deadline.observe(line);
+                if (!mcpp::ui::is_quiet())
+                    if (const auto progress = download_progress_of(line))
+                        for (const auto& file : progress->files)
+                            if (!file.sourceHost.empty() && sourceAttempts[file.name] != file.sourceAttempt) {
+                                sourceAttempts[file.name] = file.sourceAttempt;
+                                print_status("Source", std::format("{} {} (attempt {})",
+                                    file.name, file.sourceHost, file.sourceAttempt));
+                            }
+            }
 
             auto ev = parse_event_line(line);
             if (!ev) return;
@@ -1732,14 +1866,20 @@ call(const Env& env, std::string_view capability,
                 }
             }, *ev);
         },
-        std::chrono::milliseconds{0},
+        installing ? std::chrono::duration_cast<std::chrono::milliseconds>(kDirectInstallTimeout)
+                   : syncing ? std::chrono::duration_cast<std::chrono::milliseconds>(index_refresh_timeout())
+                             : std::chrono::milliseconds{0},
         std::chrono::duration_cast<std::chrono::milliseconds>(kInterfaceIdleTimeout),
-        &timedOut);
+        &timedOut, false, [&] { return installing && deadline.expired(); });
     if (timedOut) {
         result.exitCode = result.exitCode != 0 ? result.exitCode : 124;
-        result.stderrTail.push_back(std::format(
-            "xlings interface {} wrote nothing for {} seconds (not even its "
-            "heartbeat) and was stopped", capability, kInterfaceIdleTimeout.count()));
+        const auto message = std::format(
+            "provider {} exceeded its progress/process deadline and was stopped", capability);
+        if (!result.error) result.error = ErrorEvent{
+            installing || syncing ? "E_NETWORK" : "E_PROVIDER_TIMEOUT", message,
+            installing || syncing ? "check proxy settings or use mcpp self config --mirror auto|CN|GLOBAL"
+                                  : "retry the local provider operation", true};
+        result.stderrTail.push_back(message);
     }
     if (rc != 0 && result.exitCode == 0) result.exitCode = rc;
     if (result.exitCode != 0) {
@@ -1749,7 +1889,8 @@ call(const Env& env, std::string_view capability,
         std::ifstream in(stderrFile);
         std::stringstream text;
         text << in.rdbuf();
-        result.stderrTail = stderr_error_tail(text.str());
+        auto tail = stderr_error_tail(text.str());
+        result.stderrTail.insert(result.stderrTail.end(), tail.begin(), tail.end());
     }
     std::error_code rmEc;
     std::filesystem::remove(stderrFile, rmEc);
@@ -1817,6 +1958,8 @@ std::optional<BootstrapProgress> download_progress_of(std::string_view line) {
         f.totalBytes      = fl.find_num("totalBytes");
         f.started         = fl.find_bool("started");
         f.finished        = fl.find_bool("finished");
+        f.sourceHost      = fl.find_str("sourceHost");
+        f.sourceAttempt   = static_cast<int>(fl.find_num("sourceAttempt"));
         if (!f.name.empty()) prog.files.push_back(std::move(f));
     }
     if (prog.files.empty()) return std::nullopt;
@@ -1901,6 +2044,101 @@ private:
 };
 } // namespace
 
+void InstallDeadline::observe(std::string_view line, std::chrono::steady_clock::time_point now) {
+    const auto event = parse_event_line(line);
+    if (!event) return; // heartbeats and unknown events never renew a budget
+    if (const auto* progress = std::get_if<ProgressEvent>(&*event)) {
+        if (progress->phase == "extract" || progress->phase == "hook" || progress->phase == "configure")
+            localWork_ = true;
+    } else if (const auto* data = std::get_if<DataEvent>(&*event);
+               data && data->dataKind == "download_progress") {
+        if (const auto p = download_progress_of(line)) {
+            downloads_.observe(*p, now);
+            downloadSeen_ |= std::ranges::any_of(p->files, [](const auto& f) { return f.started; });
+        }
+    }
+}
+
+mcpp::provider::NetworkReport network_check(const Env& env, std::chrono::milliseconds budget) {
+    using namespace std::chrono;
+    using json = nlohmann::json;
+    if (mcpp::platform::env::offline_mode()) return {"offline", {}};
+    std::error_code fileError;
+    if (!std::filesystem::is_regular_file(env.binary, fileError)) return {"unavailable", {}};
+    const auto deadline = steady_clock::now() + budget;
+    std::vector<std::pair<std::string, std::string>> vars;
+    for (const auto& v : invocation_env(env)) vars.emplace_back(v.name, v.present ? v.value : "");
+    auto run = [&](std::vector<std::string> args) -> std::optional<std::string> {
+        const auto remaining = duration_cast<milliseconds>(deadline - steady_clock::now());
+        if (remaining <= milliseconds::zero()) return std::nullopt;
+        args.insert(args.begin(), mcpp::home::spelling(env.binary));
+        bool timeout = false;
+        const auto r = mcpp::platform::process::capture_exec_deadline(
+            args, vars, remaining, &timeout, {}, nullptr, /*ownGroup=*/true);
+        if (timeout || r.exit_code != 0) return std::nullopt;
+        return r.output;
+    };
+    // Do not run an unknown capability on an older provider: its generic CLI
+    // may journal or initialize an operation before returning "unsupported".
+    const auto info = describe(env.binary, duration_cast<milliseconds>(deadline - steady_clock::now()));
+    const auto has = [&](std::string_view feature) {
+        return std::ranges::find(info.features, feature) != info.features.end();
+    };
+    const bool supported = has("network_diagnostics") && has("read_only_queries");
+    if (!supported) return {steady_clock::now() >= deadline ? "timeout" : "unsupported", {}};
+    auto call = [&](std::string_view operation, const json& args, std::string_view kind) -> json {
+        try {
+            if (operation == "probe_url") mcpp::platform::env::note_network_access();
+            const auto output = run({"interface", std::string(operation), "--args", args.dump()});
+            if (!output) return nullptr;
+            std::istringstream lines(*output);
+            std::string line;
+            while (std::getline(lines, line)) {
+                auto event = json::parse(line, nullptr, false);
+                if (event.is_object() && event.value("kind", "") == "data"
+                    && event.value("dataKind", "") == kind && event.contains("payload"))
+                    return event["payload"];
+            }
+            return nullptr;
+        } catch (const std::exception&) { return nullptr; }
+    };
+    const auto discovered = call("network_endpoints", json::object(), "network_endpoints");
+    if (!discovered.is_object() || !discovered.contains("endpoints")
+        || !discovered["endpoints"].is_array())
+        return {steady_clock::now() >= deadline ? "timeout" : "unsupported", {}};
+    const auto& endpoints = discovered["endpoints"];
+    mcpp::provider::NetworkReport report{"checked", {}};
+    report.endpoints.resize(endpoints.size());
+    std::atomic<std::size_t> next{0};
+    auto worker = [&] {
+        for (;;) {
+            const auto i = next.fetch_add(1);
+            if (i >= endpoints.size()) return;
+            const auto& e = endpoints[i];
+            auto& out = report.endpoints[i];
+            try {
+                out.resource = e.value("resource", "");
+                out.region = e.value("region", "");
+                out.status = "timeout";
+                if (!e.contains("url") || !e["url"].is_string()) { out.status = "invalid_endpoint"; continue; }
+                const auto data = call("probe_url", json{{"url", e["url"]}, {"socket_timeout_ms", 2000}}, "network_probe");
+                if (!data.is_object()) continue;
+                out.host = data.value("host", "");
+                out.status = data.value("status", "unknown");
+                out.httpStatus = data.value("http_status", 0);
+                out.elapsedSeconds = data.value("elapsed_seconds", 0.0);
+                out.reachable = data.value("reachable", false);
+                out.proxy = data.value("proxy", false);
+            } catch (const std::exception&) { out.status = "invalid_response"; }
+        }
+    };
+    std::vector<std::jthread> workers;
+    for (std::size_t i = 0; i < std::min<std::size_t>(4, endpoints.size()); ++i)
+        workers.emplace_back(worker);
+    for (auto& w : workers) w.join();
+    return report;
+}
+
 // ─── install_with_progress ──────────────────────────────────────────
 
 int install_with_progress(const Env& env, std::string_view target,
@@ -1908,110 +2146,66 @@ int install_with_progress(const Env& env, std::string_view target,
                           bool quiet)
 {
     ScopedInvocationEnv scope(env);   // #614
-    auto argsJson = std::format(
-        R"({{"targets":["{}"],"yes":true}})", target);
+    const auto argsJson = nlohmann::json{{"targets", {std::string(target)}}, {"yes", true}}.dump();
 
-    // All platforms: try direct `xlings install ... -y` first.
-    // The direct command is more reliable for large packages (e.g. LLVM
-    // ~800MB) because:
-    //   - it doesn't pipe through NDJSON interface (simpler subprocess chain)
-    //   - xlings manages its own stdin/stdout/stderr
-    //   - extraction subprocess coordination works normally
-    // The NDJSON interface path is kept as a fallback for progress reporting.
-    {
-        auto directCmd = build_command_prefix(env) +
-            std::format(" install {} -y {}", target, mcpp::platform::shell::silent_redirect);
-        // Seal stdin so xlings and any grandchildren (curl, git, 7z, xcode-select
-        // / brew prompts, etc.) cannot block on a terminal read. Without it,
-        // first-run toolchain install pauses waiting for the user to press Enter
-        // — first seen on Windows, now also reproduced on macOS (the "需要回车
-        // 才能继续" first-run report). The old "POSIX must keep stdin open for
-        // subprocess coordination" claim never held in practice; `-y` already
-        // makes the install non-interactive, so the redirect only removes the
-        // spurious terminal blocking. Windows uses <NUL, POSIX </dev/null.
-        if constexpr (mcpp::platform::is_windows) {
-            directCmd += " <NUL";
-        } else {
-            directCmd += " </dev/null";
-        }
-
-        // The direct install redirects all output to the null device, so it
-        // produces zero feedback — on a slow/network-bound first run this
-        // looks frozen. Run the blocking command on a worker thread and draw
-        // an elapsed-time bar while it runs, with the renderer every other
-        // acquisition uses (W11): redrawn in place on a terminal, one start
-        // and one finish line otherwise, nothing under --quiet.
-        const bool showSpinner = !quiet;
-
-        mcpp::platform::env::note_network_access();
-        std::atomic<bool> done{false};
-        int directRc = 0;
-        std::thread worker([&] {
-            bool timedOut = false;
-            directRc = mcpp::platform::process::run_streaming_bounded(
-                directCmd, [](std::string_view) {},
-                std::chrono::duration_cast<std::chrono::milliseconds>(kDirectInstallTimeout),
-                std::chrono::milliseconds{0}, &timedOut);
-            if (timedOut)
-                mcpp::log::warn("xlings", std::format(
-                    "`xlings install {}` did not finish within {} hours and was stopped",
-                    target, kDirectInstallTimeout.count() / 3600));
-            done.store(true, std::memory_order_release);
-        });
-
-        if (showSpinner) {
-            mcpp::ui::ProgressBar bar("Installing", target);
-            const auto start = std::chrono::steady_clock::now();
-            while (!done.load(std::memory_order_acquire)) {
-                bar.update_indeterminate(0, std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - start).count());
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            }
-            worker.join();
-            if (directRc == 0) bar.finish();
-            else               bar.finish_failed(target);
-            if (directRc == 0) return 0;
-        } else {
-            worker.join();
-            if (directRc == 0) return 0;
-        }
-    }
-
-    // Fallback: NDJSON interface path (provides progress callbacks).
-    // Seal stdin (same rationale as the direct path above) so the install can't
-    // block on a terminal read. The protocol is NDJSON-over-stdout + "yes":true,
-    // so nothing here needs the terminal.
-    // The same decision as the direct path above: the fallback used to spell
-    // global mode by hand on POSIX whatever `env.projectDir` said (#614).
+    // One structured install attempt. Repeating a failed direct install through
+    // the interface only retries the same operation and hides its first error.
+    if (!quiet) print_status("Installing", target);
+    mcpp::platform::env::note_network_access();
     auto cmd = std::format("{} interface install_packages --args {} {} {}",
         build_command_prefix(env), shq_meta(argsJson), mcpp::platform::null_redirect,
         mcpp::platform::is_windows ? "<NUL" : "</dev/null");
 
     int resultExitCode = -1;
+    std::map<std::string, int> sourceAttempts;
+    mcpp::ui::DownloadProgress download;
+    InstallDeadline deadline;
 
     auto handle_line = [&](std::string_view line) {
+        deadline.observe(line);
         LineScan ls{line};
         auto kind = ls.find_str("kind");
         if (kind == "result") {
             resultExitCode = static_cast<int>(ls.find_num("exitCode"));
             return;
         }
-        if (kind != "data") return;
-        if (ls.find_str("dataKind") != "download_progress") return;
-        if (!cb) return;
-
-        if (auto prog = download_progress_of(line)) cb(*prog);
+        if (kind == "error") {
+            const auto message = ls.find_str("message");
+            mcpp::log::warn("provider", message);
+            if (!quiet) print_status("Error", message);
+            return;
+        }
+        if (kind != "data" || ls.find_str("dataKind") != "download_progress") return;
+        const auto prog = download_progress_of(line);
+        if (!prog) return;
+        for (const auto& file : prog->files) {
+            if (!quiet && !file.sourceHost.empty() && sourceAttempts[file.name] != file.sourceAttempt) {
+                sourceAttempts[file.name] = file.sourceAttempt;
+                print_status("Source", std::format("{} {} (attempt {})", file.name, file.sourceHost, file.sourceAttempt));
+            }
+        }
+        if (cb) cb(*prog);
+        else if (!quiet) {
+            std::vector<mcpp::ui::DownloadFile> files;
+            for (const auto& f : prog->files)
+                files.push_back({f.name, static_cast<std::size_t>(std::max(0.0, f.downloadedBytes)),
+                    static_cast<std::size_t>(std::max(0.0, f.totalBytes)), f.started, f.finished});
+            download.update(files, prog->elapsedSec);
+        }
     };
 
     bool idleTimedOut = false;
     int closeRc = mcpp::platform::process::run_streaming_bounded(
-        cmd, handle_line, std::chrono::milliseconds{0},
+        cmd, handle_line, std::chrono::duration_cast<std::chrono::milliseconds>(kDirectInstallTimeout),
         std::chrono::duration_cast<std::chrono::milliseconds>(kInterfaceIdleTimeout),
-        &idleTimedOut);
+        &idleTimedOut, false, [&] { return deadline.expired(); });
+    if (!cb && !quiet) {
+        if (!idleTimedOut && resultExitCode == 0 && closeRc == 0) download.finish();
+        else download.finish_failed();
+    }
     if (idleTimedOut) {
-        mcpp::log::warn("xlings", std::format(
-            "xlings interface install_packages wrote nothing for {} seconds and was stopped",
-            kInterfaceIdleTimeout.count()));
+        mcpp::log::warn("xlings", "package install exceeded its progress/process deadline and was stopped");
+        if (!quiet) print_status("Network", "Download stopped: no byte progress or process deadline exceeded; check proxy/mirror settings");
         return resultExitCode > 0 ? resultExitCode : 124;
     }
     return (resultExitCode != -1) ? resultExitCode : closeRc;
@@ -2099,20 +2293,42 @@ void seed_xlings_json(const Env& env,
 }
 
 int config_show(const Env& env) {
-    ScopedInvocationEnv scope(env);   // #614
-    auto cmd = std::format("{} config", build_command_prefix(env));
-    return mcpp::platform::process::run_silent(cmd);
+    std::ifstream file(env.home / ".xlings.json", std::ios::binary);
+    if (!file) {
+        std::println("mirror = auto (default; registry configuration is not initialized)");
+        return 0;
+    }
+    std::cout << file.rdbuf();
+    return 0;
 }
 
 int config_set_mirror(const Env& env, std::string_view mirror, bool quiet) {
-    ScopedInvocationEnv scope(env);   // #614
     if (mirror.empty()) return 0;
-    auto cmd = std::format(
-        "{} config --mirror {} {}",
-        build_command_prefix(env),
-        shq(mirror),
-        quiet ? mcpp::platform::shell::silent_redirect : "");
-    return mcpp::platform::process::run_silent(cmd);
+    // Configuration recovery must work before the first provider invocation.
+    // The adapter owns its format; asking the CLI first would bootstrap through
+    // precisely the failed mirror the user is trying to change.
+    const auto path = env.home / ".xlings.json";
+    auto lock = mcpp::platform::fs::FileLock::try_acquire(env.home);
+    if (!lock) return 1;
+    std::ifstream input(path, std::ios::binary);
+    auto doc = nlohmann::json::parse(input, nullptr, false);
+    input.close(); // Windows cannot atomically replace a file still held open here.
+    if (doc.is_discarded() || !doc.is_object()) return 1;
+    if (doc.value("mirror", "") == mirror) return 0;
+    doc["mirror"] = mirror;
+    auto staged = path;
+    staged += ".tmp";
+    {
+        std::ofstream output(staged, std::ios::binary);
+        output << doc.dump(2) << '\n';
+        output.close();
+        if (!output) return 1;
+    }
+    std::error_code ec;
+    mcpp::platform::fs::replace_file(staged, path, ec);
+    if (ec) { std::error_code ignored; std::filesystem::remove(staged, ignored); }
+    (void)quiet;
+    return ec ? 1 : 0;
 }
 
 void ensure_init(const Env& env, bool quiet) {
@@ -2136,7 +2352,7 @@ void ensure_init(const Env& env, bool quiet) {
     bool initTimedOut = false;
     int rc = mcpp::platform::process::run_streaming_bounded(
         cmd, [](std::string_view) {},
-        std::chrono::duration_cast<std::chrono::milliseconds>(kLocalCommandTimeout),
+        std::chrono::seconds{120},
         std::chrono::milliseconds{0}, &initTimedOut);
     if (rc != 0 && !quiet) {
         std::println(stderr,

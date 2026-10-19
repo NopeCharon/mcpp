@@ -41,6 +41,9 @@ export module mcpp.platform.terminal;
 
 import std;
 import mcpp.platform.unix.bounded_process;
+import mcpp.platform.unix.terminal;
+import mcpp.platform.windows;
+import mcpp.platform.common;
 
 export namespace mcpp::platform::terminal {
 
@@ -49,6 +52,7 @@ enum class Stream { Out, Err };
 
 // Returns true if stdout is connected to a terminal (TTY).
 bool is_tty();
+bool input_is_terminal();
 
 // Whether the stream is a terminal: `isatty` on POSIX, macOS included, and a
 // console on Windows. Until 2026.9.29.5 this was compiled only under
@@ -209,6 +213,13 @@ bool is_terminal(Stream s) {
     (void)s;
     return false;
 #endif
+}
+
+bool input_is_terminal() {
+    if constexpr (mcpp::platform::is_windows)
+        return mcpp::platform::windows::input_is_terminal();
+    else
+        return mcpp::platform::unix_terminal::input_is_terminal();
 }
 
 bool is_tty() { return is_terminal(Stream::Out); }

@@ -1064,7 +1064,7 @@ std::string install_failure_hint(const std::optional<mcpp::provider::ErrorEvent>
                                  const std::filesystem::path& home) {
     const std::string code = error ? error->code : std::string{};
     if (code == "E_NETWORK")
-        return "check network and retry, or `mcpp self init --force`";
+        return "run `mcpp self doctor` to check the configured sources, then retry";
     if (code == "E_DISK_FULL")
         return std::format("free space on the disk that holds {}, then retry", home.string());
     if (code == "E_PERMISSION")
@@ -1304,7 +1304,10 @@ PayloadAction payload_action(PayloadIntent intent, bool present, bool usable, bo
 InstallFailurePolicy install_failure_policy(std::string_view errorCode) {
     if (errorCode == "E_NOT_FOUND") return {.refreshIndex = true, .retry = true};
     if (errorCode.empty()) return {.refreshIndex = true, .retry = true};
-    if (errorCode == "E_NETWORK" || errorCode == "E_INVALID_INPUT") return {.refreshIndex = false, .retry = true};
+    // The provider already exhausted its candidates and transport retries.
+    // Repeating the same download through another frontend cannot repair it.
+    if (errorCode == "E_NETWORK") return {};
+    if (errorCode == "E_INVALID_INPUT") return {.refreshIndex = false, .retry = true};
     return {};
 }
 

@@ -126,13 +126,16 @@ static std::expected<void, std::string> step1_define_early_toolchain_closures(Pr
     state.get_cfg = [&](bool requireBootstrap = true) -> std::expected<mcpp::config::GlobalConfig*, std::string> {
         if (!state.cfg_opt) {
             auto c = mcpp::config::load_or_init(/*quiet=*/false,
-                mcpp::fetcher::make_bootstrap_progress_callback());
+                mcpp::fetcher::make_bootstrap_progress_callback(), {},
+                state.overrides.plan_only ? mcpp::config::Initialization::ReadOnly
+                                          : mcpp::config::Initialization::Bootstrap);
             if (!c) return std::unexpected(c.error().message);
             state.cfg_opt = std::move(*c);
         }
-        // Commands that need bootstrap tools (build, run, toolchain install)
-        // pass requireBootstrap=true to get an early, clear error.
-        if (requireBootstrap && !state.bootstrap_checked) {
+        // Execution requires the bootstrap tools. A planning pass reads the
+        // installed toolchain without requiring an initialized provider or
+        // installing tools it will not execute.
+        if (requireBootstrap && !state.overrides.plan_only && !state.bootstrap_checked) {
             state.bootstrap_checked = true;
             auto problem = mcpp::config::check_base_init(*state.cfg_opt);
             if (!problem.empty()) {
