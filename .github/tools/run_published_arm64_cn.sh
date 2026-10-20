@@ -3,13 +3,13 @@
 set -euo pipefail
 version=${1:?exact published mcpp version}
 repo=${2:?checkout holding these tools and the canonical client pin}
-backend=${3:-proot}
+backend=${3:-bwrap}
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 2
 [[ "$(uname -m)" == aarch64 ]] || exit 2
 [[ "$backend" == proot || "$backend" == bwrap ]] || exit 2
 base=${XLINGS_HOME:?cold isolated home required}
 [[ ! -e "$base" ]] || { echo 'home must be cold'; exit 1; }
-mkdir -p "$base/bootstrap" "$base/probes" "$base/reports"
+mkdir -p "$base/bootstrap" "$base/reports"
 cd "$base"
 # Derive the client version from the repository's existing single pin.
 xl_version=$(python3 - "$repo/src/provider/xlings/xlings.cppm" <<'PY'
@@ -43,17 +43,17 @@ xl="$base/bootstrap/xlings-$xl_version-linux-aarch64/bin/xlings"
 "$xl" update
 cp "$base/data/xim-pkgindex/.xlings-index-cache.json" "$base/reports/outer-published-index.json"
 # Native backend is provided by distro infrastructure, never labeled an xim
-# ARM package. The published bwrap package is x86-only. The client locates the
-# system proot directly; bwrap's current locator needs this explicit private
-# system-backend directory. Record the symlink and actual distro version.
+# ARM package. Record its distro version and use the published client's
+# documented isolation setup, which prepares a root-owned bwrap and a narrow
+# AppArmor profile when needed, without disabling the host's restriction.
 backend_package="$backend"
 [[ "$backend" != bwrap ]] || backend_package=bubblewrap
 dpkg-query -W "$backend_package" | tee "$base/reports/backend-version.txt"
 command -v "$backend" | tee "$base/reports/backend-path.txt"
 sha256sum "$(command -v "$backend")" > "$base/reports/backend.sha256"
 if [[ "$backend" == bwrap ]]; then
-    mkdir -p "$base/data/xpkgs/xim-x-bwrap/ci-system-backend/bin"
-    ln -s /usr/bin/bwrap "$base/data/xpkgs/xim-x-bwrap/ci-system-backend/bin/bwrap"
+    "$xl" self doctor --isolation --fix -y | tee "$base/reports/isolation-doctor.txt"
+    "$xl" self doctor --isolation --json > "$base/reports/isolation-doctor.json"
 fi
 # Independently prove the exact mcpp archive is available through public CN.
 mcpp_archive="mcpp-$version-linux-aarch64.tar.gz"
@@ -69,15 +69,20 @@ mcpp_binary_sha=$(sha256sum "${archive_binaries[0]}" | cut -d ' ' -f 1)
 printf '%s\n' "$mcpp_binary_sha" > "$base/reports/mcpp-cn-binary.sha256"
 "$xl" subos new cn-arm64-published
 "$xl" subos runtime glibc@2.44.3 cn-arm64-published
-cp "$repo/.github/tools/check_published_arm64_cn_ecosystem.sh" "$base/probes/ecosystem.sh"
-printf -v command 'CN_HOST_CHECKOUT=%q CN_EXPECTED_BINARY_SHA=%q CN_PUBLISHED_XLINGS=%q bash %q release %q' "$repo" "$mcpp_binary_sha" "$xl" "$base/probes/ecosystem.sh" "$version"
+# The controller home is read-only inside a real SubOS. The selected instance
+# owns its writable workspace; its consumer uses a separate cold client home.
+probes="$base/subos/cn-arm64-published/probes"
+mkdir -p "$probes"
+cp "$repo/.github/tools/check_published_arm64_cn_ecosystem.sh" "$probes/ecosystem.sh"
+printf -v command 'CN_HOST_CHECKOUT=%q CN_EXPECTED_BINARY_SHA=%q CN_PUBLISHED_XLINGS=%q CN_PROBE_ROOT=%q bash %q release %q' "$repo" "$mcpp_binary_sha" "$xl" "$probes" "$probes/ecosystem.sh" "$version"
 "$xl" subos use cn-arm64-published --sandbox "$backend" --cmd "$command"
-work=$(cat "$base/probes/last-run.txt")
-[[ "$work" == "$base/probes/runs/"* ]] || exit 1
+work=$(cat "$probes/last-run.txt")
+[[ "$work" == "$probes/runs/"* ]] || exit 1
 cmp "$base/reports/release-tag-sha.txt" "$work/mcpp-source-sha.txt"
 cp "$base/reports/release-tag-sha.txt" "$work/cross/engine-release-sha.txt"
 cp "$work/mcpp-home/registry/data/xim-pkgindex/.xlings-index-cache.json" "$base/reports/inner-published-index.json"
 cp "$work/mcpp-home/registry/.xlings.json" "$base/reports/inner-config.json"
+cp "$probes/client-home/.xlings.json" "$base/reports/consumer-client-config.json"
 cp "$base/.xlings.json" "$base/reports/outer-config.json"
 echo "CN_REPORT=$base/reports" >> "$GITHUB_ENV"
 echo "CN_CONSUMER_REPORT=$work" >> "$GITHUB_ENV"

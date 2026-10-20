@@ -3,17 +3,27 @@
 set -euo pipefail
 phase="${1:?usage: ecosystem-cn.sh release VERSION}"
 version="${2:?mcpp version under test required}"
-base="${XLINGS_HOME:?explicit isolated XLINGS_HOME required}"
+controller="${XLINGS_HOME:?explicit isolated XLINGS_HOME required}"
+probes="${CN_PROBE_ROOT:?instance-owned probe root required}"
+[[ "$probes" == "$controller/subos/cn-arm64-published/probes" ]] || exit 1
+base="$probes/client-home"
+[[ ! -e "$base" ]] || { echo 'consumer client home must be cold'; exit 1; }
 [[ "$(uname -m)" == aarch64 ]] || { echo "native ARM64 required"; exit 1; }
 [[ "$phase" == release ]] || { echo "published release only"; exit 1; }
 [[ ! -d "${CN_HOST_CHECKOUT:?host checkout path required}" ]] || {
     echo 'host checkout must not be visible in the SubOS'; exit 1;
 }
 xl="${CN_PUBLISHED_XLINGS:?published client path required}"
-work="${CN_PROBE_RUN_DIR:-$base/probes/runs/$phase-$version-$(date +%Y%m%dT%H%M%S)}"
-[[ "$work" == "$base/probes/runs/"* ]] || exit 1
+work="${CN_PROBE_RUN_DIR:-$probes/runs/$phase-$version-$(date +%Y%m%dT%H%M%S)}"
+[[ "$work" == "$probes/runs/"* ]] || exit 1
 mkdir -p "$work"
 exec > >(tee -a "$work/probe.log") 2>&1
+export XLINGS_HOME="$base"
+# A fresh client inside the namespace must not inherit its controller's
+# project, active instance, or shim dispatch context. Filesystem isolation
+# remains enforced by the already-entered SubOS, including the check above.
+unset XLINGS_PROJECT_DIR XLINGS_ACTIVE_SUBOS XLINGS_ROOT_INSTANCE XLINGS_ROOT_LOGIN
+unset XLINGS_SHIM_DEPTH XLINGS_SUBOS_LIB XLINGS_BIN
 printf 'phase=%s version=%s XLINGS_HOME=%s sandbox_HOME=%s\n' "$phase" "$version" "$base" "$HOME"
 cat /proc/self/mountinfo > "$work/subos-mountinfo.txt"
 export MCPP_HOME="$work/mcpp-home"
@@ -21,6 +31,7 @@ export MCPP_VENDORED_XLINGS="$xl"
 export MCPP_E2E_MIRROR=CN MCPP_E2E_LLVM_VERSION=23.1.3 MCPP_E2E_EXPECT_ARCH=aarch64
 unset LD_LIBRARY_PATH LD_PRELOAD MCPP_TOOLCHAIN
 "$xl" config --mirror CN
+"$xl" update
 "$xl" install "mcpp@$version" -g -y -u
 MCPP="$base/data/xpkgs/xim-x-mcpp/$version/bin/mcpp"
 [[ -x "$MCPP" ]] || { echo "mcpp not executable: $MCPP"; exit 1; }
@@ -43,8 +54,20 @@ project="${CN_PROBE_PROJECT:-hello}"
 "$MCPP" new "$project"
 cd "$work/$project"
 "$MCPP" build 2>&1 | tee "$work/native-default-build.log"
-grep -q 'Resolved llvm@23.1.3' "$work/native-default-build.log"
-grep -Eq 'aarch64-(unknown-)?linux-gnu' "$work/native-default-build.log"
+# Cold automatic provisioning and warm resolution have different progress
+# messages. Assert the documented build facts instead of a human log banner.
+"$MCPP" emit build-database --format json > "$work/native-build-database.json"
+python3 - "$work/native-build-database.json" "$project" "$MCPP_HOME" <<'PYDEFAULT'
+import json,pathlib,sys
+envelope=json.load(open(sys.argv[1]))
+assert envelope['kind']=='mcpp.build-database',envelope
+database=envelope['data']['database']
+selected=next(s for s in database['sets'] if s['name']==sys.argv[2])
+toolchain=database['ide']['toolchains'][selected['ide']['toolchain']]
+assert toolchain['family']=='clang' and toolchain['version']=='23.1.3',toolchain
+assert toolchain['target'] in ('aarch64-linux-gnu','aarch64-unknown-linux-gnu'),toolchain
+pathlib.Path(toolchain['driver']).resolve().relative_to(pathlib.Path(sys.argv[3]).resolve())
+PYDEFAULT
 mapfile -t native_bins < <(find target -type f -path "*/bin/$project")
 [[ "${#native_bins[@]}" == 1 ]] || exit 1
 readelf -hW "${native_bins[0]}" | tee "$work/native-header.txt"
@@ -157,5 +180,5 @@ for target in x86_64-linux-gnu aarch64-macos x86_64-windows-gnu; do
 done
 echo 'RELEASE BUILD PASS: CN install/default/new/build/run/pack, native openkal, four consumers and three target artifacts.'
 cp "$work/openkal-source-sha.txt" "$work/cross/source-sha.txt"
-printf '%s\n' "$work" > "$base/probes/last-run.txt"
+printf '%s\n' "$work" > "$probes/last-run.txt"
 echo 'Foreign target execution is pending the three target-system jobs.'
