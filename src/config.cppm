@@ -838,6 +838,10 @@ std::expected<GlobalConfig, ConfigError> load_or_init(
                     dir = std::filesystem::path(h) / (entry.size() > 2 ? entry.substr(2) : std::string{});
             dir = dir.lexically_normal();
             std::error_code ec;
+            // A Luban system's /xlings is its store, wherever its xlings put it
+            // (the home that made it, for a system made on a host).
+            if (dir == "/xlings" && !std::filesystem::is_directory(dir, ec))
+                if (auto store = mcpp::provider::layout().system_home("/"); !store.empty()) dir = store;
             if (!dir.is_absolute() || !std::filesystem::is_directory(dir, ec)) {
                 // Fewer packages reused than asked for: said, not hidden.
                 mcpp::diag::degraded("xlings/upstream", std::format("[xlings] upstream {} is not a directory", entry),
