@@ -647,7 +647,7 @@ static std::expected<void, std::string> step13_cxx_process_runtime(PrepareState&
                 ? std::optional(dist::msvc_abi_default_contract(
                       mcpp::toolchain::msvc_wants_static_crt(
                           bc.linkage, bc.cxxRuntime),
-                      !state.tc->msvcRedistDir.empty()))
+                      !state.tc->base.msvc.redistDir.empty()))
                 : std::nullopt;
         const auto contracts = dist::role_contracts(
             dist::ContractStatement{
@@ -666,7 +666,7 @@ static std::expected<void, std::string> step13_cxx_process_runtime(PrepareState&
         // cannot be met is an error, never a downgrade with a warning — the
         // same rule `mcpp pack`'s mode contradiction follows.
         if (mcpp::toolchain::is_msvc_target(*state.tc)
-            && state.tc->msvcRedistDir.empty()) {
+            && state.tc->base.msvc.redistDir.empty()) {
             struct { dist::Contract c; bool stated; std::string_view role; } rows[] = {
                 {contracts.program, contracts.programStated, "distributable"},
                 {contracts.tests,   contracts.testsStated,   "test"},
@@ -903,9 +903,12 @@ static void step13_graph_and_schedule(PrepareState& state, BuildContext& ctx) {
                                                 ctx.plan.scheduleTag, decision.reason));
 
     }
-    ctx.plan.runtimeBinding = state.runtimeBindingSnapshot;
-    mcpp::build::merge_runtime_binding_contract(
-        ctx.plan, state.runtimeBindingSnapshot);
+    // THE ARTIFACT'S RUNTIME: the stated base's, when one re-derived it
+    // (design 2026-10-23 §4.6), else the binding the compiler runs on.
+    const auto& artifactRuntime = state.targetRuntimeBinding
+        ? *state.targetRuntimeBinding : state.runtimeBindingSnapshot;
+    ctx.plan.runtimeBinding = artifactRuntime;
+    mcpp::build::merge_runtime_binding_contract(ctx.plan, artifactRuntime);
     ctx.plan.compileDbPath = state.workRoot / "compile_commands.json";
     // GCC: a clean `*link:` for this build, so the payload's specs cannot
     // inject other homes' rpath entries into the artifact. AFTER the plan is
@@ -918,6 +921,23 @@ static void step13_graph_and_schedule(PrepareState& state, BuildContext& ctx) {
     if (state.tc->compiler == mcpp::toolchain::CompilerId::GCC && !state.overrides.plan_only)
         ctx.plan.gccCleanSpecs = mcpp::toolchain::write_clean_link_specs(
             state.tc->binaryPath, ctx.outputDir);
+    // THE WAY BACK FROM A TRIMMED PATH (design 2026-10-23 §15.3): a debugger
+    // loads these and finds the sources the debug information names by
+    // `<name>@<version>/…`. Written with the build that produced them, and
+    // only when there is debug information for them to serve.
+    if (!ctx.plan.trimMap.empty() && state.m->buildConfig.debug && !state.overrides.plan_only) {
+        std::error_code ec;
+        std::filesystem::create_directories(ctx.outputDir, ec);
+        std::ofstream gdb(ctx.outputDir / "source-map.gdbinit", std::ios::binary | std::ios::trunc);
+        std::ofstream lldb(ctx.outputDir / "source-map.lldbinit", std::ios::binary | std::ios::trunc);
+        gdb << "# mcpp trim_paths: the trimmed source paths, mapped back. `source <this file>`\n";
+        lldb << "# mcpp trim_paths: the trimmed source paths, mapped back. `command source <this file>`\n";
+        for (auto it = ctx.plan.trimMap.rbegin(); it != ctx.plan.trimMap.rend(); ++it) {
+            gdb  << std::format("set substitute-path {} {}\n", it->second, it->first.generic_string());
+            lldb << std::format("settings append target.source-map {} \"{}\"\n", it->second,
+                                it->first.generic_string());
+        }
+    }
 }
 
 static std::expected<void, std::string> step13_build_graph_actions(PrepareState& state, BuildContext& ctx) {
@@ -1887,7 +1907,14 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
     ctx.tc          = *state.tc;
     ctx.fp          = state.fp;
     ctx.runtimeSelection = state.runtimeSelection;
-    ctx.runtimeBinding = state.runtimeBindingSnapshot;
+    ctx.runtimeBinding = state.targetRuntimeBinding ? *state.targetRuntimeBinding
+                                                    : state.runtimeBindingSnapshot;
+    ctx.runUnder = state.runUnder;
+    if (!state.runUnder.empty()) {
+        auto const& o = state.runUnderOrigin;
+        ctx.runUnderOrigin = o.originKind == "env" ? o.originKey
+            : o.originLine > 0 ? std::format("{}:{}", o.originFile, o.originLine) : o.originFile;
+    }
     ctx.profile     = state.effectiveProfile;
     ctx.activeFeatureRequest = state.workspacePlan() ? state.requestedFeatures
                                                      : state.overrides.features;

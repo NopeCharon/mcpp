@@ -381,7 +381,23 @@ std::filesystem::path write_clean_link_specs(
     auto out = outputDir / "mcpp-clean-link.specs";
     // Idempotent: the pristine spec is a property of the compiler binary, so
     // regenerating it every build would spawn a process for a constant.
-    if (std::filesystem::exists(out, ec)) return out;
+    //
+    // `%(sysroot_spec)` IS NOT RESTORED HERE, and that is measured. gcc puts
+    // it before `*link:` ahead of any `-specs=` file, so this file drops it
+    // and ld hears no `--sysroot` from the driver. For the ecosystem's own
+    // view that is what keeps the link working: ld prefixes a sysroot onto the
+    // DT_RUNPATH of every shared library it reads, and a SubOS farm library's
+    // RUNPATH names the payload store by absolute path (e2e 220: libEGL.so's
+    // libGLdispatch, not found). A STATED base hands ld its `--sysroot`
+    // explicitly instead (`ToolchainLinkModel::link_tokens`).
+    if (std::filesystem::exists(out, ec)) {
+        std::ifstream is(out);
+        std::string head, body;
+        std::getline(is, head);
+        std::getline(is, body);
+        if (!body.starts_with("%(sysroot_spec) ")) return out;
+        // Written by a pre-release build of 2026.10.24.1; regenerated once.
+    }
 
     // An argument vector: the command-string form carried `2>/dev/null`, which
     // cmd.exe cannot open, so on a Windows host this probe printed a spurious

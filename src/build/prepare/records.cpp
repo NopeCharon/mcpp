@@ -547,17 +547,42 @@ void step13_resolution_json(PrepareState& state, BuildContext& ctx) {
         // THE MSVC SYSROOT OF THE CLANG ROW: which toolset and SDK the build
         // compiled against, and where each came from. Absent on every other
         // row, so a reader can tell "not this row" from "not recorded".
-        if (!ctx.plan.toolchain.msvcToolsDir.empty()) {
+        if (!ctx.plan.toolchain.base.msvc.toolsDir.empty()) {
             const auto& tcr = ctx.plan.toolchain;
             j["msvc_toolset"] = {
-                {"version", tcr.msvcToolsVersion},
-                {"origin",  tcr.msvcOrigin},
-                {"product", tcr.msvcProduct},
-                {"root",    tcr.msvcToolsDir.generic_string()},
+                {"version", tcr.base.msvc.toolsVersion},
+                {"origin",  tcr.base.msvc.origin},
+                {"product", tcr.base.msvc.product},
+                {"root",    tcr.base.msvc.toolsDir.generic_string()},
             };
             j["windows_sdk"] = {
-                {"version", tcr.windowsSdkVersion},
-                {"root",    tcr.windowsSdkRoot.generic_string()},
+                {"version", tcr.base.msvc.sdkVersion},
+                {"root",    tcr.base.msvc.sdkRoot.generic_string()},
+            };
+        }
+        // THE TARGET BASE AND THE EXECUTION HOST (design 2026-10-23 §4.10).
+        // Present on every build, so "the ecosystem's base" is a value a
+        // reader sees rather than an absence it has to interpret.
+        {
+            namespace tb = mcpp::toolchain::base;
+            const auto& b = ctx.plan.toolchain.base;
+            nlohmann::json dirs = nlohmann::json::array();
+            for (auto const& d : b.runtimeDirs) dirs.push_back(d.generic_string());
+            j["base"] = {
+                {"form", std::string(tb::form_name(b.form))},
+                {"statement", b.text},
+                {"address", std::string(tb::address_name(b.address))},
+                {"runtime", std::string(tb::runtime_name(b.runtime))},
+                {"root", b.root.generic_string()},
+                {"c_abi", {{"impl", b.libc}, {"version", b.libcVersion}}},
+                {"multiarch", b.multiarch ? b.multiarchTuple : std::string{}},
+                {"loader", b.loader.generic_string()},
+                {"runtime_dirs", std::move(dirs)},
+                {"identity", b.identity},
+            };
+            j["execution"] = {
+                {"run_under", ctx.runUnder},
+                {"origin", ctx.runUnderOrigin},
             };
         }
         // WHERE EACH SOURCE CAME FROM (mcpp#755): the decision record, one

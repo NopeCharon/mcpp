@@ -118,6 +118,13 @@ automatically uses the package's only template when none is explicitly marked.
 Multiple templates without one default are an error that points to
 `--list-templates`. There is no separate `--variant` vocabulary.
 
+A package template can use a module wrapper for a traditional header library.
+The module name and the C++ API namespace are independent: importing a wrapper
+does not rename the upstream types or functions. Use the package's published
+identity and version when selecting its template. The
+[wrapper specification](https://github.com/mcpplibs/mcpp-index/blob/main/docs/mwrap.md)
+documents the `mcpplibs.mwrap` naming and interface contract.
+
 The package identity, version, and template are fully resolved before the
 destination is committed. A failed download, render, hook, or validation leaves
 no half-created project directory.

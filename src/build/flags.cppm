@@ -411,9 +411,17 @@ std::filesystem::path staged_std_bmi_path(const BuildPlan& plan) {
     return mcpp::toolchain::staged_std_bmi_path(plan.toolchain, plan.outputDir);
 }
 
-// Escape a path for embedding in ninja rule strings (native separators).
+// One path as one word of a ninja `command = ` line (native separators):
+// quoted for the host when the shell would split or expand it, `$` escaped for
+// ninja. A path the shell reads as it is keeps the old spelling byte for byte;
+// the question is asked of the generic form, so that a Windows separator alone
+// does not quote every path on that host. Until #832 this escaped for ninja
+// alone, and a home under a directory with a space handed gcc `-B/tmp/mc` and
+// `probe/home/…` as two words.
 std::string escape_path(const std::filesystem::path& p) {
-    return escape_ninja_chars(p.string());
+    const auto s = p.string();
+    const auto g = p.generic_string();
+    return shell_quote_arg(g) == g ? escape_ninja_chars(s) : ninja_command_word(s);
 }
 
 // One WORD of the link-flag list, with a package-relative search path made
@@ -645,7 +653,7 @@ std::string program_cxx_runtime(const mcpp::manifest::Manifest& m,
         mcpp::toolchain::is_msvc_target(tc)
             ? std::optional(dist::msvc_abi_default_contract(
                   mcpp::toolchain::msvc_wants_static_crt(bc.linkage, bc.cxxRuntime),
-                  !tc.msvcRedistDir.empty()))
+                  !tc.base.msvc.redistDir.empty()))
             : std::nullopt;
     const auto contracts = dist::role_contracts(
         dist::ContractStatement{
@@ -773,17 +781,11 @@ CompileFlags compute_flags(const BuildPlan& plan) {
     // --no-default-config and provide everything explicitly.
     const auto dm = mcpp::toolchain::resolve_clang_driver(plan.toolchain);
     const auto lm = mcpp::toolchain::resolve_link_model(plan.toolchain);
-    // ONE WORD PER PATH, QUOTED WHEN IT HAS TO BE. `escape_path` escapes for
-    // ninja and does not quote, so a path with a space reached the command as
-    // two words. No path this line carries on Linux or macOS had one; the MSVC
-    // toolset on the clang row always has one (`C:\Program Files\...`). A
-    // path without whitespace keeps its old spelling byte for byte.
+    // ONE WORD PER PATH, QUOTED WHEN IT HAS TO BE (`escape_path`): the MSVC
+    // toolset on the clang row always has a space (`C:\Program Files\...`),
+    // and a home under such a directory gives every payload path one.
     const mcpp::toolchain::PathEscape ninjaEsc =
-        [](const std::filesystem::path& p) {
-            const auto s = p.string();
-            return s.find_first_of(" \t") == std::string::npos
-                ? escape_path(p) : ninja_command_word(s);
-        };
+        [](const std::filesystem::path& p) { return escape_path(p); };
 
     std::string compile_toolchain_flags;
     std::string link_toolchain_flags;
@@ -884,7 +886,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         // READ, NOT RE-DERIVED. `prepare` located this once, where the target
         // and the machine's Xcode are both known, and refused there if it was
         // absent -- so a second `sdk_path()` call here could only disagree.
-        hopt.appleSdkRoot          = plan.toolchain.appleSdkRoot;
+        hopt.appleSdkRoot          = plan.toolchain.base.apple.root;
         // THE SAME EXPRESSION THE LINK SIDE ASKS, twenty lines further down
         // (`plan.targetSide.cAbi.prebuilt()`). Reading one value at both sites
         // is what makes it impossible for them to disagree — which they did,
@@ -894,7 +896,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         // in for. The two differ on a hosted target whose C library is a
         // located SDK while a package supplies libc++ (mcpp#630, §5).
         hopt.cxxFromGraph = plan.targetSide.cxx.fromGraph();
-        hopt.appleSdkCxxHeaders = plan.toolchain.appleSdkCxxHeaders;
+        hopt.appleSdkCxxHeaders = plan.toolchain.base.apple.cxxHeaders;
         compile_toolchain_flags = mcpp::toolchain::render_tokens(
             mcpp::toolchain::host_compile_tokens(plan.toolchain, hopt, ninjaEsc));
         for (auto const& w : mcpp::toolchain::apple_float_macro_words(plan.toolchain))
@@ -1142,6 +1144,28 @@ CompileFlags compute_flags(const BuildPlan& plan) {
     // `/LTCG` on the link and the archive; before, it was not spelled at all,
     // and a build with `lto = true` reported `+ lto` while doing none.
     if (prof.lto) opt_flag += isMsvcDialect ? " /GL" : " -flto";
+    // `ndebug` (design 2026-10-23 §15.4): the profiles that produce what is
+    // shipped define NDEBUG for every unit of the graph, as CMake's Release,
+    // Meson's `b_ndebug=if-release` and Cargo's release do.
+    if (prof.ndebug) opt_flag += isMsvcDialect ? " /DNDEBUG" : " -DNDEBUG";
+    // `trim_paths` (§15.3, mcpp#832): every absolute prefix an artifact would
+    // carry -- in `__FILE__`, `std::source_location`, assertion messages and
+    // debug information -- replaced by what it IS. One flag covers all of
+    // them on gcc and clang. cl.exe has no documented equivalent, and a build
+    // that claimed to trim and did not would be worse than one that says so.
+    if (prof.trimPaths && !plan.trimMap.empty()) {
+        if (isMsvcDialect) {
+            // A note, not a degradation: nothing the build does changes, and
+            // `--strict` must not start refusing every cl.exe release build.
+            mcpp::diag::note("build/trim_paths",
+                "trim_paths is on, and cl.exe has no documented switch that maps source "
+                "paths: the artifact keeps the absolute paths it was built from (clang on "
+                "`*-windows-msvc` trims them)");
+        } else {
+            for (auto const& [from, to] : plan.trimMap)
+                opt_flag += " -ffile-prefix-map=" + escape_path(from) + "=" + to;
+        }
+    }
 
     // MSVC baseline: /nologo /EHsc /utf-8 (dialect alwaysFlags) + the CRT
     // model — /MD by default, /MT when either knob asks for the static CRT
@@ -1339,7 +1363,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         const std::optional<dist::Contract> msvcAbiDefault =
             mcpp::toolchain::is_msvc_target(plan.toolchain)
                 ? std::optional(dist::msvc_abi_default_contract(
-                      msvcAbiWantsStaticCrt, !plan.toolchain.msvcRedistDir.empty()))
+                      msvcAbiWantsStaticCrt, !plan.toolchain.base.msvc.redistDir.empty()))
                 : std::nullopt;
         const dist::RoleContracts contracts = dist::role_contracts(
             dist::ContractStatement{
@@ -1410,7 +1434,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         // this target IS the statement "this is an Apple cross"; deriving it
         // again from the triple here would be a second answer to a question
         // already settled where the machine's Xcode was consulted.
-        mi.appleCrossTarget = !plan.toolchain.appleSdkRoot.empty();
+        mi.appleCrossTarget = !plan.toolchain.base.apple.root.empty();
         mi.format         = format;
         // A SECOND C++ RUNTIME ON THIS LINE.
         //
@@ -1674,11 +1698,11 @@ CompileFlags compute_flags(const BuildPlan& plan) {
                                      d.origin == Origin::Derived ? rp::Kind::Derived
                                                                  : rp::Kind::Declared});
         if (msvcAbi && policy != rp::CrtPolicy::System
-            && !plan.toolchain.msvcRedistDir.empty()) {
+            && !plan.toolchain.base.msvc.redistDir.empty()) {
             std::vector<std::filesystem::path> sources;
             std::error_code ec;
             for (auto const& e : std::filesystem::directory_iterator(
-                     plan.toolchain.msvcRedistDir, ec)) {
+                     plan.toolchain.base.msvc.redistDir, ec)) {
                 if (!e.is_regular_file(ec)) continue;
                 auto ext = e.path().extension().string();
                 std::ranges::transform(ext, ext.begin(),
@@ -1992,7 +2016,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         // which SDK, and which deployment-target flag. `appleSdkRoot` being
         // non-empty is what says the target is the cross one; prepare resolves
         // it and refuses there when the SDK cannot be located.
-        const bool appleCross = !plan.toolchain.appleSdkRoot.empty();
+        const bool appleCross = !plan.toolchain.base.apple.root.empty();
 
         std::string version_min;
         // THE iOS DEPLOYMENT TARGET IS NOT A FLAG HERE, AND THAT IS ONE
@@ -2031,7 +2055,10 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         std::string macos_sdk;
         if (appleCross) {
             macos_sdk = " -isysroot "
-                      + escape_path(plan.toolchain.appleSdkRoot);
+                      + escape_path(plan.toolchain.base.apple.root);
+        } else if (plan.toolchain.base.stated()
+                   && plan.toolchain.base.address == mcpp::toolchain::base::Address::AppleIsysroot) {
+            macos_sdk = " -isysroot " + escape_path(plan.toolchain.base.root);
         } else if (auto sdk = mcpp::platform::macos::sdk_path()) {
             macos_sdk = " -isysroot " + escape_path(*sdk);
         }
@@ -2333,9 +2360,9 @@ CompileFlags compute_flags(const BuildPlan& plan) {
             // it goes into LinkInputs below, because the freestanding link
             // line is replaced wholesale and anything added to f.ld here is
             // discarded.
-            if (!plan.toolchain.targetSysrootInclude.empty()) {
+            if (!plan.toolchain.base.multilibInclude.empty()) {
                 const auto flag =
-                    " -isystem " + ninjaEsc(plan.toolchain.targetSysrootInclude);
+                    " -isystem " + ninjaEsc(plan.toolchain.base.multilibInclude);
                 f.cxx += flag; f.cc += flag; f.as += flag;
             }
 
@@ -2345,7 +2372,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
             // it, which then dies with 'unrecognised emulation mode'.
             // Reproduced on this toolchain 2026-08-19.
             in.lld = mcpp::freestanding::resolve_lld(plan.toolchain.binaryPath);
-            in.sysrootLib = plan.toolchain.targetSysrootLib;
+            in.sysrootLib = plan.toolchain.base.multilibLib;
             // `--no-default-config` FIRST, and it is not hygiene.
             //
             // The llvm payload ships bin/clang++.cfg with an unconditional
