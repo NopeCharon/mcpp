@@ -226,6 +226,14 @@ step9_gather_target_side_candidates(PrepareState& state) {
                 gather.requirements.push_back({ pkgId, (*parsed)->layer,
                                          (*parsed)->interfaceName });
             }
+            // The private ones (design 2026-10-26 §6.3): the manifest parser
+            // accepted them for `mcpp:c++-abi` only.
+            for (auto const& entry : pkg.manifest.privateRequires) {
+                auto parsed = tsd::parse_capability(entry);
+                if (!parsed || !*parsed) continue;
+                gather.requirements.push_back({ pkgId, (*parsed)->layer,
+                                         (*parsed)->interfaceName, /*privateScope=*/true });
+            }
         }
 
         for (auto const& [layerInt, slot] : gather.byLayer) {
@@ -998,6 +1006,10 @@ step9_layering_and_requirement_checks(PrepareState& state, TargetSideGather& gat
             refusal::record(refusal::Code::LayerRequirement);
             return std::unexpected(*why);
         }
+        // The islands: packages whose private C++ requirement the graph's C++
+        // layer does not meet. Verified where their objects and the image
+        // exist (phase 13 and after the link), not here.
+        state.cxxIslands = tsd::cxx_islands(state.resolvedTargetSide, gather.requirements);
         // A WARNING, NOT A REFUSAL. The graph decides the C library either
         // way, so the segment is ignored rather than violated and the artifact
         // is the same with or without it. Refusing was tried and broke every
@@ -1653,6 +1665,7 @@ static std::expected<void, std::string> step9_root_build_program(PrepareState& s
         // and the three answers that keep a board package from naming a
         // toolchain. One call — see fill_target_build_env.
         fill_target_build_env(bpEnv, *state.m, state.tc ? &*state.tc : nullptr, state.cfg_opt ? &*state.cfg_opt : nullptr);
+        apply_graph_cxx_abi(bpEnv, state.packages);
         bpEnv.toolsBin = state.projectSubosBin;
         bpEnv.profile      = state.effectiveProfile;
         bpEnv.accel        = state.resolvedAccel();
@@ -2064,6 +2077,7 @@ static std::expected<void, std::string> step9_member_build_programs(PrepareState
         bpEnv.targetTriple = state.resolvedTargetCanonical;
         fill_target_build_env(bpEnv, *state.m, state.tc ? &*state.tc : nullptr,
                               state.cfg_opt ? &*state.cfg_opt : nullptr);
+        apply_graph_cxx_abi(bpEnv, state.packages);
         bpEnv.toolsBin = state.projectSubosBin;
         bpEnv.profile  = state.effectiveProfile;
         bpEnv.accel    = state.resolvedAccel();

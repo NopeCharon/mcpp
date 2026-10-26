@@ -124,6 +124,9 @@ struct GlobalConfig {
 
     // From config.toml [build]
     std::int64_t                    defaultJobs = 0;
+    // `[build] compile_commands`: the default for a project that does not say
+    // where its compile database goes (design 2026-10-26 D14). Empty: none.
+    std::string                     compileCommands;
 
     // From config.toml [toolchain] (M5.5)
     //   default = "<compiler>@<version>"   e.g. "gcc@15.1.0"
@@ -451,6 +454,10 @@ search_ttl_seconds = 3600
 
 [build]
 default_jobs    = 0
+# Publish each project's compile database at this path under its root, for a
+# project whose mcpp.toml does not say ([build] compile_commands). Unset: the
+# database stays in the build directory (target/<triple>/<fp>/).
+# compile_commands = "compile_commands.json"
 )";
 }
 
@@ -863,6 +870,16 @@ std::expected<GlobalConfig, ConfigError> load_or_init(
 
     // 2. Create directory tree
     std::error_code ec;
+    // `--deny init-mcpp-home` (design 2026-10-26 §5.5): a home that holds no
+    // configuration yet is not set up, and the caller said not to.
+    if (initialization != Initialization::ReadOnly
+        && !std::filesystem::exists(cfg.configFile, ec)
+        && mcpp::platform::env::effect_denied("init-mcpp-home")) {
+        mcpp::platform::env::note_effect_refused("init-mcpp-home", cfg.mcppHome.generic_string());
+        return std::unexpected(ConfigError{std::format(
+            "effect denied: init-mcpp-home -- {} is not set up yet, and the caller denied "
+            "creating it (--deny init-mcpp-home)", cfg.mcppHome.generic_string())});
+    }
     if (initialization != Initialization::ReadOnly) {
         for (auto& d : { cfg.binDir, cfg.registryDir, cfg.bmiCacheDir,
                          cfg.metaCacheDir, cfg.logDir }) {
@@ -915,6 +932,7 @@ std::expected<GlobalConfig, ConfigError> load_or_init(
     mcpp::provider::set_index_refresh_timeout(std::chrono::seconds{cfg.indexRefreshTimeoutSeconds});
     cfg.searchTtlSeconds = doc->get_int("cache.search_ttl_seconds").value_or(3600);
     cfg.defaultJobs    = doc->get_int("build.default_jobs").value_or(0);
+    cfg.compileCommands = doc->get_string("build.compile_commands").value_or("");
     cfg.defaultToolchain = doc->get_string("toolchain.default").value_or("");
     cfg.defaultTarget    = doc->get_string("toolchain.default_target").value_or("");
     // The system-level configuration (design 2026-10-16 §8.1, §9): what an

@@ -416,6 +416,21 @@ struct BuildPlan {
     // `openkal-llvm` family name, which had to be invented to carry a fact
     // about the dependency graph on an object that describes a compiler.
     mcpp::targetside::TargetSide    targetSide;
+    // THE C++ ISLAND OF THIS BUILD, when it has one (design 2026-10-26 §6.3):
+    // a C++ runtime other than the build's own reaches the link -- declared by
+    // packages' private `mcpp:c++-abi` requirements, named on the link line,
+    // or needed by a library the line names. The runtime table then embeds
+    // the build's own runtime hidden with one unwinder, the named words follow
+    // it on the line, and every C++ image is verified after the link
+    // (mcpp.build.cxx_runtime). Absent: one runtime, nothing to verify.
+    struct CxxIsland {
+        std::string                 own;          // "libc++" / "libstdc++"
+        std::string                 foreign;
+        std::vector<std::string>    packages;     // the packages that declared it
+        std::vector<std::string>    namedWords;   // link words naming the foreign runtime
+        std::vector<std::string>    neededBy;     // libraries on the line that NEED it
+    };
+    std::optional<CxxIsland>        cxxIsland;
     // Which graph this plan will write into build.ninja. The fingerprint does
     // NOT cover dev-deps or test targets, so `mcpp build` and `mcpp test`
     // share an output directory and overwrite each other's graph; this is what
@@ -486,6 +501,10 @@ struct BuildPlan {
     // configurations, which publishes the root file itself, once, from all of
     // them (`publish_root_compile_commands` over a list).
     bool                            publishRootCompileDb = true;
+    // `[build] compile_commands` as resolved (resolve_compile_commands):
+    // relative to the project root, empty when no copy is published. Recorded
+    // with the build so a fast path publishes to the same place.
+    std::string                     rootCompileDb;
     // See StdModuleUnit above. Empty when the build does not import `std`.
     std::vector<StdModuleUnit>      stdModuleUnits;
     // GCC only: a specs file that replaces the pristine `*link:`, so the

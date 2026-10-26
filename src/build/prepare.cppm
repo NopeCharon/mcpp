@@ -539,6 +539,12 @@ export struct BuildContext {
     // not, which let a plain build serve a featured artefact.
     std::string activeFeatureRequest;
     std::filesystem::path           outputDir;
+    // THE BUILD DIRECTORY'S LOCK (mcpp.build.dirlock, mcpp#839): taken when
+    // the finish phase starts writing `outputDir`, held through ninja, and
+    // dropped (`reset()`) before a program or a test runs. Shared because a
+    // context is copied; the last copy releases it. Null for a planning pass
+    // that describes (plan_only), which works in its own directory.
+    std::shared_ptr<mcpp::platform::fs::FileLock> buildLock;
     std::filesystem::path           stdBmi;
     std::filesystem::path           stdObject;
     // plan_only: what the std module build WOULD be (sources are on the
@@ -719,6 +725,14 @@ void with_member(BuildContext& ctx, std::string_view owner, F&& fn) {
     } exchange{ctx, group, member};
     fn();
 }
+
+// WHERE THE PROJECT'S COMPILE DATABASE IS PUBLISHED (design 2026-10-26 D14),
+// relative to the project root; empty when it is not. MCPP_COMPILE_COMMANDS
+// ("off" or "none" for no copy), then `[build] compile_commands` of the
+// manifest ("" for no copy), then the machine's default from config.toml.
+// The configuration's own database is in its build directory either way.
+export std::string resolve_compile_commands(const mcpp::manifest::Manifest& m,
+                                            std::string_view machineDefault);
 
 export CacheMode resolve_cache_mode(const mcpp::manifest::Manifest& m,
                                     std::string_view override_mode);

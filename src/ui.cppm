@@ -84,6 +84,9 @@ void finished(std::string_view profile, std::chrono::milliseconds elapsed,
 // "warning:" / "error:" prefix lines (yellow / red).
 void warning(std::string_view message);
 void error(std::string_view message);
+// Receives each message `error` prints, while set: an enveloped command
+// carries its errors as diagnostics (design 2026-10-26 §5.6). Empty clears.
+void set_error_observer(std::function<void(std::string_view)> observer);
 // "note:" prefix line (cyan), on stderr like the two above: a statement that
 // changes nothing the build does and that a reader may want to act on.
 void note(std::string_view message);
@@ -437,7 +440,17 @@ bool detect_color(term::Stream s) {
     if (auto* e = std::getenv("NO_COLOR");      e && *e)        return false;
     // On Windows this also turns the console's escape processing on, without
     // which the colour sequences would be printed as text.
-    return term::can_move_cursor(s);
+    const bool terminal = term::can_move_cursor(s);
+    // COLOUR ASKED FOR WHERE THERE IS NO TERMINAL (design 2026-10-26 D15):
+    // an IDE's console, a CI log or a pager reads mcpp through a pipe and
+    // renders the escapes itself. `CLICOLOR_FORCE` (any value but "0") and
+    // `FORCE_COLOR` (any value but "0" or "false") are the two conventions
+    // such hosts set; NO_COLOR and MCPP_NO_COLOR, above, still win. Colour
+    // only: the status row needs a terminal and stays off in a pipe.
+    if (auto* e = std::getenv("CLICOLOR_FORCE"); e && *e && std::string_view(e) != "0") return true;
+    if (auto* e = std::getenv("FORCE_COLOR"); e && *e && std::string_view(e) != "0"
+        && std::string_view(e) != "false") return true;
+    return terminal;
 }
 
 std::string with_color(std::string_view code, std::string_view text) {
@@ -796,7 +809,21 @@ void warning(std::string_view message) {
         : std::format("warning: {}\n", message));
 }
 
+namespace {
+std::mutex g_errorObserverMutex;
+std::function<void(std::string_view)> g_errorObserver;
+}  // namespace
+
+void set_error_observer(std::function<void(std::string_view)> observer) {
+    std::lock_guard lock(g_errorObserverMutex);
+    g_errorObserver = std::move(observer);
+}
+
 void error(std::string_view message) {
+    {
+        std::lock_guard lock(g_errorObserverMutex);
+        if (g_errorObserver) g_errorObserver(message);
+    }
     init();
     emit(term::Stream::Err, colored(term::Stream::Err)
         ? std::format("{}{}error:{} {}\n", kBold, kBrightRed, kReset, message)

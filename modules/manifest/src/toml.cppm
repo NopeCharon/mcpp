@@ -618,6 +618,82 @@ ManifestError error(const std::filesystem::path& origin,
     return ManifestError{msg, origin, pos.line, pos.column};
 }
 
+// A rejection that names its key -- `[build].sources must be …`, `[package]
+// needs …`, the convention of these messages -- is located where that key (or
+// that table's header) is written, so a reader of the message, or of the
+// envelope, is taken to the line (design 2026-10-26 §5.6). The first
+// `[table]` or `[table].key` in the message is the one it is about; a table
+// whose name the message elides (`[target.'cfg(...)']`) is not located.
+void locate_named_key(ManifestError& e, const t::Document& doc) {
+    const std::string_view msg = e.message;
+    const auto open = msg.find('[');
+    if (open == std::string_view::npos) return;
+    const auto close = msg.find(']', open);
+    if (close == std::string_view::npos || close == open + 1) return;
+    std::string dotted(msg.substr(open + 1, close - open - 1));
+    std::string table = dotted;
+    std::size_t i = close + 1;
+    if (i + 1 < msg.size() && msg[i] == '.') {
+        std::size_t j = i + 1;
+        while (j < msg.size() && (std::isalnum(static_cast<unsigned char>(msg[j]))
+                                  || msg[j] == '_' || msg[j] == '-'))
+            ++j;
+        if (j > i + 1) dotted += "." + std::string(msg.substr(i + 1, j - i - 1));
+    }
+    auto at = doc.position_of(dotted);
+    if (!at && dotted != table) at = doc.position_of(table);
+    if (!at) return;
+    e.line = at->line;
+    e.column = at->column;
+}
+
+// One `requires` array, of `[package]` or of a `[target.<sel>]` (design
+// 2026-10-26 §6.3, D20): each entry a string, or a table
+// `{ layer = "<capability>", visibility = "public" | "private" }`. A string
+// is a public requirement, as it always was. `private` is accepted for the
+// C++ layer alone -- a second C library in one image is not an island, it is
+// two C libraries (openkal's boundary) -- and refused otherwise, naming
+// `requires-private-layer`. `where` names the table for the messages.
+std::expected<void, std::string>
+read_requires(const t::Value& v, std::string_view where,
+              std::vector<std::string>& publicOut, std::vector<std::string>& privateOut) {
+    if (!v.is_array())
+        return std::unexpected(std::format(
+            "{} requires must be an array of capabilities, such as "
+            "[\"mcpp:compiler=llvm\"] or [{{ layer = \"mcpp:c++-abi=libstdc++\", "
+            "visibility = \"private\" }}]", where));
+    for (auto const& e : v.as_array()) {
+        if (e.is_string()) { publicOut.push_back(e.as_string()); continue; }
+        if (!e.is_table())
+            return std::unexpected(std::format(
+                "{} requires: an entry is a string or a table {{ layer, visibility }}", where));
+        std::string layer, visibility = "public";
+        for (auto const& [k, kv] : e.as_table()) {
+            if (k == "layer" && kv.is_string()) layer = kv.as_string();
+            else if (k == "visibility" && kv.is_string()) visibility = kv.as_string();
+            else
+                return std::unexpected(std::format(
+                    "{} requires: `{}` is not a member of a requirement; the members are "
+                    "`layer` (a string) and `visibility` (\"public\" or \"private\")", where, k));
+        }
+        if (layer.empty())
+            return std::unexpected(std::format("{} requires: a table entry needs `layer`", where));
+        if (visibility == "public") { publicOut.push_back(layer); continue; }
+        if (visibility != "private")
+            return std::unexpected(std::format(
+                "{} requires: visibility = \"{}\"; the values are \"public\" and \"private\"",
+                where, visibility));
+        if (!layer.starts_with("mcpp:c++-abi="))
+            return std::unexpected(std::format(
+                "{} requires: visibility = \"private\" is for `mcpp:c++-abi=<impl>` only, "
+                "and `{}` is another layer [requires-private-layer].\n"
+                "       A private C++ runtime stays behind its package's C interface; "
+                "one image has one C library and one compiler runtime.", where, layer));
+        privateOut.push_back(layer);
+    }
+    return {};
+}
+
 // #227 follow-up: libs/toml.cppm's `[[dotted.path]]` support is intentionally
 // schema-agnostic — it accepts an array-of-tables at ANY dotted path, so a
 // doubled-bracket typo like `[[dependencies]]` (single brackets meant) or
@@ -919,7 +995,9 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
     if (!doc) {
         return std::unexpected(error(origin, doc.error().message, doc.error().where));
     }
-    return parse_document(*doc, origin, ctx);
+    auto m = parse_document(*doc, origin, ctx);
+    if (!m && m.error().line == 0) locate_named_key(m.error(), *doc);
+    return m;
 }
 
 namespace {
@@ -958,6 +1036,12 @@ std::expected<Manifest, ManifestError> parse_document(const t::Document& documen
         // reader below type-checks every entry, so nothing is silently
         // dropped on this path either way.
         "xlings.deps",
+        // `requires = [{ layer = "...", visibility = "private" }]` (design
+        // 2026-10-26 §6.3): an inline array whose entries are tables, the same
+        // Value shape as `[[package.requires]]`; `read_requires` type-checks
+        // every entry. Mixed arrays (strings and tables) never reach here.
+        "package.requires",
+        "target.*.requires",
     };
     if (auto badPath = find_disallowed_array_of_tables(doc->root(), "", kAllowedArraysOfTables)) {
         return std::unexpected(error(origin, std::format(
@@ -1413,11 +1497,12 @@ std::expected<Manifest, ManifestError> parse_document(const t::Document& documen
     }
     // [package] requires — validated exactly like `provides`: names under the
     // reserved prefix are a closed set, everything else passes through.
-    if (auto v = doc->get_string_array("package.requires")) {
-        for (auto const& entry : *v)
+    if (auto* rv = doc->get("package.requires")) {
+        if (auto r = read_requires(*rv, "[package]", m.requires_, m.privateRequires); !r)
+            return std::unexpected(error(origin, r.error()));
+        for (auto const& entry : m.requires_)
             if (auto cap = mcpp::targetside::parse_capability(entry); !cap)
                 m.unknownCapabilities.push_back(entry);
-        m.requires_ = *v;
     }
     // [package] requires_abi -- see Manifest::requiresAbiThreads /
     // Manifest::requiresAbiExceptions.
@@ -2789,6 +2874,7 @@ std::expected<Manifest, ManifestError> parse_document(const t::Document& documen
     if (auto v = doc->get_string("build.default-profile")) m.buildConfig.defaultProfile = *v;
     else if (auto v = doc->get_string("build.profile"))   m.buildConfig.defaultProfile = *v;  // accepted alias
     if (auto v = doc->get_string("build.cache"))          m.buildConfig.cacheMode = *v;
+    if (auto v = doc->get_string("build.compile_commands")) m.buildConfig.compileCommands = *v;
     // [build] platform-dependencies — see Manifest::platformDependencies.
     // Validated HERE (unlike `cache`) because the value set is one word and
     // there is nothing build-mode-specific about it to keep out of the
@@ -3836,7 +3922,7 @@ std::expected<Manifest, ManifestError> parse_document(const t::Document& documen
             static constexpr std::string_view kKnownTargetScalars[] = {
                 "cxx_runtime", "linkage", "min_api_level", "sysroot", "toolchain",
             };
-            static constexpr std::string_view kKnownTargetArrays[] = { "run_under", "runner" };
+            static constexpr std::string_view kKnownTargetArrays[] = { "requires", "run_under", "runner" };
             static constexpr std::string_view kKnownTargetTables[] = {
                 "abi", "build", "build-dependencies", "dependencies",
                 "dev-dependencies", "feature-deps", "feature-requires-abi",
@@ -3876,6 +3962,22 @@ std::expected<Manifest, ManifestError> parse_document(const t::Document& documen
                     "Per-role contracts go in [build].cxx_runtime's table form.",
                     triple, key));
             }
+            // `[target.<pred>] requires = [...]` (design 2026-10-26 §6.3): the
+            // target-axis form of `[package] requires`, symmetric with
+            // `requires_abi`; handed to this selector's conditional config
+            // below and unioned in when the predicate matches.
+            std::vector<std::string> targetRequires, targetPrivateRequires;
+            if (auto rq = body.find("requires"); rq != body.end()) {
+                if (!rq->second.is_array())
+                    return std::unexpected(error(origin, std::format(
+                        "[target.{}] requires must be an array of capabilities", triple)));
+                if (auto r = read_requires(rq->second, std::format("[target.{}]", triple),
+                                           targetRequires, targetPrivateRequires); !r)
+                    return std::unexpected(error(origin, r.error()));
+                for (auto const& entry : targetRequires)
+                    if (auto cap = mcpp::targetside::parse_capability(entry); !cap)
+                        m.unknownCapabilities.push_back(entry);
+            }
             m.targetOverrides[canon_triple(triple)] = std::move(e);
 
             // [target.<predicate>.{build,dependencies,...}] — platform-conditional
@@ -3884,6 +3986,8 @@ std::expected<Manifest, ManifestError> parse_document(const t::Document& documen
             // prepare_build.
             ConditionalConfig cc;
             cc.predicate = triple;
+            cc.requires_ = std::move(targetRequires);
+            cc.privateRequires = std::move(targetPrivateRequires);
             // `[target.<pred>.runtime]` — the dialect-neutral link intent. Two
             // keys only, and the same two `[runtime]` already has at the top
             // level: this makes them per-target, it does not invent a vocabulary.

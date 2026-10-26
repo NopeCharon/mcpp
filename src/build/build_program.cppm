@@ -151,6 +151,12 @@ struct BuildProgramEnv {
     // key, the ABI tag, the toolchain fingerprint and `resolution.json`. It was
     // simply never handed to the layer that had to decide on it.
     std::string cxxStdlib;
+    // The root of the package of the graph that supplies the `c++-abi` layer
+    // (`gcc.libstdcxx` beside an llvm compiler), empty when the compiler's own
+    // payload supplies it (design 2026-10-26 §6.4). A rule package that drives
+    // a second compiler -- a SYCL device compiler -- points it at the same C++
+    // library through this, so one process holds one C++ runtime.
+    std::string cxxAbiRoot;
     // Three more answers a board-support package would otherwise hardcode.
     //
     // THE COUPLING THESE REMOVE IS INVISIBLE IN A MANIFEST. `riscv-virt-rt`
@@ -677,6 +683,7 @@ contract_env(const fs::path& root, const fs::path& outDir, const BuildProgramEnv
     e.emplace_back("MCPP_TOOLCHAIN_BINUTILS_DIR", env.toolchainBinutilsDir);
     e.emplace_back("MCPP_COMPILER", shared_value("MCPP_COMPILER"));
     e.emplace_back("MCPP_CXX_STDLIB", shared_value("MCPP_CXX_STDLIB"));
+    e.emplace_back("MCPP_CXX_ABI_ROOT", env.cxxAbiRoot);
     e.emplace_back("MCPP_TARGET_SYSROOT", env.targetSysroot);
     // #734 E2. Every key always, empty when it does not apply, for the reason
     // the lines above give.
@@ -1175,6 +1182,16 @@ std::expected<void, std::string> run_build_program_impl(
     // produces a baffling failure; a build PROGRAM that runs long is usually
     // stuck — waiting on a network read or spinning — and without a bound the
     // whole build hangs with no diagnostic at all.
+    // `--deny exec-build-script` (design 2026-10-26 §5.5): the effect is
+    // running code from the workspace, so the refusal is here, where a program
+    // would start -- a program whose answer is current runs nothing and is
+    // not refused.
+    if (mcpp::platform::env::effect_denied("exec-build-script")) {
+        mcpp::platform::env::note_effect_refused("exec-build-script", std::format("{} build program", who));
+        return std::unexpected(std::format(
+            "effect denied: exec-build-script -- {}'s build program would run, and the caller "
+            "denied running code from the workspace (--deny exec-build-script)", who));
+    }
     mcpp::build::progress::program_running(who, env.requested);
     programReport.runStart = ProgressClock::now();
     bool timedOut = false;

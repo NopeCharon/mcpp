@@ -10,10 +10,15 @@ import mcpp.build.prepare_inputs;
 import std;
 import mcpp.diag;
 import mcpp.build.stage;
+import mcpp.build.dirlock;
+import mcpp.build.cxx_runtime;   // the C++ island (design 2026-10-26 §6.3)
+import mcpp.toolchain.provider;   // capabilities_for: the payload's C++ runtime
+import mcpp.runtime.elf;          // DT_NEEDED of a library the line names
 import mcpp.build.refusal;
 import mcpp.build.version_floor;
 import mcpp.home;
 import mcpp.platform.axis;
+import mcpp.platform.env;        // --deny write-project
 import mcpp.libs.json;
 import mcpp.log;
 import mcpp.manifest;
@@ -514,6 +519,112 @@ static std::expected<void, std::string> step13_make_plan(PrepareState& state, Bu
     return {};
 }
 
+// THE C++ ISLAND (design 2026-10-26 §6.3, D13): whether a C++ runtime other
+// than this build's own reaches its link, and from where. Three sources, one
+// answer: a package's private `mcpp:c++-abi` requirement the graph does not
+// meet (declared), a link word naming the other runtime (`-l:libstdc++.so.6`,
+// typed by name rather than found by substring), and a library the line names
+// whose DT_NEEDED is the other runtime. The last two are islands no package
+// declared -- verified the same way, and reported to the author.
+//
+// Condition 1 is decided here, where the link units exist: an island is one
+// C++ image of ours with the other runtime behind it, so a build that also
+// links a C++ shared library has several images on two runtimes, which no
+// link order makes reliable -- refused, naming the library.
+static std::expected<void, std::string> step13_cxx_islands(PrepareState& state, BuildContext& ctx) {
+    namespace rt = mcpp::build::cxx_runtime;
+    auto& plan = ctx.plan;
+    if (!state.tc) return {};
+    const auto ownName = plan.targetSide.cxx.fromGraph() && plan.targetSide.cxx.interfaceName == "libstdc++"
+        ? std::string("libstdc++")
+        : mcpp::toolchain::capabilities_for(*state.tc).stdlib_id;
+    const auto own = rt::runtime_of_stdlib(ownName);
+    if (own == rt::Runtime::None) return {};
+    const auto other = own == rt::Runtime::Libcxx ? rt::Runtime::Libstdcxx : rt::Runtime::Libcxx;
+
+    mcpp::build::BuildPlan::CxxIsland island;
+    island.own = ownName;
+    island.foreign = std::string(rt::name_of(other));
+    // By qualified name, which is how an action names the package it belongs
+    // to: the island's objects are the outputs of its `role = "object"`
+    // actions -- a second compiler's, built against the other runtime.
+    for (auto const& i : state.cxxIslands) {
+        if (rt::runtime_of_stdlib(i.interfaceName) != other) continue;
+        for (auto const& pkg : state.packages) {
+            const auto id = pkg.manifest.package.version.empty()
+                ? pkg.manifest.package.name
+                : std::format("{}@{}", pkg.manifest.package.name, pkg.manifest.package.version);
+            if (id == i.requiredBy) {
+                island.packages.push_back(mcpp::build::qualified_package_name(pkg.manifest));
+                break;
+            }
+        }
+    }
+    // The link words, and the libraries they name.
+    std::vector<std::filesystem::path> searchDirs;
+    std::vector<std::string> libs;
+    const auto words = mcpp::manifest::flag_words(plan.manifest.buildConfig.ldflags);
+    for (std::size_t i = 0; i < words.size(); ++i) {
+        const auto& w = words[i];
+        if (rt::runtime_named_by(w) == other) { island.namedWords.push_back(w); continue; }
+        if (w == "-L" && i + 1 < words.size()) searchDirs.emplace_back(words[++i]);
+        else if (w.starts_with("-L") && w.size() > 2) searchDirs.emplace_back(w.substr(2));
+        else if (w.starts_with("-l:")) libs.push_back(w.substr(3));
+        else if (w.starts_with("-l") && w.size() > 2) libs.push_back("lib" + w.substr(2) + ".so");
+        else if (!w.starts_with("-") && w.find(".so") != std::string::npos) libs.push_back(w);
+    }
+    for (auto const& lib : libs) {
+        std::filesystem::path path(lib);
+        std::error_code ec;
+        if (!path.is_absolute()) {
+            path.clear();
+            for (auto const& d : searchDirs)
+                if (std::filesystem::exists(d / lib, ec)) { path = d / lib; break; }
+        }
+        if (path.empty() || !std::filesystem::exists(path, ec)) continue;
+        auto facts = mcpp::platform::elf::inspect_elf_runtime(path);
+        if (!facts) continue;
+        for (auto const& n : facts->needed)
+            if (rt::runtime_of_soname(n) == other) {
+                island.neededBy.push_back(path.filename().string());
+                break;
+            }
+    }
+    if (island.packages.empty() && island.namedWords.empty() && island.neededBy.empty()) return {};
+
+    for (auto const& lu : plan.linkUnits) {
+        if (lu.kind != mcpp::build::LinkUnit::SharedLibrary || !mcpp::build::link_unit_holds_cxx(plan, lu))
+            continue;
+        mcpp::build::refusal::record(mcpp::build::refusal::Code::LayerRequirement);
+        std::string from = !island.packages.empty() ? island.packages.front()
+                         : !island.namedWords.empty() ? "`" + island.namedWords.front() + "`"
+                         : island.neededBy.front();
+        return std::unexpected(std::format(
+            "{} brings {} into a build whose C++ runtime is {}, and `{}` is a C++ shared library of "
+            "this build [cxx-runtime-island].\n"
+            "       Two runtimes are reliable only behind one C++ image of ours: with several "
+            "images, the two runtimes' ABI names (`__cxa_throw`, the `std::exception` family) are "
+            "shared across the process and each image may bind the other's (SPEC-002 §6).\n"
+            "       Build with one runtime: depend on a package that provides `mcpp:c++-abi={}`, "
+            "or build with a toolchain whose runtime is {}; or make `{}` static.",
+            from, island.foreign, island.own, lu.targetName, island.foreign, island.foreign,
+            lu.targetName));
+    }
+    // COMPAT(undeclared-cxx-runtime): accepted as the island it is, verified
+    // alike, and reported so the package that wrote the word declares it.
+    if (island.packages.empty()) {
+        std::string what = !island.namedWords.empty()
+            ? std::format("the link word `{}` names", island.namedWords.front())
+            : std::format("{}, named on the link line, needs", island.neededBy.front());
+        state.reportCompatUse("undeclared-cxx-runtime", 0, std::format(
+            "{} {}, a C++ runtime other than this build's ({}), and no package declares it; "
+            "it is accepted as an island and verified after the link, which", what,
+            island.foreign, island.own));
+    }
+    plan.cxxIsland = std::move(island);
+    return {};
+}
+
 static std::expected<void, std::string> step13_cxx_private_runtime(PrepareState& state, BuildContext& ctx) {
     // A DEPENDENCY'S C++ SHARED LIBRARY OVER A C++ RUNTIME THAT IS A PACKAGE
     // (#641, item 5).
@@ -909,7 +1020,21 @@ static void step13_graph_and_schedule(PrepareState& state, BuildContext& ctx) {
         ? *state.targetRuntimeBinding : state.runtimeBindingSnapshot;
     ctx.plan.runtimeBinding = artifactRuntime;
     mcpp::build::merge_runtime_binding_contract(ctx.plan, artifactRuntime);
-    ctx.plan.compileDbPath = state.workRoot / "compile_commands.json";
+    // The project's copy of the compile database, where its manifest (or the
+    // machine's default) says; none otherwise, and then `${mcpp.compile_db}`
+    // names the configuration's own (design 2026-10-26 D14).
+    {
+        std::string machineDefault;
+        if (auto c = state.get_cfg(/*requireBootstrap=*/false)) machineDefault = (*c)->compileCommands;
+        const auto rel = resolve_compile_commands(*state.m, machineDefault);
+        ctx.plan.rootCompileDb = rel;
+        if (rel.empty()) {
+            ctx.plan.compileDbPath = ctx.outputDir / "compile_commands.json";
+            ctx.plan.publishRootCompileDb = false;
+        } else {
+            ctx.plan.compileDbPath = (state.workRoot / rel).lexically_normal();
+        }
+    }
     // GCC: a clean `*link:` for this build, so the payload's specs cannot
     // inject other homes' rpath entries into the artifact. AFTER the plan is
     // moved in — an earlier assignment was silently overwritten by that move,
@@ -1822,15 +1947,39 @@ static std::expected<void, std::string> step13_abi_enforcement(PrepareState& sta
     // before the dep graph, so this enforces/diagnoses rather than reselects —
     // abi-driven reselection is a resolution-ordering follow-up.
     {
-        const auto prof = mcpp::toolchain::abi_profile(ctx.tc);
+        auto prof = mcpp::toolchain::abi_profile(ctx.tc);
+        // COMPAT(abi-capability): the C library and the C++ runtime are
+        // target-side layers (design 2026-10-26 §6.7, D12), so the two
+        // dimensions are read from the RESOLVED target side -- which a graph
+        // package can supply -- and not from the payload's profile. An llvm
+        // build whose C++ layer is a graph libstdc++ satisfies
+        // `abi:cxxstdlib=libstdc++`; read off the payload it was refused.
+        if (!ctx.plan.targetSide.cAbi.absent() && !ctx.plan.targetSide.cAbi.interfaceName.empty())
+            prof.libc = ctx.plan.targetSide.cAbi.interfaceName;
+        if (!ctx.plan.targetSide.cxx.absent() && !ctx.plan.targetSide.cxx.interfaceName.empty())
+            prof.cxxStdlib = ctx.plan.targetSide.cxx.interfaceName;
         std::vector<mcpp::toolchain::AbiConstraint> constraints;
         for (auto& cap : ctx.plan.runtimeCapabilities) {
             std::string provider;
             for (auto& [c, p] : ctx.plan.runtimeProviders)
                 if (c == cap) { provider = p.canonical(); break; }
             if (auto con = mcpp::toolchain::parse_abi_capability(
-                    cap, provider.empty() ? std::string_view{"?"} : std::string_view{provider}))
+                    cap, provider.empty() ? std::string_view{"?"} : std::string_view{provider})) {
+                // Reported where the package that states it can be edited.
+                if (con->dim == mcpp::toolchain::AbiDim::Libc
+                    || con->dim == mcpp::toolchain::AbiDim::CxxStdlib) {
+                    for (std::size_t i = 0; i < state.packages.size(); ++i)
+                        if (std::ranges::find(state.packages[i].manifest.runtimeConfig.capabilities, cap)
+                            != state.packages[i].manifest.runtimeConfig.capabilities.end()) {
+                            state.reportCompatUse("abi-capability", i, std::format(
+                                "the runtime capability `{}`, read as `requires = [\"mcpp:{}={}\"]`,",
+                                cap, con->dim == mcpp::toolchain::AbiDim::Libc ? "c-abi" : "c++-abi",
+                                con->value));
+                            break;
+                        }
+                }
                 constraints.push_back(std::move(*con));
+            }
         }
         if (auto mismatches = mcpp::toolchain::abi_check(prof, constraints);
             !mismatches.empty()) {
@@ -1925,6 +2074,22 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
     ctx.cacheMode   = state.cacheMode;
     ctx.projectRoot= *state.root;
     ctx.outputDir  = target_dir(*state.tc, state.fp, state.workRoot);
+    // THE CONFIGURATION'S DIRECTORY IS WRITTEN FROM HERE ON (mcpp#839): build
+    // actions, the dependency BMI cache, resolution.json, build.ninja. The
+    // fingerprint that names it is the scan's last result, so everything
+    // before this line -- the manifest, resolution, the network, the
+    // toolchain, the scan -- ran holding nothing, and a second build of the
+    // same configuration waits here, then finds ninja with little to do. A
+    // pass that only describes (plan_only) plans into its own directory.
+    // `--deny write-project` stops here, before the first write (design
+    // 2026-10-26 §5.5).
+    if (!state.overrides.plan_only && mcpp::platform::env::effect_denied("write-project")) {
+        mcpp::platform::env::note_effect_refused("write-project", ctx.outputDir.generic_string());
+        return std::unexpected(std::format(
+            "effect denied: write-project -- the build writes {}, and the caller denied writing "
+            "the project (--deny write-project)", ctx.outputDir.generic_string()));
+    }
+    if (!state.overrides.plan_only) ctx.buildLock = mcpp::build::dirlock::acquire(ctx.outputDir);
 
     // Each step states its duration under `build/stage` in the log file, as
     // the phases do (build wall-time plan, W9; see prepare_build).
@@ -1950,6 +2115,8 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
     if (auto r = timed("link forms", [&] { return step13_link_forms(state, ctx); }); !r)
         return std::unexpected(r.error());
     if (auto r = timed("make plan", [&] { return step13_make_plan(state, ctx); }); !r)
+        return std::unexpected(r.error());
+    if (auto r = timed("cxx islands", [&] { return step13_cxx_islands(state, ctx); }); !r)
         return std::unexpected(r.error());
     if (auto r = timed("cxx private runtime", [&] { return step13_cxx_private_runtime(state, ctx); }); !r)
         return std::unexpected(r.error());

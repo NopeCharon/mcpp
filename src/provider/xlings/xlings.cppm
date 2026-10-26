@@ -153,7 +153,14 @@ namespace pinned {
     // space a script package's hook could not load (mcpp#832). The index
     // works around it for gcc (openxlings/xim-pkgindex#1035); this floor
     // closes it for every script package.
-    inline constexpr std::string_view kXlingsVersion   = "2026.10.24.1";
+    //
+    // Thirteenth, at 2026.10.26.1 (openxlings/xlings#707). An interface call
+    // ends when its capability does (`payload_status`, which every query
+    // reads, took 517 ms of fixed waits); an upgraded home's projection links
+    // are proven by its registrations; `--home` selects one run's home; and a
+    // hook in a project's store finds `xlings` in its bin directory, which
+    // `gcc.libstdcxx` (an `xim:gcc` edge) needs.
+    inline constexpr std::string_view kXlingsVersion   = "2026.10.26.1";
     inline constexpr std::string_view kNasmVersion     = "3.02";
 }
 
@@ -994,6 +1001,41 @@ mcpp::provider::ProviderInfo describe(const std::filesystem::path& binary,
     if (ec) return info;
     const auto key = std::tuple{executable, size, modified};
     if (auto it = cache.find(key); it != cache.end()) return it->second;
+    // AND ACROSS PROCESSES (design 2026-10-26 §8): the answer describes the
+    // binary, so it is kept under the home keyed as the in-process cache is,
+    // by the file's path, size and modification time. Every query (`emit
+    // build-database`, `toolchain list`) started a process for it.
+    const auto parse = [&](const nlohmann::json& j) {
+        const auto strings = [&](const char* field) {
+            std::vector<std::string> values;
+            if (j.contains(field) && j[field].is_array())
+                for (const auto& value : j[field]) if (value.is_string()) values.push_back(value.get<std::string>());
+            return values;
+        };
+        info.version = j.value("version", std::string{});
+        info.protocol = j.value("protocol_version", std::string{});
+        info.capabilities = strings("capabilities");
+        info.features = strings("features");
+        info.homeLayouts.clear();
+        if (j.contains("home_layouts") && j["home_layouts"].is_array())
+            for (const auto& value : j["home_layouts"]) if (value.is_number_integer()) info.homeLayouts.push_back(value.get<int>());
+        info.answered = !info.version.empty();
+    };
+    const auto stamp = std::format("{}\t{}\t{}", executable.generic_string(),
+        static_cast<std::uint64_t>(size), static_cast<std::int64_t>(modified.time_since_epoch().count()));
+    const auto persisted = mcpp::home::root() / "cache" / "provider-handshake"
+                         / (std::format("{:016x}", std::hash<std::string>{}(stamp)) + ".json");
+    if (std::ifstream in(persisted, std::ios::binary); in) {
+        auto j = nlohmann::json::parse(in, nullptr, false);
+        if (j.is_object() && j.value("stamp", std::string{}) == stamp && j.contains("answer")) {
+            parse(j["answer"]);
+            if (info.answered) {
+                cache.emplace(key, info);
+                return info;
+            }
+            info = {};
+        }
+    }
     const auto temporary = std::filesystem::temp_directory_path(ec);
     if (ec) return info;
     const auto home = temporary / std::format("mcpp-provider-handshake-{}-{}",
@@ -1018,19 +1060,18 @@ mcpp::provider::ProviderInfo describe(const std::filesystem::path& binary,
         const auto j = !timedOut && output.exit_code == 0
             ? nlohmann::json::parse(output.output, nullptr, false) : nlohmann::json{};
         if (j.is_object()) {
-            const auto strings = [&](const char* field) {
-                std::vector<std::string> values;
-                if (j.contains(field) && j[field].is_array())
-                    for (const auto& value : j[field]) if (value.is_string()) values.push_back(value.get<std::string>());
-                return values;
-            };
-            info.version = j.value("version", std::string{});
-            info.protocol = j.value("protocol_version", std::string{});
-            info.capabilities = strings("capabilities");
-            info.features = strings("features");
-            if (j.contains("home_layouts") && j["home_layouts"].is_array())
-                for (const auto& value : j["home_layouts"]) if (value.is_number_integer()) info.homeLayouts.push_back(value.get<int>());
-            info.answered = !info.version.empty();
+            parse(j);
+            // Written only by a run that writes the global cache, for the
+            // reason the probe cache gives.
+            if (info.answered && mcpp::platform::env::writes_global_cache()
+                && std::filesystem::is_directory(mcpp::home::root(), ec)) {
+                std::filesystem::create_directories(persisted.parent_path(), ec);
+                auto tmp = persisted;
+                tmp += std::format(".{:x}", std::random_device{}());
+                { std::ofstream(tmp, std::ios::binary) << nlohmann::json{{"stamp", stamp}, {"answer", j}}.dump(); }
+                std::filesystem::rename(tmp, persisted, ec);
+                if (ec) std::filesystem::remove(tmp, ec);
+            }
         }
     } catch (const std::exception&) { info = {}; }
     cache.emplace(key, info);
