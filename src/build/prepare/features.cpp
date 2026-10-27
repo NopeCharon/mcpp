@@ -12,7 +12,7 @@ import mcpp.log;
 import mcpp.build.refusal;
 import mcpp.build.version_floor;
 import mcpp.home;
-import mcpp.platform.axis;
+import mcpplibs.os.platform;
 import mcpp.manifest;
 import mcpp.source_kind;
 import mcpp.modgraph.glob;
@@ -50,7 +50,6 @@ import mcpp.provider.select;
 import mcpp.provider.runtime_selection;
 import mcpp.runtime.binding;
 import mcpp.toolchain.post_install;
-import mcpp.platform;
 import mcpp.pm.resolver;
 import mcpp.pm.index_spec;
 import mcpp.pm.index_contract;
@@ -62,6 +61,7 @@ import mcpp.pm.dependency_selector;
 import mcpp.pm.lock_io;
 import mcpp.ui;
 import mcpp.wire;               // Severity, for PlanNote (#699 item 2, E3)
+import mcpp.invocation;
 
 namespace mcpp::build {
 
@@ -477,8 +477,16 @@ static std::expected<void, std::string> step6_activate_features(PrepareState& st
             // every consumer — and that is exactly a `shared` or `lib` target.
             // A selected workspace member builds every target, so every one
             // of its targets is gated, as a root's are (§15).
+            for (auto& t : pkg.manifest.targets) {
+                if (t.kind != mcpp::manifest::Target::Entry) continue;
+                t.inactiveFeatures.clear();
+                for (auto const& rf : t.requiredFeatures)
+                    if (std::find(active.begin(), active.end(), rf) == active.end())
+                        t.inactiveFeatures.push_back(rf);
+            }
             std::erase_if(pkg.manifest.targets,
                           [&](const mcpp::manifest::Target& t) {
+                if (t.kind == mcpp::manifest::Target::Entry) return false;
                 if (!pkg.selectedMember
                     && t.kind != mcpp::manifest::Target::Library
                     && t.kind != mcpp::manifest::Target::SharedLibrary)
@@ -967,20 +975,13 @@ static std::expected<void, std::string> step6_device_extensions_and_rules(Prepar
                     pkg.manifest.modules.sources.push_back("!" + g);
                 }
                 // The device-kind files the EFFECTIVE set matches, for the
-                // build program. Exclusions are honoured the way the scanner
-                // honours them: positives first, then `!` entries removed.
+                // build program, selected as the scanner selects them.
                 const auto extTable = mcpp::extension_table_for(bc.moduleExtensions,
                                                                 bc.deviceExtensions);
-                std::set<std::filesystem::path> matched, dropped;
-                for (auto const& g : pkg.manifest.modules.sources) {
-                    if (g.empty()) continue;
-                    if (g[0] == '!') { for (auto& f : mcpp::modgraph::expand_glob(pkg.root, g.substr(1))) dropped.insert(f); }
-                    else if (!std::filesystem::path(g).is_absolute())
-                        for (auto& f : mcpp::modgraph::expand_glob(pkg.root, g)) matched.insert(f);
-                }
+                const auto matched = mcpp::modgraph::select_sources(pkg.root, pkg.manifest.modules.sources,
+                                                                    /*literals=*/false);
                 std::vector<std::string> device;
                 for (auto const& f : matched) {
-                    if (dropped.contains(f)) continue;
                     if (mcpp::classify(f, extTable) != mcpp::SourceKind::Device) continue;
                     device.push_back(f.lexically_relative(pkg.root).generic_string());
                 }
@@ -1206,6 +1207,10 @@ static void step6_record_tool_provision(PrepareState& state, HostToolCtx& ctx,
                                          const std::filesystem::path& p) {
     for (std::size_t c = 0; c < state.provisionGraph.visible.size(); ++c) {
         if (!state.provisionGraph.visible[c].contains(ctx.want)) continue;
+        // The root's own, and a member this build selects, which declares as
+        // the root does: in a workspace the selected package is not package 0.
+        if (c == 0 || (c < state.packages.size() && state.packages[c].selectedMember))
+            state.rootTools[ctx.toolName] = p;
         auto& v = state.toolEnvByConsumer[c];
         std::vector<std::string> vars;
         for (auto const& n : state.publishedNamesFor(ctx.depIdx, state.bareBindingsFor(c))) {
@@ -1347,8 +1352,8 @@ step6_resolve_tool_key(PrepareState& state, HostToolCtx& ctx) {
     // compiler this build compiles its build programs with. It
     // is handed to the sub-build as an override and recorded in
     // the key, so the two cannot disagree.
-    if (const char* e = std::getenv("MCPP_TOOLCHAIN"); e && *e)
-        ctx.toolTcSpec = e;
+    if (auto e = mcpp::invocation::get("MCPP_TOOLCHAIN"))
+        ctx.toolTcSpec = *e;
     else if (auto own = host_tool_declared_toolchain(
                  depPkg.manifest, depPkg.root, kCurrentPlatform))
         ctx.toolTcSpec = *own;
@@ -1410,7 +1415,7 @@ step6_resolve_tool_key(PrepareState& state, HostToolCtx& ctx) {
 
     ctx.cacheRoot = mcpp::home::cache_root();
     ctx.entry     = mcpp::build::tool_store::entry_dir(ctx.cacheRoot, ctx.key);
-    const auto exeSuffix = std::string(mcpp::platform::exe_suffix);
+    const auto exeSuffix = std::string(mcpplibs::os::exe_suffix);
     ctx.binOut    = mcpp::build::tool_store::bin_path(
         ctx.entry, ctx.toolName, exeSuffix);
 
@@ -1511,7 +1516,7 @@ step6_build_tool(PrepareState& state, HostToolCtx& ctx) {
         const mcpp::provider::runtime::RuntimeSelection>(
             state.runtimeSelection);
     sub.inherited_runtime_binding = std::make_shared<
-        const mcpp::platform::runtime::RuntimeBinding>(
+        const mcpp::runtime::RuntimeBinding>(
             state.runtimeBindingSnapshot);
     sub.tool_chain    = state.overrides.tool_chain.empty()
         ? std::format("root → {}:{}", ctx.depName, ctx.toolName)
@@ -1573,8 +1578,7 @@ step6_build_tool(PrepareState& state, HostToolCtx& ctx) {
     // ninja's own progress and command echoes, which is right
     // for a normal build and wrong when the question is "what
     // did the inner build actually do".
-    if (const char* v = std::getenv("MCPP_TOOL_BUILD_VERBOSE");
-        v && *v && std::string_view(v) != "0")
+    if (auto v = mcpp::invocation::get("MCPP_TOOL_BUILD_VERBOSE"); v && *v != "0")
         bopt.verbose = true;
     auto br = be->build(subCtx->plan, bopt);
     if (!br) {

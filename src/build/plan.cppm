@@ -20,10 +20,11 @@ import mcpp.toolchain.fingerprint;
 import mcpp.toolchain.linkmodel;
 import mcpp.toolchain.triple;
 import mcpp.pack.prebuilt;   // is_distribution_package — a shipped shared lib is not rebuilt
-import mcpp.platform;
+import mcpplibs.os.platform;
+import mcpp.toolchain.platform;
+import mcpp.runtime.search;
+import mcpp.runtime.env_contract;
 import mcpp.runtime.binding;
-import mcpp.platform.runtime_env_contract;
-import mcpp.platform.runtime_search;
 import mcpp.provider;
 import mcpp.provider.select;
 import mcpp.home;
@@ -200,6 +201,14 @@ struct LinkUnit {
     // it; see `windows_executable_link_flags`. Empty on every non-Binary unit.
     std::string                     windowsSubsystem;
     std::string                     windowsEntry;
+    // Design 2026-10-26 §24: where the program's beginning comes from, as
+    // `<package>/<entry>` when a dependency's entry target supplies it (empty
+    // for the target's own `main`), and the symbol the image is entered at
+    // with the statement that put it there (empty = the linker script's
+    // `ENTRY()` or the linker's default). The backend renders `start`.
+    std::string                     entryFrom;
+    std::string                     start;
+    std::string                     startFrom;
 };
 
 // One Windows resource script compiled into one linkable resource artifact
@@ -404,6 +413,15 @@ struct BuildPlan {
     // a driver that tries the last-given mapping first takes the longest
     // match. Empty unless the profile trims.
     std::vector<std::pair<std::filesystem::path, std::string>> trimMap;
+    // THE SAME MAP, PER PACKAGE (mcpp#844, design 2026-10-26 part 2 §10.4),
+    // by `CompileUnit::packageName`: the fixed roots and the roots of the
+    // package and its dependency closure -- every prefix the package's units
+    // can write -- in the order of `trimMap`. A unit's command carries its
+    // package's map and no other, so a package's command line does not
+    // depend on which members the plan builds. Filled by prepare, which owns
+    // the dependency edges.
+    std::map<std::string, std::vector<std::pair<std::filesystem::path, std::string>>,
+             std::less<>> packageTrimMaps;
     mcpp::toolchain::Toolchain      toolchain;
     mcpp::toolchain::Fingerprint    fingerprint;
     // Where the target's platform interface, C library and C++ runtime come
@@ -481,7 +499,7 @@ struct BuildPlan {
     // One immutable snapshot selected before workspace member substitution.
     // Build/run/test and cache fast paths consume this value; none may re-read
     // xlings active/current state.
-    mcpp::platform::runtime::RuntimeBinding runtimeBinding;
+    mcpp::runtime::RuntimeBinding runtimeBinding;
     std::string                     cppStandard = "c++23";
     std::string                     cppStandardFlag = "-std=c++23";
     // Module-graph-global dialect flags (issue #210), pre-joined with a
@@ -521,6 +539,10 @@ struct BuildPlan {
     std::map<std::string, ModuleScope, std::less<>> moduleScopes;
     std::filesystem::path           stdCompatObjectPath; // absolute path to prebuilt std.compat.o
     std::filesystem::path           scanDepsPath;    // clang-scan-deps binary (Clang only)
+    // `okld` for an ok-image target (`<arch>-openkal`): the program of the graph
+    // (or of this machine) that writes each image's requirements note and
+    // checks the convention after the link (mcpp.okimage). Empty elsewhere.
+    std::filesystem::path           okldPath;
     // NASM assembly (.asm sources). Both resolved in prepare AFTER the plan
     // exists — only when the plan actually contains .asm units (lazy, hard
     // failure when unavailable; never a silent skip).
@@ -568,7 +590,7 @@ struct BuildPlan {
     mcpp::manifest::LinkIntent                      linkIntent;
     // The complete run-time search closure of the artifacts this plan will
     // produce, in loader order and tagged with where each directory came from
-    // (`mcpp.platform.runtime_search`).
+    // (`mcpp.runtime.search`).
     //
     // This is the RECORD — what resolution.json publishes and `mcpp why
     // runtime` explains. Emission is still owned by each origin's existing
@@ -581,7 +603,7 @@ struct BuildPlan {
     // every child process including host binaries — measured to kill
     // `xdg-open`/`notify-send` outright when a private libc is on it. The farm
     // is reachable PER OBJECT (DT_RPATH) and must stay that way.
-    std::vector<mcpp::platform::search::Dir>        runtimeSearch;
+    std::vector<mcpp::runtime::search::Dir>        runtimeSearch;
     // Windows runtime-DLL deployment. On PE (`supports_rpath` is false) a
     // directly-launched .exe cannot RUNPATH-locate a dependency's DLL, so each
     // *.dll found in a dependency's [runtime] library_dir is copied beside the
@@ -698,14 +720,14 @@ void swap_link_group(BuildPlan& plan, BuildPlan::LinkGroup& g) {
 // providers and materialized artifacts before mcpp sees this snapshot.
 void merge_runtime_binding_contract(
     BuildPlan& plan,
-    const mcpp::platform::runtime::RuntimeBinding& binding);
+    const mcpp::runtime::RuntimeBinding& binding);
 
 // The run-time search closure for this plan, in loader order and tagged with
 // provenance. Exported so a test can exercise the guards (cross target, non-ELF
 // format, undeclared SubOS) without linking a binary for each.
-std::vector<mcpp::platform::search::Dir> runtime_search_closure(
+std::vector<mcpp::runtime::search::Dir> runtime_search_closure(
     const BuildPlan& plan,
-    const mcpp::platform::runtime::RuntimeBinding& binding);
+    const mcpp::runtime::RuntimeBinding& binding);
 
 // Is `p` inside one of `roots`, judged LEXICALLY?
 //
@@ -809,6 +831,16 @@ bool link_unit_holds_cxx(const BuildPlan& plan, const LinkUnit& lu);
 // not a guess about it. The C++ runtime contract of programs and tests reads
 // this (#646 F3a).
 bool image_loads_cxx_shared_library(const BuildPlan& plan, LinkUnit::Kind kind);
+
+// The `trim_paths` map (`BuildPlan::trimMap`) of the packages `keep` marks,
+// `keep[i]` for `packages[i]`; every package when `keep` is empty. The fixed
+// roots are always in it.
+std::vector<std::pair<std::filesystem::path, std::string>>
+trim_map(const std::vector<mcpp::modgraph::PackageRoot>& packages,
+         const mcpp::toolchain::Toolchain& tc,
+         const std::filesystem::path& outputDir,
+         const std::vector<std::filesystem::path>& storeRoots,
+         const std::vector<char>& keep = {});
 
 } // namespace mcpp::build
 
@@ -939,11 +971,11 @@ std::vector<std::string> dependency_name_candidates(
 // triple, and never consulted directly when a target triple is present.
 mcpp::toolchain::triple::ArtifactNaming host_artifact_naming() {
     return {
-        .exeSuffix            = mcpp::platform::exe_suffix,
-        .libPrefix            = mcpp::platform::lib_prefix,
-        .staticLibExt         = mcpp::platform::static_lib_ext,
-        .sharedLibExt         = mcpp::platform::shared_lib_ext,
-        .sharedNeedsImportLib = mcpp::platform::is_windows,
+        .exeSuffix            = mcpplibs::os::exe_suffix,
+        .libPrefix            = mcpp::toolchain::platform::lib_prefix,
+        .staticLibExt         = mcpp::toolchain::platform::static_lib_ext,
+        .sharedLibExt         = mcpp::toolchain::platform::shared_lib_ext,
+        .sharedNeedsImportLib = mcpplibs::os::is_windows,
     };
 }
 
@@ -1049,7 +1081,7 @@ std::vector<std::string> shared_library_link_flags(
     // used to answer this and missed iOS, which links with the same ld64 and
     // wants the same `@loader_path` -- `os == "ios"` would otherwise take the
     // ELF branch below and hand `$ORIGIN` to a linker that has no such token.
-    const bool macho = target.empty() ? bool(mcpp::platform::is_macos)
+    const bool macho = target.empty() ? bool(mcpplibs::os::is_macos)
                                       : target.is_mach_o();
     if (pe) {
         flags.push_back(import_library_for(t, n).generic_string());
@@ -1282,11 +1314,11 @@ ResolvedRuntimeContract resolve_runtime_contract(
 // does. Farm-first would let a later install silently change which libc an
 // ALREADY LINKED artifact loads. `search::ordered` is what enforces it, and
 // e2e 219 asserts it on the produced ELF rather than on this code.
-std::vector<mcpp::platform::search::Dir> runtime_search_closure(
+std::vector<mcpp::runtime::search::Dir> runtime_search_closure(
     const BuildPlan& plan,
-    const mcpp::platform::runtime::RuntimeBinding& binding) {
-    using mcpp::platform::search::Dir;
-    using mcpp::platform::search::Origin;
+    const mcpp::runtime::RuntimeBinding& binding) {
+    using mcpp::runtime::search::Dir;
+    using mcpp::runtime::search::Origin;
 
     // PAYLOAD DIRECTORIES COME FROM THE SAME FUNCTION THAT EMITS THEM.
     //
@@ -1334,7 +1366,7 @@ std::vector<mcpp::platform::search::Dir> runtime_search_closure(
     // mechanism neither format has. Asked of `object_format()` directly, the
     // single derivation, instead.
     const bool elfTarget = triple.empty()
-        ? bool(mcpp::platform::is_linux)
+        ? bool(mcpplibs::os::is_linux)
         : (triple.object_format() == mcpp::toolchain::triple::ObjectFormat::Elf);
 
     // THE ARTIFACT'S OWN DIRECTORY — `$ORIGIN` (#415).
@@ -1388,12 +1420,12 @@ std::vector<mcpp::platform::search::Dir> runtime_search_closure(
         for (auto const& dir : binding.searchDirs)
             closure.push_back({dir, Origin::SubosFarm});
 
-    return mcpp::platform::search::ordered(std::move(closure));
+    return mcpp::runtime::search::ordered(std::move(closure));
 }
 
 void merge_runtime_binding_contract(
     BuildPlan& plan,
-    const mcpp::platform::runtime::RuntimeBinding& binding) {
+    const mcpp::runtime::RuntimeBinding& binding) {
     auto package_id = [](const mcpp::provider::runtime_info::PackageIdentity& value) {
         return mcpp::manifest::PackageId{
             .namespace_ = value.namespace_,
@@ -1567,7 +1599,8 @@ std::vector<std::pair<std::filesystem::path, std::string>>
 trim_map(const std::vector<mcpp::modgraph::PackageRoot>& packages,
          const mcpp::toolchain::Toolchain& tc,
          const std::filesystem::path& outputDir,
-         const std::vector<std::filesystem::path>& storeRoots) {
+         const std::vector<std::filesystem::path>& storeRoots,
+         const std::vector<char>& keep) {
     std::vector<std::pair<std::filesystem::path, std::string>> out;
     auto add = [&](std::filesystem::path from, std::string to) {
         if (from.empty() || !from.is_absolute()) return;
@@ -1583,11 +1616,14 @@ trim_map(const std::vector<mcpp::modgraph::PackageRoot>& packages,
                              : std::filesystem::path(tc.localRoot), "/mcpp/toolchain");
     if (tc.base.stated()) add(tc.base.root, "/mcpp/sysroot");
     add(outputDir, "/mcpp/build");
-    for (auto const& p : packages)
+    for (std::size_t i = 0; i < packages.size(); ++i) {
+        auto const& p = packages[i];
+        if (!keep.empty() && (i >= keep.size() || !keep[i])) continue;
         if (!p.manifest.package.name.empty())
             add(p.root, std::format("{}@{}", p.manifest.package.name,
                                     p.manifest.package.version.empty() ? std::string("0")
                                                                        : p.manifest.package.version));
+    }
     std::ranges::stable_sort(out, {}, [](auto const& e) { return e.first.native().size(); });
     return out;
 }
@@ -1623,7 +1659,7 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
     // Artifact naming and shared-library link shape are properties of the
     // TARGET. Resolved once here from tc.targetTriple (empty = host target, in
     // which case the host constants ARE the right answer) and threaded down,
-    // so nothing below reaches for mcpp::platform to describe an output.
+    // so nothing below reaches for the host to describe an output.
     const auto targetTriple = [&] {
         auto t = mcpp::toolchain::triple::parse(tc.targetTriple);
         return t ? *t : mcpp::toolchain::triple::Triple{};
@@ -1637,7 +1673,7 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
     // does not name, which is wrong the same way for iOS and for
     // wasm32-emscripten — see the sibling derivation earlier in this file.
     const bool elfTarget = targetTriple.empty()
-        ? bool(mcpp::platform::is_linux)
+        ? bool(mcpplibs::os::is_linux)
         : (targetTriple.object_format() == mcpp::toolchain::triple::ObjectFormat::Elf);
     auto loader_tag_flag = [&](LinkUnit::Kind kind) -> std::string {
         if (!elfTarget) return {};
@@ -1678,8 +1714,8 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
     // the same mechanism, and the answer to both is annotation.
     const bool msvcTarget = [&] {
         const std::string targetOs = targetTriple.empty()
-            ? (mcpp::platform::is_macos   ? "macos"
-             : mcpp::platform::is_windows ? "windows" : "linux")
+            ? (mcpplibs::os::is_macos   ? "macos"
+             : mcpplibs::os::is_windows ? "windows" : "linux")
             : targetTriple.os;
         // The ABI, from the toolchain rather than from `naming`: on a native
         // Windows build the host naming constants are the MSVC ones whatever the
@@ -1764,7 +1800,7 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         // same file reached through two graph edges) is not duplicated.
         // On a PE target a destination is compared without case
         // (DeployFile::is_destination).
-        const bool peTarget = targetTriple.empty() ? bool(mcpp::platform::is_windows)
+        const bool peTarget = targetTriple.empty() ? bool(mcpplibs::os::is_windows)
                                                    : targetTriple.is_pe();
         auto add_deploy = [&](const std::filesystem::path& source,
                               std::string_view toDir = {}) {
@@ -1857,8 +1893,8 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         // target spawns is beyond mcpp's reach. Putting the directory in the
         // artifact's RUNPATH instead is: DT_RUNPATH reaches the object that
         // carries it and the dlopen() it performs, and nothing else.
-        if constexpr (mcpp::platform::publishes_via_environment(
-                          mcpp::platform::kPrivateLibcSearchScope)) {
+        if constexpr (mcpp::runtime::publishes_via_environment(
+                          mcpp::runtime::kPrivateLibcSearchScope)) {
             if (tc.base.payload && !out.depRuntimeLibraryDirs.empty()) {
                 append_unique_path(out.runtimeLibraryDirs,
                                    tc.base.payload->glibcLib);
@@ -1986,7 +2022,7 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         // compiled as an ordinary executable entry on every row but Android,
         // and as a translation unit of the shared library there -- so it
         // occupies an object address in this census exactly as `bin` does.
-        if (!t.is_program()
+        if (!t.is_program() && t.kind != mcpp::manifest::Target::Entry
             && t.kind != mcpp::manifest::Target::TestBinary) continue;
         auto entry = projectRoot / t.main;
         if (scannedSources.contains(entry)) continue;
@@ -2313,17 +2349,21 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
     //    exclusive to its target — when assembling another target's link
     //    image we must NOT pull in foreign entries (they each define
     //    `int main(...)`, causing multiple-definition link errors).
+    //    A file a target names as `main` on another row is a beginning too
+    //    (design 2026-10-26 §24.3): it is in no image of this row.
     std::set<std::filesystem::path> entryFilesAcrossTargets;
     for (auto& t : manifest.targets) {
         if (!t.main.empty()) {
             entryFilesAcrossTargets.insert(projectRoot / t.main);
         }
+        for (auto const& other : t.otherMains) entryFilesAcrossTargets.insert(projectRoot / other);
     }
     for (auto const& p : packages) {
         for (auto const& t : p.manifest.targets) {
             if (!t.main.empty()) {
                 entryFilesAcrossTargets.insert(p.root / t.main);
             }
+            for (auto const& other : t.otherMains) entryFilesAcrossTargets.insert(p.root / other);
         }
     }
 
@@ -2563,7 +2603,7 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
                 const auto unitDir = lu.output.parent_path().lexically_normal();
                 if (!naming.sharedNeedsImportLib && !unitDir.empty() && libDir != unitDir) {
                     const auto rel = libDir.lexically_relative(unitDir).generic_string();
-                    const bool macho = targetTriple.empty() ? bool(mcpp::platform::is_macos)
+                    const bool macho = targetTriple.empty() ? bool(mcpplibs::os::is_macos)
                                                             : targetTriple.is_mach_o();
                     if (!rel.empty() && rel != ".")
                         lu.linkFlags.push_back(macho
@@ -2802,6 +2842,248 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
                 artifactOnlyPackages.insert(qualified_package_name(packages[i].manifest));
     }
 
+    // ── Program beginnings and image entries (design 2026-10-26 §24) ──────
+    //
+    // ONE PLACE COMPILES A BEGINNING THAT BELONGS TO ANOTHER PACKAGE. A
+    // program's beginning may be a dependency's `kind = "entry"` target; its
+    // translation unit is compiled in THAT package's context -- its include
+    // directories, its module interfaces, its flags and the entry target's own
+    // `cflags`/`cxxflags`/`defines` -- once per configuration, and linked
+    // into every program that selects it. It is in `entryFilesAcrossTargets`
+    // (its target has a `main`), so no other image links it.
+    std::set<std::filesystem::path> entryFlagsApplied;
+    auto entry_object = [&](std::size_t pkgIdx, const std::filesystem::path& entry,
+                            const mcpp::manifest::Target& flagsOf) -> std::filesystem::path {
+        auto const& pkgManifest = pkgIdx == 0 ? manifest : packages[pkgIdx].manifest;
+        const auto pkgRoot = pkgIdx == 0 ? projectRoot : packages[pkgIdx].root;
+        const auto owner = qualified_package_name(pkgManifest);
+        std::optional<std::filesystem::path> object;
+        for (auto const& cu : plan.compileUnits)
+            if (cu.source == entry) { object = cu.object; break; }
+        if (!object) {
+            const auto extTable = pkgIdx == 0 ? rootExtTable
+                : mcpp::extension_table_for(pkgManifest.buildConfig.moduleExtensions,
+                                            pkgManifest.buildConfig.deviceExtensions);
+            CompileUnit cu;
+            cu.source      = entry;
+            cu.packageName = owner;
+            cu.kind        = mcpp::classify(entry, extTable);
+            if (pkgIdx < packages.size() && packages[pkgIdx].usageResolved) {
+                cu.localIncludeDirs      = packages[pkgIdx].privateBuild.includeDirs;
+                cu.localIncludeDirsAfter = packages[pkgIdx].privateBuild.includeDirsAfter;
+                cu.packageCflags         = packages[pkgIdx].privateBuild.cflags;
+                cu.packageCxxflags       = packages[pkgIdx].privateBuild.cxxflags;
+            } else {
+                cu.localIncludeDirs      = local_include_dirs_for_manifest(pkgRoot, pkgManifest);
+                cu.localIncludeDirsAfter = local_include_dirs_after_for_manifest(pkgRoot, pkgManifest);
+                cu.packageCflags         = pkgManifest.buildConfig.cflags;
+                cu.packageCxxflags       = pkgManifest.buildConfig.cxxflags;
+            }
+            mcpp::modgraph::normalize_include_flags(pkgRoot, cu.packageCflags);
+            mcpp::modgraph::normalize_include_flags(pkgRoot, cu.packageCxxflags);
+            apply_c_standard(cu);
+            const auto scanned = mcpp::modgraph::scan_entry_file(entry, owner, extTable);
+            for (auto const& req : scanned.requires_) cu.imports.push_back(req.logicalName);
+            cu.declaration = scanned.provides ? mcpp::modgraph::ModuleDeclaration::Unknown
+                                              : scanned.declaration;
+            cu.object = object_for(entry, owner, std::filesystem::relative(entry, pkgRoot),
+                                   pkgIdx).object;
+            plan.compileUnits.push_back(cu);
+            object = cu.object;
+        }
+        if (entryFlagsApplied.insert(entry).second
+            && (!flagsOf.defines.empty() || !flagsOf.cflags.empty() || !flagsOf.cxxflags.empty())) {
+            for (auto& cu : plan.compileUnits) {
+                if (cu.source != entry) continue;
+                for (auto const& d : flagsOf.defines) {
+                    const auto element = mcpp::manifest::flag_element("-D" + d);
+                    cu.packageCflags.push_back(element);
+                    cu.packageCxxflags.push_back(element);
+                }
+                for (auto const& f : flagsOf.cflags)   cu.packageCflags.push_back(f);
+                for (auto const& f : flagsOf.cxxflags) cu.packageCxxflags.push_back(f);
+                break;
+            }
+        }
+        return *object;
+    };
+
+    // An entry's translation unit carries its target's flags wherever the
+    // package's sources compile it, selected by a program or not: it is
+    // checked by every build of its package, with the flags it is built with.
+    {
+        auto with_flags = [&](const std::filesystem::path& root, const mcpp::manifest::Target& t) {
+            if (t.kind != mcpp::manifest::Target::Entry || t.main.empty()) return;
+            if (t.defines.empty() && t.cflags.empty() && t.cxxflags.empty()) return;
+            const auto entry = root / t.main;
+            if (!std::ranges::any_of(plan.compileUnits,
+                                     [&](const CompileUnit& cu) { return cu.source == entry; }))
+                return;
+            if (!entryFlagsApplied.insert(entry).second) return;
+            for (auto& cu : plan.compileUnits) {
+                if (cu.source != entry) continue;
+                for (auto const& d : t.defines) {
+                    const auto element = mcpp::manifest::flag_element("-D" + d);
+                    cu.packageCflags.push_back(element);
+                    cu.packageCxxflags.push_back(element);
+                }
+                for (auto const& f : t.cflags)   cu.packageCflags.push_back(f);
+                for (auto const& f : t.cxxflags) cu.packageCxxflags.push_back(f);
+                break;
+            }
+        };
+        for (auto const& t : manifest.targets) with_flags(projectRoot, t);
+        for (std::size_t i = 1; i < packages.size(); ++i)
+            for (auto const& t : packages[i].manifest.targets) with_flags(packages[i].root, t);
+    }
+
+    // `main = { from = "<dependency>/<entry>" }`: the dependency is a key of
+    // the consumer's own dependency tables (its dev-dependencies too, for a
+    // test), or the consumer's own name; the entry is a `kind = "entry"`
+    // target of that package whose required features are active.
+    struct EntrySelection {
+        std::size_t                   packageIndex = 0;
+        const mcpp::manifest::Target* target = nullptr;
+        std::string                   name;   // `<dependency>/<entry>`, as the program wrote it
+    };
+    auto select_entry = [&](std::size_t consumerIdx, const mcpp::manifest::Manifest& consumer,
+                            const mcpp::manifest::Target& t)
+        -> std::expected<EntrySelection, std::string> {
+        const auto slash = t.mainFrom.rfind('/');
+        const std::string depKey = t.mainFrom.substr(0, slash);
+        const std::string entryName = t.mainFrom.substr(slash + 1);
+        const std::string statement = std::format("{} = {{ from = \"{}\" }}",
+            t.mainDeclaredBy.empty() ? std::format("[targets.{}] main", t.name) : t.mainDeclaredBy,
+            t.mainFrom);
+        std::optional<std::size_t> idx;
+        if (depKey == consumer.package.name || depKey == qualified_package_name(consumer))
+            idx = consumerIdx;
+        std::vector<std::string> keys;
+        auto look = [&](const std::map<std::string, mcpp::manifest::DependencySpec>& deps) {
+            for (auto const& [depName, spec] : deps) {
+                keys.push_back(depName);
+                if (idx || depName != depKey) continue;
+                for (auto const& candidate : dependency_name_candidates(depName, spec))
+                    if (auto it = packageIndexByName.find(candidate); it != packageIndexByName.end()) {
+                        idx = it->second;
+                        break;
+                    }
+            }
+        };
+        look(consumer.dependencies);
+        if (t.kind == mcpp::manifest::Target::TestBinary) look(consumer.devDependencies);
+        if (!idx) {
+            std::string list;
+            for (auto const& k : keys) list += (list.empty() ? "" : ", ") + k;
+            return std::unexpected(std::format(
+                "{}: '{}' is neither a dependency of '{}' nor its own name (its dependencies: {})",
+                statement, depKey, qualified_package_name(consumer),
+                list.empty() ? std::string("none") : list));
+        }
+        auto const& provider = *idx == 0 ? manifest : packages[*idx].manifest;
+        const mcpp::manifest::Target* entry = nullptr;
+        std::string entries;
+        for (auto const& candidate : provider.targets) {
+            if (candidate.kind != mcpp::manifest::Target::Entry) continue;
+            entries += (entries.empty() ? "" : ", ") + candidate.name;
+            if (candidate.name == entryName) entry = &candidate;
+        }
+        if (!entry)
+            return std::unexpected(std::format(
+                "{}: '{}' declares no entry target '{}' (its `kind = \"entry\"` targets: {})",
+                statement, qualified_package_name(provider), entryName,
+                entries.empty() ? std::string("none") : entries));
+        if (!entry->inactiveFeatures.empty()) {
+            std::string feats;
+            for (auto const& f : entry->inactiveFeatures)
+                feats += (feats.empty() ? "" : ", ") + std::format("\"{}\"", f);
+            return std::unexpected(std::format(
+                "{}: the entry '{}' of '{}' requires the feature{} {} of that package, which "
+                "{} not active in this build. Enable {} on the dependency:\n"
+                "    {} = {{ ..., features = [{}] }}",
+                statement, entryName, qualified_package_name(provider),
+                entry->inactiveFeatures.size() == 1 ? "" : "s", feats,
+                entry->inactiveFeatures.size() == 1 ? "is" : "are",
+                entry->inactiveFeatures.size() == 1 ? "it" : "them", depKey, feats));
+        }
+        return EntrySelection{ *idx, entry, t.mainFrom };
+    };
+
+    // Apply a selected entry to a link unit: its object, the PE entry
+    // function its translation unit defines (inherited unless the program
+    // states another, which is refused), and where it came from.
+    auto begin_with_entry = [&](LinkUnit& lu, const mcpp::manifest::Target& t,
+                                const EntrySelection& sel) -> std::expected<std::filesystem::path, std::string> {
+        auto const& providerRoot = sel.packageIndex == 0 ? projectRoot : packages[sel.packageIndex].root;
+        const auto entry = providerRoot / sel.target->main;
+        if (!sel.target->windowsEntry.empty()) {
+            if (!lu.windowsEntry.empty() && lu.windowsEntry != sel.target->windowsEntry)
+                return std::unexpected(std::format(
+                    "[targets.{}] windows_entry = \"{}\", and its beginning '{}' defines "
+                    "`{}` ([targets.{}] windows_entry of that package). The entry function is "
+                    "the one the translation unit defines; remove the program's statement, or "
+                    "select an entry that defines `{}`",
+                    t.name, lu.windowsEntry, sel.name, sel.target->windowsEntry,
+                    sel.target->name, lu.windowsEntry));
+            lu.windowsEntry = sel.target->windowsEntry;
+        }
+        lu.entryFrom = sel.name;
+        return entry_object(sel.packageIndex, entry, *sel.target);
+    };
+
+    // THE SYMBOL AN IMAGE IS ENTERED AT, AND WHO SAID SO (§24.4 items 7-8).
+    // The program (or `[test]`), its selected entry and every package whose
+    // objects it links may state one; they must agree, and only an image with
+    // no C runtime -- a freestanding target -- has one to state.
+    auto settle_start = [&](LinkUnit& lu, const mcpp::manifest::Target& t,
+                            const EntrySelection* sel,
+                            const std::vector<std::size_t>& linkedPackages)
+        -> std::expected<void, std::string> {
+        std::vector<std::pair<std::string, std::string>> statements;   // symbol, statement
+        if (!t.start.empty())
+            statements.emplace_back(t.start, t.startDeclaredBy.empty()
+                ? std::format("[targets.{}] start = \"{}\"", t.name, t.start) : t.startDeclaredBy);
+        if (sel && !sel->target->start.empty())
+            statements.emplace_back(sel->target->start, std::format(
+                "[targets.{}] start = \"{}\" of '{}' (the entry this program begins with)",
+                sel->target->name, sel->target->start,
+                qualified_package_name(sel->packageIndex == 0 ? manifest
+                                                              : packages[sel->packageIndex].manifest)));
+        for (auto i : linkedPackages) {
+            auto const& pm = i == 0 ? manifest : packages[i].manifest;
+            auto const& symbol = pm.runtimeConfig.linkIntent.start;
+            if (!symbol.empty())
+                statements.emplace_back(symbol, std::format(
+                    "`mcpp:link-start={}` from the build program of '{}'",
+                    symbol, qualified_package_name(pm)));
+        }
+        if (statements.empty()) return {};
+        for (auto const& [symbol, statement] : statements)
+            if (symbol != statements.front().first) {
+                std::string all;
+                for (auto const& [sym, st] : statements) all += "\n    " + st;
+                return std::unexpected(std::format(
+                    "target '{}' is entered at one symbol, and the statements disagree:{}",
+                    t.name, all));
+            }
+        if (!targetTriple.is_freestanding()) {
+            const std::string owner = targetTriple.is_openkal()
+                    ? std::string("okrun, at `ok_main`, which the image's C library defines")
+                : targetTriple.is_android()
+                    ? std::string("the Android runtime, through the exports the platform names")
+                    : std::string("the C runtime (`_start`, `mainCRTStartup`), which initialises "
+                                  "the program and calls `main`; entering elsewhere skips it");
+            return std::unexpected(std::format(
+                "{}: `start` names the symbol an image with no C runtime is entered at, and "
+                "on {} the image is entered by {}. It applies to a freestanding target "
+                "(`--target <arch>-none-elf`)",
+                statements.front().second, targetTriple.str(), owner));
+        }
+        lu.start = statements.front().first;
+        lu.startFrom = statements.front().second;
+        return {};
+    };
+
     // 4. Link units (one per [targets.X])
     // When any TestBinary target exists, skip Binary/Library/SharedLibrary
     // targets — `mcpp test` only cares about the test binaries, and pulling
@@ -2813,6 +3095,9 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
     }
     for (auto& t : manifest.targets) {
         if (inTestMode && t.kind != mcpp::manifest::Target::TestBinary) continue;
+        // An entry target is the beginning of other programs, linked into
+        // each that selects it, and no link unit of its own (§24.3).
+        if (t.kind == mcpp::manifest::Target::Entry) continue;
         LinkUnit lu;
         lu.targetName = t.name;
         lu.package    = qualified_package_name(manifest);
@@ -2876,12 +3161,23 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
             }
         }
 
+        // The beginning a dependency's entry target supplies (§24.3).
+        std::optional<EntrySelection> selectedEntry;
+        if (!t.mainFrom.empty() && lu.kind != LinkUnit::StaticLibrary) {
+            auto sel = select_entry(0, manifest, t);
+            if (!sel) return std::unexpected(sel.error());
+            selectedEntry = *sel;
+        }
+
         // Whether this consumer's own entry source defines `main`. Decides how
         // kind="lib" dependencies are linked (archive vs inline) so the
         // gtest_main-style optional entry works on EVERY linker — see the
         // dependency-linking block further below. Can't tell (no entry) →
         // false → inline (the pre-archive behavior, always provides the entry).
-        bool entryDefinesMain = lu.entryMain && source_defines_main(*lu.entryMain);
+        // A selected entry is the program's beginning, so a dev-dependency's
+        // own main-providing object is not linked beside it.
+        bool entryDefinesMain = selectedEntry.has_value()
+            || (lu.entryMain && source_defines_main(*lu.entryMain));
 
         // #622 A3: a `SharedLibrary` unit only ever carries `entryMain` when
         // it is an `app` on the Android row (an ordinary `kind = "shared"`
@@ -2980,6 +3276,34 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
                     break;
                 }
             }
+        }
+
+        // A dependency's entry as this program's beginning: its object, and
+        // for a program with no file of its own, `entryMain` naming it, which
+        // keeps the implementation loop below from linking it twice. A test
+        // keeps its own file as `entryMain`; the entry joins beside it.
+        if (selectedEntry) {
+            auto object = begin_with_entry(lu, t, *selectedEntry);
+            if (!object) return std::unexpected(object.error());
+            lu.objects.push_back(*object);
+            if (!lu.entryMain) {
+                auto const& providerRoot = selectedEntry->packageIndex == 0
+                    ? projectRoot : packages[selectedEntry->packageIndex].root;
+                lu.entryMain = providerRoot / selectedEntry->target->main;
+            }
+        }
+        if (lu.kind != LinkUnit::StaticLibrary) {
+            std::vector<std::size_t> linked;
+            for (std::size_t i = 0; i < std::max<std::size_t>(packages.size(), 1); ++i) {
+                const auto name = i == 0 ? qualified_package_name(manifest)
+                                         : qualified_package_name(packages[i].manifest);
+                if (i != 0 && (sharedDepPackages.contains(name) || placedInImage.contains(name)
+                               || artifactOnlyPackages.contains(name)))
+                    continue;
+                linked.push_back(i);
+            }
+            if (auto r = settle_start(lu, t, selectedEntry ? &*selectedEntry : nullptr, linked); !r)
+                return std::unexpected(r.error());
         }
 
         // Also include implementation .cpp/.cc/.cxx/.c units, but EXCLUDE any
@@ -3107,6 +3431,28 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
                 entryObject = main_cu.object;
             }
             lu.objects.push_back(*entryObject);
+        }
+        // The program's beginning from an entry target (§24.3), resolved
+        // against its own package's dependencies.
+        std::optional<EntrySelection> selectedEntry;
+        if (!r.target.mainFrom.empty()) {
+            auto sel = select_entry(r.packageIndex, pkg.manifest, r.target);
+            if (!sel) return std::unexpected(sel.error());
+            selectedEntry = *sel;
+            auto object = begin_with_entry(lu, r.target, *selectedEntry);
+            if (!object) return std::unexpected(object.error());
+            lu.objects.push_back(*object);
+            auto const& providerRoot = selectedEntry->packageIndex == 0
+                ? projectRoot : packages[selectedEntry->packageIndex].root;
+            lu.entryMain = providerRoot / selectedEntry->target->main;
+        }
+        {
+            std::vector<std::size_t> linked;
+            for (auto i : seen)
+                if (links_objects_of(qualified_package_name(packages[i].manifest), r.packageIndex))
+                    linked.push_back(i);
+            if (auto rs = settle_start(lu, r.target, selectedEntry ? &*selectedEntry : nullptr, linked); !rs)
+                return std::unexpected(rs.error());
         }
         for (auto const& cu : plan.compileUnits) {
             if (!closure.contains(cu.packageName)) continue;
@@ -3237,6 +3583,7 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         std::vector<LinkUnit> units;
         for (auto const& t : pkg.manifest.targets) {
             if (memberTestMode && t.kind != mcpp::manifest::Target::TestBinary) continue;
+            if (t.kind == mcpp::manifest::Target::Entry) continue;   // §24.3
             // A member's shared libraries are linked once, with the graph's
             // shared libraries (above), and placed in its product directory.
             if (t.kind == mcpp::manifest::Target::SharedLibrary) {
@@ -3342,7 +3689,32 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
                     }
                 }
             }
-            const bool entryDefinesMain = lu.entryMain && source_defines_main(*lu.entryMain);
+            // A dependency's entry as this program's beginning (§24.3), as
+            // for a root's target.
+            std::optional<EntrySelection> selectedEntry;
+            if (!t.mainFrom.empty() && lu.kind != LinkUnit::StaticLibrary) {
+                auto sel = select_entry(mi, pkg.manifest, t);
+                if (!sel) return std::unexpected(sel.error());
+                selectedEntry = *sel;
+                auto object = begin_with_entry(lu, t, *selectedEntry);
+                if (!object) return std::unexpected(object.error());
+                lu.objects.push_back(*object);
+                if (!lu.entryMain) {
+                    auto const& providerRoot = selectedEntry->packageIndex == 0
+                        ? projectRoot : packages[selectedEntry->packageIndex].root;
+                    lu.entryMain = providerRoot / selectedEntry->target->main;
+                }
+            }
+            if (lu.kind != LinkUnit::StaticLibrary) {
+                std::vector<std::size_t> linked;
+                for (auto i : closureIdx)
+                    if (links_objects_of(qualified_package_name(packages[i].manifest), mi))
+                        linked.push_back(i);
+                if (auto r = settle_start(lu, t, selectedEntry ? &*selectedEntry : nullptr, linked); !r)
+                    return std::unexpected(r.error());
+            }
+            const bool entryDefinesMain = selectedEntry.has_value()
+                || (lu.entryMain && source_defines_main(*lu.entryMain));
             for (auto const& cu : plan.compileUnits) {
                 if (!closure.contains(cu.packageName)) continue;
                 if (!links_objects_of(cu.packageName, mi)) continue;
@@ -3553,8 +3925,20 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
                 for (auto const* std_name : {"std", "std.compat"})
                     entries.emplace(std_name, std::string(traits.bmiDir) + "/" + basename(std_name));
 
+            // GCC's map names the BMI directory as its repository (`$root`)
+            // and every path below it, as GCC's own mapper does for a unit
+            // given no map. A BMI records the paths of the modules it imports
+            // as its compile's mapper spelt them, and an importer finds an
+            // INDIRECT import at that recorded path below its own repository:
+            // a root unit compiled without a map, imported by one compiled with
+            // a repository other than the BMI directory, would send that
+            // importer to `<name>.gcm` beside the build directory.
             ModuleScope scope;
-            for (auto const& [name, path] : entries) scope.content += name + " " + path + "\n";
+            const std::string root = std::string(traits.bmiDir) + "/";
+            if (gcc) scope.content = "$root " + std::string(traits.bmiDir) + "\n";
+            for (auto const& [name, path] : entries)
+                scope.content += name + " "
+                    + (gcc && path.starts_with(root) ? path.substr(root.size()) : path) + "\n";
             if (!gcc && importsQualified) {
                 // `-fmodule-file=<name>=<path>` (clang) or `/reference
                 // <name>=<path>` (MSVC) for each module the unit imports that

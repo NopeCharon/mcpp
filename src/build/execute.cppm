@@ -21,6 +21,7 @@ import mcpp.diag;
 import mcpp.build.plan;
 import mcpp.toolchain.triple;
 import mcpp.freestanding.runner;
+import mcpp.okimage;
 import mcpp.build.runner_lookup;    // #544: where the runner's program is
 import mcpp.home;                   // config.toml, for the machine's default toolchain
 import mcpp.libs.toml;
@@ -48,8 +49,12 @@ import mcpp.provider;
 import mcpp.provider.select;
 import mcpp.runtime.binding;
 import mcpp.log;
-import mcpp.platform;
-import mcpp.platform.capacity;
+import mcpplibs.os.platform;
+import mcpp.invocation;
+import mcpp.effects;
+import mcpp.runtime.launch_env;
+import mcpp.run;
+import mcpp.home.files;
 import mcpp.build.schedule.policy;   // resolve_jobs — one answer to "how many at once"
 import mcpp.fetcher.progress;
 import mcpp.project;
@@ -142,7 +147,7 @@ constexpr int kBuildCacheMaxEntries = 32;
 // compared.
 std::string toolchain_request_identity() {
     std::string cli;
-    if (const char* e = std::getenv("MCPP_TOOLCHAIN"); e) cli = e;
+    if (auto e = mcpp::invocation::get("MCPP_TOOLCHAIN")) cli = *e;
     std::string machineDefault;
     // THE TARGET BASE AND THE EXECUTION HOST, FROM WHEREVER THEY CAN BE STATED
     // OUTSIDE THE MANIFEST (design 2026-10-23 §3.3, §3.7): the overrides and
@@ -168,10 +173,10 @@ std::string toolchain_request_identity() {
     if (std::filesystem::exists(mcpp::home::system_config_file(), ec))
         target_table(mcpp::home::system_config_file());
     std::string overrides;
-    for (auto const& e : mcpp::platform::env::with_prefix("MCPP_TARGET_"))
+    for (auto const& e : mcpp::invocation::with_prefix("MCPP_TARGET_"))
         if (e.find("_SYSROOT=") != std::string::npos || e.find("_RUN_UNDER=") != std::string::npos)
             overrides += e + ";";
-    if (const char* s = std::getenv("MCPP_SYSROOT"); s && *s) overrides += std::format("MCPP_SYSROOT={};", s);
+    if (auto s = mcpp::invocation::get("MCPP_SYSROOT")) overrides += std::format("MCPP_SYSROOT={};", *s);
     if (overrides.empty() && targets.empty())
         return std::format("cli={};default={}", cli, machineDefault);
     return std::format("cli={};default={};base={}{}", cli, machineDefault, overrides, targets);
@@ -275,7 +280,7 @@ export struct BuildCacheEntry {
     std::string cacheMode;
     // Exact immutable snapshot used by the build. Optional distinguishes a
     // current cache from one written by an older mcpp (or a corrupt payload).
-    std::optional<mcpp::platform::runtime::RuntimeBinding> runtimeBinding;
+    std::optional<mcpp::runtime::RuntimeBinding> runtimeBinding;
     // Source trees outside `projectRoot` that this build read — `path`
     // dependencies, which is what workspace members are to each other. The
     // staleness sweep has to cover them or a NEW FILE appearing in one is
@@ -361,6 +366,14 @@ export struct BuildCacheEntry {
     // empty identity, because an engine whose version is the empty string does
     // not exist and "no record" must not be representable as a value.
     std::optional<EngineIdentity> engine;
+    // THE LOCK THE GRAPH WAS PLANNED UNDER: a digest of the project's mcpp.lock
+    // when the record was written, `absent` when there was none, empty for an
+    // entry that predates the field (it declines once). `mcpp update` deletes
+    // entries from the lock -- or the whole file -- so that the next build
+    // re-resolves a branch; a replay of the old graph would build the old
+    // commit and write it back. Measured on 2026.10.19.1: after `mcpp update`,
+    // `mcpp run` printed the old branch's output on every run.
+    std::string lockDigest;
     // Where the build published the project's compile database (`[build]
     // compile_commands` as resolved, design 2026-10-26 D14), relative to the
     // project root; empty for none. A fast path publishes to the same place,
@@ -396,6 +409,15 @@ std::string join_extensions(const std::vector<std::string>& extensions) {
         out += x;
     }
     return out;
+}
+
+// The digest of a project's mcpp.lock (FNV-1a over its bytes), or `absent`.
+export std::string lock_digest(const std::filesystem::path& projectRoot) {
+    std::ifstream in(projectRoot / "mcpp.lock", std::ios::binary);
+    if (!in) return "absent";
+    std::uint64_t h = 1469598103934665603ull;
+    for (char c; in.get(c);) { h ^= static_cast<unsigned char>(c); h *= 1099511628211ull; }
+    return std::format("{:016x}", h);
 }
 
 export std::vector<BuildCacheEntry> read_build_cache(const std::filesystem::path& projectRoot) {
@@ -473,7 +495,7 @@ export std::vector<BuildCacheEntry> read_build_cache(const std::filesystem::path
             haveNextLine = static_cast<bool>(std::getline(f, line));
         }
         if (haveNextLine && line.starts_with("runtimeBinding=")) {
-            auto decoded = mcpp::platform::runtime::deserialize_runtime_binding(
+            auto decoded = mcpp::runtime::deserialize_runtime_binding(
                 line.substr(15));
             if (decoded) e.runtimeBinding = std::move(*decoded);
             haveNextLine = static_cast<bool>(std::getline(f, line));
@@ -573,6 +595,10 @@ export std::vector<BuildCacheEntry> read_build_cache(const std::filesystem::path
             e.rootCompileDbRecorded = true;
             haveNextLine = static_cast<bool>(std::getline(f, line));
         }
+        if (haveNextLine && line.starts_with("lock=")) {
+            e.lockDigest = line.substr(5);
+            haveNextLine = static_cast<bool>(std::getline(f, line));
+        }
         // `engine=<version>`, a tab, and the executable's path; see
         // EngineIdentity. The version holds no tab, so the path is everything
         // after the first one. Absent, or without the tab, the entry declines
@@ -624,7 +650,7 @@ void write_build_cache(const std::filesystem::path& projectRoot,
                        const std::string& runEnvValue = "",
                        const std::string& profile = "",
                        const std::string& cacheMode = "",
-                       const mcpp::platform::runtime::RuntimeBinding& runtimeBinding = {},
+                       const mcpp::runtime::RuntimeBinding& runtimeBinding = {},
                        std::vector<DepSourceRoot> depSourceRoots = {},
                        bool runnerDeclared = false,
                        bool runTierPending = false,
@@ -644,7 +670,7 @@ void write_build_cache(const std::filesystem::path& projectRoot,
     static std::mutex cacheWrite;
     std::lock_guard lock(cacheWrite);
     auto path = projectRoot / kBuildCacheFile;
-    auto fileLock = mcpp::platform::fs::FileLock::acquire(
+    auto fileLock = mcpp::home::FileLock::acquire(
         path.parent_path(), ".build_cache.lock", {}, std::chrono::hours(1), {});
     auto entries = read_build_cache(projectRoot);
 
@@ -680,6 +706,7 @@ void write_build_cache(const std::filesystem::path& projectRoot,
     // The engine that wrote the graph is the one writing the record: both
     // happen in this process, after the graph was emitted.
     newEntry.engine = running_engine();
+    newEntry.lockDigest = lock_digest(projectRoot);
     entries.insert(entries.begin(), std::move(newEntry));
 
     // Trim to LRU capacity.
@@ -726,7 +753,7 @@ void write_build_cache_entries(const std::filesystem::path& path,
         f << "subos=" << e.subosDir << '\n';
         if (e.runtimeBinding)
             f << "runtimeBinding="
-              << mcpp::platform::runtime::serialize_runtime_binding(*e.runtimeBinding)
+              << mcpp::runtime::serialize_runtime_binding(*e.runtimeBinding)
               << '\n';
         f << "profile=" << e.profile << '\n';
         f << "cacheMode=" << e.cacheMode << '\n';
@@ -756,6 +783,7 @@ void write_build_cache_entries(const std::filesystem::path& path,
             f << "group=" << e.group << '\n';
         }
         if (e.rootCompileDbRecorded) f << "compileDb=" << e.rootCompileDb << '\n';
+        if (!e.lockDigest.empty()) f << "lock=" << e.lockDigest << '\n';
         if (e.engine)
             f << "engine=" << e.engine->version << '\t' << e.engine->exe << '\n';
     }
@@ -830,8 +858,8 @@ compute_run_targets(const mcpp::build::BuildPlan& plan) {
 // cached fast path so both derive the same env from the same source.
 std::pair<std::string, std::string>
 compute_run_env(const mcpp::build::BuildPlan& plan) {
-    auto key = mcpp::platform::env::runtime_library_path_key();
-    auto value = mcpp::platform::env::prepend_path_list(key, plan.runtimeLibraryDirs);
+    auto key = mcpp::runtime::launch_env::runtime_library_path_key();
+    auto value = mcpp::runtime::launch_env::prepend_path_list(key, plan.runtimeLibraryDirs);
     if (key.empty() || value.empty()) return {"", ""};
     return {key, value};
 }
@@ -855,12 +883,10 @@ compute_run_env(const mcpp::build::BuildPlan& plan) {
 // declaration changes and this code does not.
 std::vector<std::pair<std::string, std::string>>
 compute_subos_env(const mcpp::build::BuildPlan& plan) {
-    return mcpp::platform::runtime::resolve_runtime_environment(
+    return mcpp::runtime::resolve_runtime_environment(
         plan.runtimeBinding,
         [](std::string_view v) -> std::optional<std::string> {
-            if (const char* e = std::getenv(std::string(v).c_str()))
-                return std::string(e);
-            return std::nullopt;
+            return mcpp::invocation::get(v);
         });
 }
 
@@ -1043,9 +1069,8 @@ ExecutionHost locate_run_under(const mcpp::build::BuildContext& ctx, std::string
     ExecutionHost h;
     if (ctx.runUnder.empty()) return h;
     h.prefix = ctx.runUnder;
-    const char* pathEnv = std::getenv("PATH");
     auto found = mcpp::build::runner_lookup::locate(h.prefix.front(), ctx.xlingsDepBinDirs,
-                                                     pathEnv ? pathEnv : "");
+                                                     mcpp::invocation::get("PATH").value_or(""));
     if (!found.program) {
         h.error = std::format(
             "{}\n       `run_under` comes from {}. Install the program (for example through "
@@ -1073,7 +1098,7 @@ ExecutionHost locate_run_under(const mcpp::build::BuildContext& ctx, std::string
 // here, and is believed.
 std::optional<std::string> unreachable_execution(const mcpp::build::BuildContext& ctx,
                                                  std::string_view tripleKey, bool noRunner) {
-    if (noRunner || !ctx.runUnder.empty() || mcpp::platform::is_macos) return std::nullopt;
+    if (noRunner || !ctx.runUnder.empty() || mcpplibs::os::is_macos) return std::nullopt;
     auto t = mcpp::toolchain::triple::parse(tripleKey);
     if (!t || !t->is_apple()) return std::nullopt;
     return std::format(
@@ -1206,6 +1231,12 @@ RunnerChoice choose_device_action(const BuildContext& ctx,
         c.tmpl = mcpp::toolchain::payload_default_runner(ctx.tc.binaryPath);
         c.fromPayload = !c.tmpl.empty();
     }
+    // AND THE TARGET'S OWN, FOR AN OK IMAGE: the loader is what runs one, on
+    // every system (SPEC 12). `okrun` is found as any runner's program is --
+    // first among the programs the graph built for this machine
+    // (`openkal-tools`), then in declared payloads, then on PATH.
+    if (isDefault && c.tmpl.empty() && ft && ft->is_openkal())
+        c.tmpl = { std::string(mcpp::okimage::kRunner) };
     // `--no-runner` is the operator on THIS host stating a host fact the
     // manifest cannot carry: the triple is native here. On a freestanding
     // target that leaves nothing to execute, and the caller's existing
@@ -1227,19 +1258,24 @@ RunnerChoice choose_runner(const BuildContext& ctx) {
 // size line that replaced the outcome would be a different kind of message.
 // Silent on every hosted target and whenever the tool is absent — an
 // informational line has no standing to fail a build.
+//
+// The `Entry` line beside it (design 2026-10-26 §24.4 item 10) says where an
+// image is entered and who said so, for an image whose entry was stated.
 void report_freestanding_size(const BuildContext& ctx) {
     auto ft = mcpp::toolchain::triple::parse(ctx.tc.targetTriple);
     if (!ft || !ft->is_freestanding()) return;
     auto tool = mcpp::freestanding::resolve_size_tool(ctx.tc.binaryPath);
-    if (tool.empty()) return;
     for (auto const& lu : ctx.plan.linkUnits) {
         if (lu.kind != mcpp::build::LinkUnit::Binary) continue;
         auto art = ctx.outputDir / lu.output;
         std::error_code ec;
         if (!std::filesystem::exists(art, ec)) continue;
+        if (!lu.start.empty())
+            mcpp::ui::info("Entry", std::format("{}  {}  ({})", lu.targetName, lu.start, lu.startFrom));
+        if (tool.empty()) continue;
         // An argument vector rather than a `2>/dev/null` command string,
         // which cmd.exe cannot open on a Windows host.
-        auto out = mcpp::platform::process::capture_stdout(
+        auto out = mcpp::run::capture_stdout(
             {tool.string(), art.string()});
         if (out.exit_code != 0 && out.output.empty()) continue;
         auto s = mcpp::freestanding::parse_size_output(out.output);
@@ -1281,7 +1317,9 @@ std::vector<mcpp::build::result::Artifact> result_artifacts(const BuildContext& 
             case LinkUnit::StaticLibrary: kind = "static"; break;
             default: continue;
         }
-        res::Artifact a{lu.targetName, kind, ctx.outputDir / lu.output, std::nullopt};
+        res::Artifact a{lu.targetName, kind, ctx.outputDir / lu.output, std::nullopt, std::nullopt};
+        if (!lu.entryFrom.empty() || !lu.start.empty())
+            a.entry = res::Entry{lu.entryFrom, lu.start, lu.startFrom};
         if (lu.kind == LinkUnit::Binary && lu.artifactOf.empty()) {
             res::Launch l;
             l.cwd = ctx.projectRoot.generic_string();
@@ -1758,9 +1796,9 @@ std::optional<int> run_ninja_fast(const std::string& ninjaProgram,
     // Unset by default and unset in CI. It changes nothing but ninja's
     // verbosity, and it is spelled as a topic list rather than a boolean so
     // that `-d stats` and `-d keeprsp` are reachable without another variable.
-    if (const char* topics = std::getenv("MCPP_NINJA_DEBUG"); topics && *topics) {
+    if (auto topics = mcpp::invocation::get("MCPP_NINJA_DEBUG")) {
         argv.push_back("-d");
-        argv.push_back(topics);
+        argv.push_back(*topics);
     }
 
     std::vector<std::pair<std::string, std::string>> childEnv;
@@ -1822,9 +1860,9 @@ std::optional<int> run_ninja_fast(const std::string& ninjaProgram,
         // Nobody reads this ninja's progress: it reports no action start
         // (build progress design 2026-09-29, §6.4).
         childEnv.emplace_back(std::string(mcpp::build::progress::kStartsEnv), "");
-        mcpp::platform::process::RunResult r;
-        if (scanArgv) r = mcpp::platform::process::capture_exec(*scanArgv, childEnv);
-        if (r.exit_code == 0) r = mcpp::platform::process::capture_exec(argv, childEnv);
+        mcpp::run::RunResult r;
+        if (scanArgv) r = mcpp::run::capture_exec(*scanArgv, childEnv);
+        if (r.exit_code == 0) r = mcpp::run::capture_exec(argv, childEnv);
         out = std::move(r.output);
         status = r.exit_code;
     }
@@ -1841,6 +1879,10 @@ std::optional<int> run_ninja_fast(const std::string& ninjaProgram,
         // command lines, and a future filter change must not be able to
         // silently remove the advice along with them.
         if (auto advice = mcpp::build::link_failure_advice(out); !advice.empty())
+            mcpp::ui::block(advice);
+        // Design 2026-10-26 §24.4 item 10, the fast-path form: no plan, so the
+        // note names where a `start` may come from rather than where it came.
+        if (auto advice = mcpp::build::start_failure_advice(out, {}); !advice.empty())
             mcpp::ui::block(advice);
         // mcpp#662, the fast-path form: no `BuildPlan` here (the whole point
         // of this path is skipping `prepare`), so whether the C library is the
@@ -2214,6 +2256,10 @@ admit_recorded_build(const BuildCacheEntry& e, const ReplayAsk& ask) {
     const auto manifestTime = std::filesystem::last_write_time(ask.manifest, ec);
     if (ec || manifestTime > ninjaTime)
         return std::unexpected(std::format("{} is newer than build.ninja", ask.manifestName));
+    if (e.lockDigest.empty())
+        return std::unexpected("the recorded build predates the lock it was planned under");
+    if (e.lockDigest != lock_digest(ask.manifest.parent_path()))
+        return std::unexpected("mcpp.lock is not the one the recorded build was planned under");
 
     // mcpp#225: bounded + vcs/build-dir-excluded walk (see sources_newer_than)
     // instead of a hand-rolled recursive_directory_iterator over src/.
@@ -2266,15 +2312,15 @@ export std::optional<int> try_fast_build(const std::filesystem::path& projectRoo
     //
     // Declining the fast path is the whole fix: `--locked` is for release
     // builds, audits and CI, none of which are the case the fast path serves.
-    if (mcpp::platform::env::get("MCPP_LOCKED").value_or("") == "1")
+    if (mcpp::invocation::get("MCPP_LOCKED").value_or("") == "1")
         return fast_path_declined("build", "MCPP_LOCKED=1 asks for a locked resolution");
     // `--managed-only` is checked against the sources prepare decides, which
     // a fast path does not run (mcpp#755).
-    if (auto v = mcpp::platform::env::get("MCPP_MANAGED_ONLY"); v && *v != "0")
+    if (auto v = mcpp::invocation::get("MCPP_MANAGED_ONLY"); v && *v != "0")
         return fast_path_declined("build", "MCPP_MANAGED_ONLY asks for the sources to be checked");
 
     // The full path refuses a denied write and names it (design 2026-10-26 §5.5).
-    if (mcpp::platform::env::effect_denied("write-project"))
+    if (mcpp::effects::effect_denied("write-project"))
         return fast_path_declined("build", "the caller denied write-project");
     auto want = fast_path_identity(projectRoot);
     if (!want) return fast_path_declined("build", "the manifest or the request could not be read");
@@ -2372,13 +2418,13 @@ export std::optional<int> try_fast_workspace_build(
         const std::vector<std::vector<std::string>>& groups,
         bool verbose, bool no_cache) {
     if (no_cache) return fast_path_declined("workspace", "the build cache is off (--no-cache)");
-    if (mcpp::platform::env::effect_denied("write-project"))
+    if (mcpp::effects::effect_denied("write-project"))
         return fast_path_declined("workspace", "the caller denied write-project");
-    if (mcpp::platform::env::get("MCPP_LOCKED").value_or("") == "1")
+    if (mcpp::invocation::get("MCPP_LOCKED").value_or("") == "1")
         return fast_path_declined("workspace", "MCPP_LOCKED=1 asks for a locked resolution");
     // `--managed-only` is checked against the sources prepare decides, which
     // a fast path does not run (mcpp#755).
-    if (auto v = mcpp::platform::env::get("MCPP_MANAGED_ONLY"); v && *v != "0")
+    if (auto v = mcpp::invocation::get("MCPP_MANAGED_ONLY"); v && *v != "0")
         return fast_path_declined("workspace", "MCPP_MANAGED_ONLY asks for the sources to be checked");
     auto join = [](const std::vector<std::string>& v) {
         std::string out;
@@ -2396,7 +2442,7 @@ export std::optional<int> try_fast_workspace_build(
         mcpp::build::runtime_validation::ArtifactSnapshot validated;
     };
     std::vector<Ready> ready;
-    std::vector<std::shared_ptr<mcpp::platform::fs::FileLock>> locks;
+    std::vector<std::shared_ptr<mcpp::home::FileLock>> locks;
     std::string profile;
     std::error_code ec;
     const auto wsToml = std::filesystem::last_write_time(wsRoot / "mcpp.toml", ec);
@@ -2512,13 +2558,13 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
         return fast_path_declined("run", "--print-launch describes the launch the full path composes");
     // Same reason as try_fast_build's: this path skips resolution, and
     // `--locked` is an assertion about resolution.
-    if (mcpp::platform::env::get("MCPP_LOCKED").value_or("") == "1")
+    if (mcpp::invocation::get("MCPP_LOCKED").value_or("") == "1")
         return fast_path_declined("run", "MCPP_LOCKED=1 asks for a locked resolution");
     // `--managed-only` is checked against the sources prepare decides, which
     // a fast path does not run (mcpp#755).
-    if (auto v = mcpp::platform::env::get("MCPP_MANAGED_ONLY"); v && *v != "0")
+    if (auto v = mcpp::invocation::get("MCPP_MANAGED_ONLY"); v && *v != "0")
         return fast_path_declined("run", "MCPP_MANAGED_ONLY asks for the sources to be checked");
-    if (mcpp::platform::env::effect_denied("write-project"))
+    if (mcpp::effects::effect_denied("write-project"))
         return fast_path_declined("run", "the caller denied write-project");
     auto want = fast_path_identity(projectRoot);
     if (!want) return fast_path_declined("run", "the manifest or the request could not be read");
@@ -2641,12 +2687,10 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
     // Installing/changing a provider invalidates the fast path via the SubOS
     // manifest mtime check; this invocation never mixes a new run contract
     // with objects built under the old one.
-    for (auto& kv : mcpp::platform::runtime::resolve_runtime_environment(
+    for (auto& kv : mcpp::runtime::resolve_runtime_environment(
              *match->runtimeBinding,
              [](std::string_view v) -> std::optional<std::string> {
-                 if (const char* e = std::getenv(std::string(v).c_str()))
-                     return std::string(e);
-                 return std::nullopt;
+                 return mcpp::invocation::get(v);
              }))
         childEnv.push_back(std::move(kv));
 
@@ -2656,7 +2700,7 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
     // `runnerDeclared` gate above), so the artifact is the only thing that
     // could have been refused.
     int spawnErr = 0;
-    const int exitRc = mcpp::platform::process::run_foreground(argv, childEnv, &spawnErr);
+    const int exitRc = mcpp::run::run_foreground(argv, childEnv, &spawnErr);
     if (spawnErr != 0) {
         using namespace mcpp::build::runner_lookup;
         const auto triple = mcpp::toolchain::triple::host_triple().str();
@@ -2801,9 +2845,8 @@ int run_artifact_via_runner(mcpp::build::BuildContext& ctx,
         // different interpreter with different arguments is the failure the
         // runner key exists to prevent.
         auto tmpl = choice.tmpl;
-        const char* pathEnv = std::getenv("PATH");
         auto found = mcpp::build::runner_lookup::locate(
-            tmpl.front(), ctx.xlingsDepBinDirs, pathEnv ? pathEnv : "");
+            tmpl.front(), ctx.xlingsDepBinDirs, mcpp::invocation::get("PATH").value_or(""));
         if (!found.program) {
             std::println(stderr, "error: {}",
                 mcpp::build::runner_lookup::not_found_message(
@@ -2899,7 +2942,7 @@ int run_artifact_via_runner(mcpp::build::BuildContext& ctx,
         return 0;
     }
     int spawnErr = 0;
-    const int rc = mcpp::platform::process::run_foreground(argv, childEnv, &spawnErr);
+    const int rc = mcpp::run::run_foreground(argv, childEnv, &spawnErr);
     if (spawnErr != 0) {
         using namespace mcpp::build::runner_lookup;
         if (!choice.tmpl.empty() || !host.prefix.empty())
@@ -3638,9 +3681,8 @@ static void test_resolve_runner(TestBuild& tb, const TestOptions& testOpts, bool
     tb.runnerTmpl = runnerChoice.tmpl;
     auto& runnerTmpl = tb.runnerTmpl;
     if (!runnerTmpl.empty()) {
-        const char* pathEnv = std::getenv("PATH");
         auto found = mcpp::build::runner_lookup::locate(
-            runnerTmpl.front(), ctx->xlingsDepBinDirs, pathEnv ? pathEnv : "");
+            runnerTmpl.front(), ctx->xlingsDepBinDirs, mcpp::invocation::get("PATH").value_or(""));
         if (found.program) runnerTmpl.front() = found.program->string();
         else tb.invocationNotRunReason = mcpp::build::runner_lookup::not_found_message(
             runnerChoice.tripleKey, runnerTmpl.front(), found.searched);
@@ -3688,11 +3730,11 @@ static int test_run_member(TestBuild& tb, const TestOptions& testOpts,
     // The runtime of THIS member: in a plan of several members, the plan's own
     // directories are the union over every member, and a member's tests are
     // told about its closure's alone.
-    auto runtimeEnvKey = mcpp::platform::env::runtime_library_path_key();
+    auto runtimeEnvKey = mcpp::runtime::launch_env::runtime_library_path_key();
     std::string runtimeEnvValue;
     bool hasRuntimeDirs = false;
     with_member(*ctx, owner, [&] {
-        runtimeEnvValue = mcpp::platform::env::prepend_path_list(
+        runtimeEnvValue = mcpp::runtime::launch_env::prepend_path_list(
             runtimeEnvKey, ctx->plan.runtimeLibraryDirs);
         hasRuntimeDirs = !ctx->plan.runtimeLibraryDirs.empty();
     });
@@ -3706,7 +3748,7 @@ static int test_run_member(TestBuild& tb, const TestOptions& testOpts,
     // test needing `[runtime] library_dirs` passes on Linux/Windows and fails
     // here with a dyld error that names neither the cause nor the platform —
     // so say it out loud rather than leaving the difference silent.
-    if constexpr (mcpp::platform::is_macos) {
+    if constexpr (mcpplibs::os::is_macos) {
         if (runtimeEnvKey.empty() && hasRuntimeDirs) {
             mcpp::diag::warning("test/runtime-path",
                 "macOS does not inject a runtime library path for test binaries "
@@ -3829,13 +3871,13 @@ static int test_run_member(TestBuild& tb, const TestOptions& testOpts,
                 int spawnErr = 0;
                 std::string runOutput;
                 if (capture) {
-                    auto rr = mcpp::platform::process::capture_exec_deadline(
+                    auto rr = mcpp::run::capture_exec_deadline(
                         r.argv, r.env, deadline, &timedOut, {}, &spawnErr);
                     exitCode  = rr.exit_code;
                     runOutput = std::move(rr.output);
                 } else {
                     mcpp::ui::status("Running", std::format("bin/{}", r.name));
-                    exitCode = mcpp::platform::process::run_exec_deadline(
+                    exitCode = mcpp::run::run_exec_deadline(
                         r.argv, r.env, deadline, &timedOut, &spawnErr);
                 }
                 auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -4017,12 +4059,12 @@ static int test_run_member(TestBuild& tb, const TestOptions& testOpts,
         // Prepend the toolchain's environment's bin to the CHILD PATH so test
         // binaries that shell out to bootstrapped tools (patchelf, ninja) find
         // them — applied to the child only, not via a leaky shell prefix.
-        if constexpr (!mcpp::platform::is_windows) {
+        if constexpr (!mcpplibs::os::is_windows) {
             if (auto environment = mcpp::provider::environment_of(ctx->tc.binaryPath)) {
                 auto sandboxBin  = *environment / "bin";
                 if (std::filesystem::exists(sandboxBin)) {
                     std::array<std::filesystem::path, 1> extra{sandboxBin};
-                    auto pathVal = mcpp::platform::env::prepend_path_list("PATH", extra);
+                    auto pathVal = mcpp::runtime::launch_env::prepend_path_list("PATH", extra);
                     if (!pathVal.empty()) childEnv.emplace_back("PATH", pathVal);
                 }
             }

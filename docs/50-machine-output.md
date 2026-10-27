@@ -569,6 +569,7 @@ a program classifying the outcome reads `reason`:
 | `std-module-precompile` | the standard library's module could not be precompiled for this configuration |
 | `msvc-redist-unavailable` | an explicit `cxx_runtime = "toolchain-coupled"` on an MSVC-ABI row whose toolset has no redistributable directory to stage *(2026.9.28.1+)* |
 | `crt-declared-under-host-coupled` | a file of the MSVC C++ runtime is declared beside the program while its contract is host-coupled, under which the system's runtime serves it and no copy is placed *(2026.9.28.2+)* |
+| `image-tool-absent` | a build of `<arch>-openkal` links an image and finds no `okld`, the program of the graph that notes and checks an ok image *(2026.10.26.2+)* |
 | `other` | a refusal whose branch has not been given a token yet |
 
 **One token is also printed by `mcpp build` itself.**
@@ -871,7 +872,7 @@ terminal is therefore visible to an IDE that reads the record, and the reverse.
 | `status` | `running`, `ok`, `failed`, or `cancelled` |
 | `configuration` | `triple`, `profile`, `fingerprint`, `outputDir` |
 | `compileDatabase` | the configuration's `compile_commands.json`, or `null` |
-| `artifacts` | `name`, `kind` (`bin`, `test`, `shared`, `static`), `path`, and for a runnable product `launch` |
+| `artifacts` | `name`, `kind` (`bin`, `test`, `shared`, `static`), `path`, for a runnable product `launch`, and `entry` when the program's beginning or its entry symbol was stated |
 | `diagnostics` | the compilers' diagnostics of a failed build: `severity`, `message`, `path`, `range` |
 
 `launch` is how `mcpp run` starts the product: `argv`, `cwd`, `env` and
@@ -881,6 +882,11 @@ caller's other variables, so the record holds no secret of the caller's.
 `via` is `null`, `"runner"` (a `[target.<triple>].runner` wraps the program) or
 `"run_under"` (an execution host wraps it). A debugger, an IDE or a CI job that
 starts the program from `launch` starts it as `mcpp run` would.
+
+`entry` says where the program begins and where its image is entered (docs/04,
+`kind = "entry"` and `start`): `from` is the `"<dependency>/<entry>"` a
+`main = { from }` named, `start` the stated entry symbol and `start_from` the
+statement that named it. Each key is present only when stated.
 
 A run ended by SIGINT, SIGTERM or SIGHUP leaves `cancelled` in both files
 ([exit codes](specs/exit-codes.md) §3.7). A record still `running` whose

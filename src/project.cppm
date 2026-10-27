@@ -113,6 +113,21 @@ export void merge_workspace_deps(mcpp::manifest::Manifest& member,
     merge_map(member.dependencies);
     merge_map(member.devDependencies);
     merge_map(member.buildDependencies);
+    for (auto& [feature, deps] : member.featureDeps) merge_map(deps);
+    // AND EVERY CONDITIONAL TABLE. `[target.'cfg(...)'.dependencies]` is merged
+    // into the maps above only when its predicate holds, which is after this
+    // runs; an entry there written `workspace = true` kept its empty version
+    // and resolved from the index, so a workspace's git dependency inherited
+    // under a target selector became the published version of the same name
+    // (measured in mcpp-language-server: `openkal-linux.workspace = true` under
+    // `cfg(os = "linux")` resolved openkal-linux 0.17.0 beside a branch of
+    // openkal that required another).
+    for (auto& c : member.conditionalConfigs) {
+        merge_map(c.dependencies);
+        merge_map(c.devDependencies);
+        merge_map(c.buildDependencies);
+        for (auto& [feature, deps] : c.featureDeps) merge_map(deps);
+    }
 }
 
 // Inherit the workspace root's `[indices]` when the member declares none.
@@ -716,10 +731,18 @@ unresolved_workspace_dependency_error(const mcpp::manifest::Manifest& m,
         return std::nullopt;
     };
     std::optional<std::string> name;
-    std::string_view table;
+    std::string table;
     if ((name = first(m.dependencies)))           table = "dependencies";
     else if ((name = first(m.devDependencies)))   table = "dev-dependencies";
     else if ((name = first(m.buildDependencies))) table = "build-dependencies";
+    for (auto it = m.featureDeps.begin(); !name && it != m.featureDeps.end(); ++it)
+        if ((name = first(it->second))) table = std::format("feature-deps.{}", it->first);
+    for (auto it = m.conditionalConfigs.begin(); !name && it != m.conditionalConfigs.end(); ++it) {
+        const std::string at = std::format("target.{}", it->predicate);
+        if ((name = first(it->dependencies)))           table = at + ".dependencies";
+        else if ((name = first(it->devDependencies)))   table = at + ".dev-dependencies";
+        else if ((name = first(it->buildDependencies))) table = at + ".build-dependencies";
+    }
     if (!name) return std::nullopt;
     return std::format(
         "{}: [{}] {} = {{ workspace = true }}, but no workspace declares '{}'.\n"
@@ -761,6 +784,14 @@ load_effective_manifest(const std::filesystem::path& dir) {
     if (wsRoot.empty()) {
         auto m = mcpp::manifest::load(manifestPath);
         if (!m) return std::unexpected(m.error().format());
+        // A workspace root that is a package takes its own
+        // [workspace.dependencies] as the planner's member "." does
+        // (`load_member_manifest`); they were not merged here, so a reader of
+        // the root's effective manifest saw `x.workspace = true` with no source.
+        if (m->workspace.present) {
+            const auto workspace = *m;
+            merge_workspace_deps(*m, workspace, std::filesystem::absolute(dir));
+        }
         inherit_as_root_package(*m, std::filesystem::absolute(dir));
         return EffectiveManifest{ std::move(*m), std::nullopt, {}, false };
     }

@@ -84,7 +84,8 @@ widget = { version = "1.0", backend = "glfw_opengl3" }  # Sugar for: features=["
 **Git 依赖与 `mcpp.lock`**:`tag` 和 `rev` 已经指向历史中的一个固定点，而
 `branch` 是会移动的。首次构建把分支解析成一个 commit 并写进 `mcpp.lock`,
 此后每次构建都重新构建**那个** commit —— lock 是权威来源而不是缓存提示，
-所以删掉 `~/.mcpp/git` 或换一台机器，都不会静默切换到更新的分支头。要用新的
+所以删掉 `~/.mcpp/git` 或换一台机器，都不会静默切换到更新的分支头。工程经由
+其他包间接依赖的分支同样如此（2026.10.26.2+），以包的限定名记录。要用新的
 分支头，必须显式请求：
 
 ```bash
@@ -154,7 +155,7 @@ sdk = { version = "1.0", visibility = "private" }
 | `version` | `version`，不同的约束 | 按上文所述，用 SemVer 对两个约束做 AND 合并；无法满足的一对被拒绝，并点名两个约束与两个请求方。 |
 | `git` | `git`，不同的 `rev`/`tag`/`branch` | 根是两个请求方之一时，根的声明胜出；否则先解析出来的声明胜出。`dependency/source-override` 警告点名两个请求方与两个引用，说明哪一个被采用、原因是什么，以及如何取用另一个。这个警告绝不会被吞掉。 |
 | `path` | `path`，不同的目录 | 规则与警告同上一行，只是比较的是规范化后的绝对目录，而不是 git 引用。 |
-| 根的 `path` 或 `git` 声明 | 某个依赖的 `git` 或 `version` 声明（种类冲突） | 根的声明胜出，警告同上。若败下阵的声明是一条 `version` 需求，它会被拿去与根已解析出的那份 checkout 的 `[package] version` 核对；需求被违反就拒绝，并点名那个 pin、请求方与需求本身。 |
+| 根的 `path` 或 `git` 声明 | 某个依赖的 `git` 或 `version` 声明（种类冲突） | 根的声明胜出，警告同上。若败下阵的声明是一条 `version` 需求，它会被拿去与根已解析出的那份 checkout 的 `[package] version` 核对；需求被违反就拒绝，并点名那个 pin、请求方与需求本身。根已回答的请求不再交给索引选择与固定，因此根的 checkout 也能满足索引尚未收录的版本（2026.10.26.2+）。 |
 | 某个依赖的 `path`/`git` 声明 | 另一个依赖的不同种类的声明（种类冲突，且双方都不是根） | 拒绝："requested as both a … dep … and a … dep …. Pick one."。消息多出一句：在根里声明该身份即可解决。 |
 
 这里根所拥有的特权，与 `linkage` 只在根 manifest 自己的边上生效（见上文

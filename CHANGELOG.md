@@ -4,6 +4,172 @@
 > Each `## [<version>]` section is that release's notes. Entries are written in English
 > from 2026.9.28.3 on; earlier entries remain as written.
 
+## [2026.10.26.2] - 2026-10-26
+
+### Added
+
+- **`x86_64-openkal` and `aarch64-openkal`: one ok image per architecture**
+  (openkal SPEC clause 12). The image is compiled for no operating system
+  with the convention's flags, linked by `ld.lld` into an ET_DYN entered at
+  `ok_main` (`bin/<name>.oke`, or `lib<name>.okso` for an image another
+  loads), and published only after `okld note` has written its requirements
+  note and `okld check` has checked it. `okrun` runs it on Linux, macOS and
+  Windows and is the target's runner. Both programs come from the dependency
+  graph: `[build-dependencies] openkal-tools = { tools = ["okld", "okrun"] }`.
+  The C library and the C++ run-time inside an image are packages; the
+  payload's libc++ is not offered to an image.
+  A build that links an image with no `okld` in the graph is refused with
+  the machine-readable reason `image-tool-absent`.
+  The tools a workspace's root package declares are its own, as any root's
+  are.
+  `mcpp pack --mode self-contained` reads the declaration of openkal-tools a
+  build resolves: after workspace inheritance and in the target's
+  `[target.'cfg(os = "openkal")'.build-dependencies]`.
+
+- **A program's beginning can be a dependency's entry target, and a
+  freestanding image states the symbol it is entered at** (#845). A framework
+  declares `[targets.<n>] kind = "entry"` with the translation unit that
+  supplies `main`, and a program selects it with
+  `main = { from = "<dependency>/<entry>" }` in place of a file of its own; a
+  test suite does the same with `[test] main`. The entry is compiled in its
+  package's context with its own flags, linked only into the programs that
+  select it, gated by its `required_features`, and its `windows_entry` is
+  inherited. `start = "<symbol>"` on a program, an entry, a row or `[test]`,
+  and `mcpp:link-start` from a board package's build program (protocol 16),
+  name the ELF entry of a freestanding image; statements that disagree are
+  refused naming each, the symbol must be defined (it was a linker warning and
+  an image entered at address 0), and the build reports it on an `Entry` line
+  and in the result record's `entry`. A file a target names as `main` on any
+  row is no longer linked as an ordinary source on the other rows.
+
+### Changed
+
+- **mcpp keeps no operating-system layer of its own.** `modules/platform` is
+  removed; mcpp reaches the operating system through mcpplibs.os 0.2.0, and
+  what was mcpp's own meaning under that name now lives in the module that
+  owns it: the environment of an invocation in the `invocation` package, the
+  constraints of a run in `mcpp.effects`, every program mcpp starts in
+  `mcpp.run`, the loader environment and the run-time search in
+  `src/runtime`, command-line spelling in `mcpp.build.command_line`, the
+  platform keys and the Apple SDK in `toolchain-model`, the terminal and key
+  input in `src/ui`, the home's lock and trust check in `mcpp.home.files`.
+  The one primitive kept per system is the lock every release of mcpp takes
+  (`src/native/posix`, `src/native/windows`). A program is found on PATH
+  without a shell, with PATHEXT's suffixes on Windows, and the current
+  directory is not searched on Windows. A list of directories in an
+  environment variable (`PATH`, the run-time library path) is read and written
+  with `mcpplibs.os`'s `split_list` and `join_list`: an empty entry is
+  skipped, and a quoted entry on Windows is unquoted.
+- **A program mcpp starts is named by its argument vector.** Compiler probes,
+  git, xlings, tar, strip, patchelf, readelf and vswhere are started without a
+  command interpreter, with their additions to the environment given to them
+  alone; the interpreter runs only commands that are text by nature (a
+  `[hooks]` command, an MSVC environment script, and the command lines mcpp
+  composes and records as text, as ninja's rules are). On Windows the
+  interpreter receives `cmd.exe /d /s /c "<command>"` as one string. Every
+  started program reads an empty standard input unless it is the program
+  `mcpp run` becomes, and runs in a unit that ends with mcpp.
+- **No signal handlers.** A request to end (SIGINT, SIGTERM, SIGHUP, a
+  console's control events) is taken over by mcpplibs.os and read by one
+  watcher thread, which ends the units of the running programs, writes the
+  interrupt files, restores the terminal and ends mcpp as the request would
+  have; the exit codes of §5 are unchanged. A closed standard output ends mcpp
+  in the same order (`mcpp … | head`: 141 to a shell on POSIX). Every program
+  mcpp starts begins with SIGPIPE at its default, although openkal ignores it
+  for its own writes.
+- **mcpp does not write its own process environment.** Variables mcpp states
+  (its home, `--offline`, a hook's variables, xlings' home and PATH) are this
+  invocation's statements, read by every lookup mcpp makes and given to the
+  programs it starts; an xlings invocation's environment is the started
+  program's, on Windows as elsewhere.
+
+### Fixed
+
+- **A dependency upgraded to a cached version replaces the previous version's
+  files.** A package's BMI and objects are staged from the build cache at paths
+  named by the module and the source, not by the cache entry, and staging under
+  `--verify size` took a destination of the source's size as already staged.
+  After an upgrade the previous version's files are at those paths, and a
+  change that keeps their sizes (a constant) left them in place: the program
+  ran the old code, and a unit compiled against the new graph failed with
+  `CRC mismatch` (GCC). A destination that can be read is now compared by
+  content under every mode; an equal size is accepted only for one that cannot
+  be opened (a language server holding it). e2e 948.
+- **A compile whose status could not be written fails at once.** A detached
+  module compile reports its status in `<slot>.rc`, which appears by a rename
+  after the number is written. On a full disk the file appeared empty and the
+  build waited for a number until its two-hour limit; an `.rc` with no number is
+  now a failed unit, said as such.
+- **A WebAssembly link writes its `.wasm` again.** 2026.10.26.1 published every
+  POSIX link through a temporary name, and Emscripten names the file it writes
+  beside the output after the output: a link to `app.js.tmp` wrote no
+  `app.wasm`, the edge's implicit output was missing, and `mcpp pack` of a
+  `wasm32-emscripten` program (mcpp-plugins' `dist-web`) found no stem family.
+  A WebAssembly link is in place, as a PE link is.
+- **A module's indirect import is found whatever map its importer has (GCC).**
+  A unit that reaches another package's module is compiled with a module map,
+  and a unit that imports only the root's modules with GCC's own mapper. A BMI
+  records the paths of its imports as its compile's mapper spelt them, and the
+  map named no repository, so a unit with a map that imported a root module
+  compiled without one looked for that module's import beside the build
+  directory (`failed to read compiled module`, `Bad import dependency`). The
+  map now names the BMI directory as its repository (`$root gcm.cache`) and
+  every path below it, as GCC's own mapper does; the dyndep step reads the
+  same form. The same cause failed `import std.compat` in a unit with a map, in
+  any project with a dependency. A dependency's BMI that an earlier mcpp put in
+  the global build cache spells its imports the earlier way, so the cache key
+  of a package that provides a module under GCC carries the spelling: such a
+  package is compiled once more after the upgrade, and a package of object
+  files keeps its entry.
+- **`mcpp update` moves a branch dependency forward again.** The record of
+  the previous build was replayed although mcpp.lock had been cleared, so the
+  next build kept the old commit and wrote it back. A recorded build is now
+  replayed only under the lock it was planned with.
+- **A git branch reached through another package is locked.** mcpp.lock
+  recorded only the branches the project itself declared, so a branch two
+  edges away moved to its tip on every build and stopped an `--offline` build
+  ("mcpp.lock records no commit for branch"). It is now recorded under the
+  package's qualified name and read back as its anchor.
+- **A root's checkout answers a dependency's request by version that no index
+  carries.** The root's path or git declaration of a package overrides a
+  dependency's request for it by version, but the request was first given to
+  the index to select, and a package the index did not carry yet (a root
+  pinning a checkout ahead of a release) refused the build with "no package
+  found for exact selector". The root's checkout now answers it; a
+  requirement the checkout does not satisfy is still refused.
+- **A build program compiled against an updated interface of the same mcpp
+  version reads the new interface.** The compiled `mcpp` module of build
+  programs was kept by mcpp's version alone, so a build of mcpp between
+  releases that added a directive served the previous interface. It is kept by
+  the version and a digest of its text.
+- **A request by version the local index cannot answer refreshes the index
+  wherever it is in the graph.** The refresh before the dependency walk asked
+  only about the root's and the selected members' `[dependencies]`, so a
+  version named by a path dependency, by a package's own manifest or in a
+  conditional table, and published after the local index was fetched, refused
+  the build ("no package found for exact selector") with no refresh at all.
+  The miss now asks the refresh policy (offline, `[index] auto_refresh`, the
+  debounce, one sync per run) and the selection is made again; a namespace the
+  index cannot refute still never refreshes.
+- **A dependency written `workspace = true` under a target selector or behind
+  a feature receives the workspace's source.** Only `[dependencies]`,
+  `[dev-dependencies]` and `[build-dependencies]` were merged, so a git or path
+  dependency of `[workspace.dependencies]` inherited in
+  `[target.'cfg(...)'.dependencies]` or `[feature-deps.<f>]` kept an empty
+  version and resolved from the index. Such an entry no workspace declares is
+  now refused by name, as one in `[dependencies]` is.
+- **A branch pushed to between `git ls-remote` and the clone is still
+  fetched.** The clone of a branch is one commit deep, so a push between the
+  two left it at a newer tip without the commit the build had resolved, and
+  the build stopped at `unable to read tree`. That commit is now fetched by
+  its name, or, from a server that refuses that, with the branch's history.
+- **Switching workspace members under `trim_paths` no longer recompiles their
+  shared dependencies** (#844). The prefix map of the whole plan was part of
+  the flags every unit shares, so a dependency's command line named the roots
+  of the members being built, and `--release -p cli` then `-p gui` recompiled
+  the common packages each time. A unit's map is now the fixed roots and the
+  roots of its own package's dependency closure.
+
 ## [2026.10.26.1] - 2026-10-26
 
 ### Added

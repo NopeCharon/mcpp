@@ -12,7 +12,7 @@ import mcpp.diag;
 import mcpp.build.refusal;
 import mcpp.build.version_floor;
 import mcpp.home;
-import mcpp.platform.axis;
+import mcpp.toolchain.platform;
 import mcpp.libs.json;
 import mcpp.log;
 import mcpp.manifest;
@@ -21,7 +21,6 @@ import mcpp.modgraph.glob;
 import mcpp.graph;
 import mcpp.build.progress;   // the members' programs wait in order (design 2026-09-29 §4.2)
 import mcpp.build.schedule.policy;   // resolve_jobs — how many programs compile at once (#748, B2)
-import mcpp.platform.capacity;       // the host fallback when no job count was stated
 import mcpp.modgraph.graph;
 import mcpp.modgraph.scanner;
 import mcpp.modgraph.validate;
@@ -56,7 +55,6 @@ import mcpp.build.build_program;
 import mcpp.build.backend;      // BuildOptions for the tool sub-build
 import mcpp.build.ninja;        // make_ninja_backend — driving that sub-build
 import mcpp.toolchain.post_install;
-import mcpp.platform;
 import mcpp.ui;
 import mcpp.log;
 import mcpp.wire;               // Severity, for PlanNote (#699 item 2, E3)
@@ -262,6 +260,7 @@ step9_gather_target_side_candidates(PrepareState& state) {
                 in.targetOs           = tt->os;
                 in.targetEnv          = tt->env;
                 in.freestandingTarget = tt->is_freestanding();
+                in.openkalTarget      = tt->is_openkal();
                 // NOT `tt->envExplicit`. By this line the triple has been
                 // canonicalised, and the canonical form of `x86_64-linux` is
                 // `x86_64-linux-gnu` — re-parsing it reports a segment the
@@ -463,7 +462,10 @@ step9_resolve_and_realise_cabi(PrepareState& state, TargetSideGather& gather) {
             auto tt = mcpp::toolchain::triple::parse(state.tc->targetTriple);
             auto realised = mcpp::toolchain::cenv::realise(
                 *state.resolvedTargetSide.cAbiDecl, tt ? tt->os : std::string{},
-                tt ? tt->arch : std::string{}, tt && tt->is_freestanding());
+                tt ? tt->arch : std::string{},
+                // An ok image is told no operating system, as a bare machine
+                // is: the C library's identity macros are the only ones.
+                tt && (tt->is_freestanding() || tt->is_openkal()));
             if (!realised) {
                 refusal::record(refusal::Code::CEnvUnrealisable);
                 return std::unexpected(realised.error());
@@ -624,7 +626,12 @@ step9_resolve_and_realise_cabi(PrepareState& state, TargetSideGather& gather) {
         // availability check links and runs without the archive; refusing it
         // would trade a diagnosed hazard for a regression. The degradation
         // names the platform, the file and the package that supplies it.
-        if (state.resolvedTargetSide.compilerRuntime.absent() && state.tc) {
+        // An ok image's runtime routines are the image's own by design
+        // (mcpp.okimage), so its absence there is not a gap to report.
+        if (auto okt = state.tc ? mcpp::toolchain::triple::parse(state.tc->targetTriple)
+                                : std::optional<mcpp::toolchain::triple::Triple>{};
+            state.resolvedTargetSide.compilerRuntime.absent() && state.tc
+            && !(okt && okt->is_openkal())) {
             auto tt = mcpp::toolchain::triple::parse(state.tc->targetTriple);
             mcpp::diag::degraded("target/compiler-runtime", std::format(
                 "the toolchain payload carries no compiler runtime for {} "
@@ -1195,8 +1202,11 @@ step9_same_os_check_and_report(PrepareState& state) {
                     "same-OS check: '{}'(os={}) vs '{}'(os={})",
                     reportedTargetName, want ? want->os : "<unparsed>",
                     state.resolvedTargetSide.llvmTriple, got ? got->os : "<unparsed>"));
+            // An ok image is compiled for no operating system by design
+            // (`<arch>-unknown-none-elf`): the loader is its environment.
+            const bool okImage = want && got && want->is_openkal() && got->is_freestanding();
             if (want && got && !want->os.empty() && !got->os.empty()
-                && want->os != got->os) {
+                && want->os != got->os && !okImage) {
                 refusal::record(refusal::Code::OsMismatch);
                 return std::unexpected(std::format(
                     "target '{}' resolved to a toolchain for '{}'.\n"
@@ -1456,7 +1466,7 @@ static std::expected<void, std::string> step9_dependency_link_forms(PrepareState
         targetFacts.fullStaticLibc =
             state.m->buildConfig.linkage == "static"
             && mcpp::toolchain::target_supports_full_static(
-                   state.tc->targetTriple, mcpp::platform::supports_full_static);
+                   state.tc->targetTriple, mcpp::toolchain::platform::supports_full_static);
 
         for (std::size_t i = 1; i < state.packages.size(); ++i) {
             auto const& pkg = state.packages[i].manifest;
@@ -2369,7 +2379,16 @@ static std::expected<void, std::string> step9_rerun_input_prepare_dir(PrepareSta
     // required features are active in this build; otherwise it is silently
     // skipped. A pure build-selection knob — it runs before the modgraph/plan
     // so gated-out targets cost nothing.
+    // An entry target is kept and its inactive features recorded: a program
+    // that selects it is refused naming them (design 2026-10-26 §24.4).
+    for (auto& t : state.m->targets) {
+        if (t.kind != mcpp::manifest::Target::Entry) continue;
+        t.inactiveFeatures.clear();
+        for (auto const& rf : t.requiredFeatures)
+            if (!state.activeRootFeatures.contains(rf)) t.inactiveFeatures.push_back(rf);
+    }
     std::erase_if(state.m->targets, [&](const mcpp::manifest::Target& t) {
+        if (t.kind == mcpp::manifest::Target::Entry) return false;
         for (auto const& rf : t.requiredFeatures)
             if (!state.activeRootFeatures.contains(rf)) return true;
         return false;

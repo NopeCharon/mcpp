@@ -29,6 +29,7 @@
 export module mcpp.build.program_protocol;
 
 import std;
+import mcpp.invocation;
 
 export namespace mcpp::build::program_protocol {
 
@@ -118,7 +119,10 @@ export namespace mcpp::build::program_protocol {
 // `mcpp:decision=` records which tool a plugin runs, `mcpp:toolchain=` states
 // the build toolchain from the root's toolchain phase, and `mcpp::phase()`
 // says which phase is running. No directive of v14 changes spelling.
-inline constexpr int kProtocolVersion = 15;
+// v16 (design 2026-10-26 §24.3): `mcpp:link-start=` -- the symbol every image
+// linked over the package is entered at, the build-program form of a target's
+// `start`. No directive of v15 changes spelling.
+inline constexpr int kProtocolVersion = 16;
 
 // ── Cache-format epoch ─────────────────────────────────────────────────────
 //
@@ -194,9 +198,9 @@ std::chrono::milliseconds run_timeout_for(std::optional<int> manifestSecs);
 namespace mcpp::build::program_protocol {
 
 std::optional<int> env_timeout_override() {
-    const char* v = std::getenv("MCPP_BUILD_PROGRAM_TIMEOUT");
+    const auto v = mcpp::invocation::get("MCPP_BUILD_PROGRAM_TIMEOUT");
     if (!v) return std::nullopt;
-    std::string_view sv(v);
+    std::string_view sv(*v);
     int parsed = 0;
     auto r = std::from_chars(sv.data(), sv.data() + sv.size(), parsed);
     if (r.ec != std::errc{} || r.ptr != sv.data() + sv.size()) return std::nullopt;

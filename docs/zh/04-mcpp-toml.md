@@ -261,6 +261,66 @@ main = "src/main.cpp"
 targets.myapp.kind must be 'bin', 'lib' or 'shared'; got 'app'
 ```
 
+#### `kind = "entry"` 与 `main = { from }` —— 由其他包提供的程序起点（mcpp 2026.10.26.2+）
+
+提供程序 `main` 的框架把该翻译单元声明为**入口目标**，程序以它代替自己的文件：
+
+```toml
+# 框架（提供方）
+[targets.player]
+kind = "entry"
+main = "src/entry/player.cpp"
+
+[target.'cfg(os = "android")'.targets.player]
+main = "src/entry/player_android.cpp"   # Android 上的起点是另一个文件
+
+# 应用（使用方）
+[dependencies]
+openmui = "0.1"
+
+[targets.notes]
+kind = "app"
+main = { from = "openmui/player" }     # "<依赖>/<入口>"
+```
+
+- `<依赖>` 是本清单依赖表中的键（测试另读 `[dev-dependencies]`），或本包自身的名字；
+  `<入口>` 是该包的 `kind = "entry"` 目标。
+- 入口翻译单元在提供方的上下文中编译：提供方的头文件目录、模块接口、标志，以及入口目标
+  自身的 `cflags`、`cxxflags`、`defines`；链入选择它的每个程序，不进入其他映像（包括
+  它自己的包）。目标在任一行上命名为 `main` 的文件都不作为普通源文件链入映像。
+- 两者之间的契约只经符号与运行时数据。由程序定义的回调，提供方以 `extern "C++"` 或
+  `extern "C"` 声明：附着于命名模块的声明不能在模块之外定义。
+- 入口目标陈述 `main`（文件），可以陈述 `start`、`windows_entry`、`cflags`、`cxxflags`、
+  `defines` 与 `required_features`。`windows_entry` 由选择它的程序继承，程序陈述不同的值
+  被拒绝；`required_features` 必须已开启，否则拒绝并给出开启它们的依赖写法。描述产物的键
+  （`soname`、`exports`、`linkage`、程序的 `windows_*` 键）属于程序，在入口目标上被拒绝。
+- 使用 `main = { from }` 的程序目标不陈述 `cflags`、`cxxflags`、`defines`：这些标志作用于
+  目标自身的入口，而该入口已属于提供方。
+- 入口目标不是所在包的产物：只声明入口目标的包仍按源文件推断库或程序目标。
+
+测试程序在 `[test]` 中使用同一写法（§2.17）。
+
+#### `start` —— 镜像的入口符号（mcpp 2026.10.26.2+）
+
+没有 C 运行时的镜像（独立目标）从启动者跳转的位置开始执行：启动 ROM、加载器或模拟器读取的
+ELF 入口。
+
+```toml
+[targets.kernel]
+kind  = "bin"
+main  = "src/start.S"
+start = "_start"
+```
+
+- `start` 可写在程序目标、入口目标、它们的行表与 `[test]` 中；在由 C 运行时进入的镜像
+  （所有 hosted 行）、ok 镜像（`ok_main`）与 Android 上被拒绝，并说明该行由谁进入镜像。
+- 程序、它选择的入口与板级包的构建程序（`mcpp:link-start`，见
+  [30 —— build.mcpp](30-build-mcpp.md)）可分别陈述它；陈述必须一致，不一致时拒绝并列出
+  全部来源。
+- 陈述后它优先于链接脚本的 `ENTRY()` 成为镜像入口，且入口符号未定义使链接失败，而不是产生
+  一个从地址 0 开始执行的镜像。未陈述时沿用链接脚本的 `ENTRY()` 或链接器默认值。
+- 构建在 `Size` 之后报告它：`Entry  kernel  _start  ([targets.kernel] start = "_start")`。
+
 #### `exports` —— 产物发布的符号集合（mcpp 2026.9.6.5+）
 
 ```toml
@@ -420,7 +480,8 @@ required_features = ["gui"]                   # only built when feature `gui` is
 | `cxxflags` / `cflags` | 这个目标专用的额外编译旗标。**不要**把 `-std=...` 写在这里——用 `[package].standard`。 |
 | `required_features` | 只有当构建中**每一个**列出的 feature 都被激活时，这个目标才会被产出；否则被静默跳过。它只是一道闸——不会激活 feature（用 `--features` / `[features].default`）。**一个例外，但它不是第二条规则：** 当这个目标作为 host 工具被请求时（`tools = [...]`，§2.14），这个目标就是被**请求**的那一个，于是它的 `required_features` 变成子构建的**输入**。同一个字段、同一个含义——只是解析的方向反过来了。 |
 | `windows_subsystem` *（2026.9.12.2+）* | 可执行文件的 PE subsystem：`"console"`（默认）或 `"windows"`，一个启动时没有控制台的 GUI 程序。只到达这个目标的链接，别处不受影响，在非 PE 的目标上不渲染任何东西。见上一节。 |
-| `windows_entry` *（2026.9.12.2+）* | 程序定义的入口函数：`"main"`（默认）、`"wmain"`、`"WinMain"` 或 `"wWinMain"`。见上一节。 |
+| `windows_entry` *（2026.9.12.2+）* | 程序定义的入口函数：`"main"`（默认）、`"wmain"`、`"WinMain"` 或 `"wWinMain"`。见上一节。入口目标陈述其翻译单元定义的函数，由选择它的程序继承。 |
+| `start` *（2026.10.26.2+）* | 独立目标上镜像的入口符号。见上文 `start`。 |
 | `windows_code_page` *（2026.9.26.1+）* | 可执行文件在 Windows 上的 ANSI 代码页：`"utf-8"`，以 Windows 10 1903 及以后版本会遵从的应用程序清单嵌入；或 `"legacy"`，即系统代码页。两者都不写的程序目标运行在系统代码页里，作为 host 工具构建的程序（§2.14）除外，它默认为 `"utf-8"`。写在库目标上会被拒绝；在非 PE 目标上不产生任何东西。见 §2.3 的*路径与文本编码*。 |
 | `windows_long_paths` *（2026.10.16.1+）* | `true` 在可执行文件的应用程序清单中嵌入 `longPathAware`：在 Windows 启用长路径（`LongPathsEnabled`）时，进程可以使用超过 260 个字符的路径。`false` 不嵌入。两者都不写的程序目标不嵌入，作为 host 工具构建的程序（§2.14）除外，它默认为 `true`。写在库目标上会被拒绝；在非 PE 目标上不产生任何东西。 |
 | `linkage` *（2026.9.15.2+）* | 一个库目标的**默认**链接形态，`"static"` 或 `"shared"`：不写 `linkage` 的消费者得到的形态。与 `kind = "shared"` 不同，它不是约束，因此消费者的显式陈述会被遵从。与 `kind = "shared"` 同写，或写在程序目标上，都会被拒绝。见[`dependency_linkage`](#dependency_linkage--静态还是动态由消费者决定)。 |
@@ -1218,6 +1279,11 @@ argv（OpenSBI 启动用 `-bios default`，picolibc 镜像用 `-bios none
 -semihosting`）——一个替某一块板子猜一个值的引擎，就是另一块板子必须
 与之对抗的引擎。一个板级支持包通常会提供它。
 
+唯一一个 runner 属于 target 而非板子的 target 是 `<arch>-openkal`
+（2026.10.26.2）：ok 映像在每个系统上都由 `okrun` 运行，因此工程未声明 runner
+时，`okrun` 就是该 target 的 runner。它的查找方式与声明的 runner 程序相同，并
+优先查找依赖图为本机构建的程序（`tools = [...]`）（[24](24-openkal-cross.md)）。
+
 ### 2.7.3 hosted 目标上的 `runner`（2026.9.2.1+）
 
 `[target.<triple>].runner` 适用于每一个精确三元组，不只是裸机。一个
@@ -1400,7 +1466,7 @@ debug    = false          # -g
 lto      = true           # -flto; /GL + /LTCG on cl.exe (note: some packaged gcc builds ship without the LTO plugin)
 strip    = true           # -s at link time
 ndebug     = true         # 整个图的每个单元 -DNDEBUG(release/dist 默认开)
-trim_paths = true         # 整个图的每个单元 -ffile-prefix-map(release/dist 默认开)
+trim_paths = true         # 按单元的 -ffile-prefix-map(release/dist 默认开)
 # passthrough escape hatch (fixed keys, open values):
 cflags   = ["-fno-plt"]
 cxxflags = ["-fno-plt"]
@@ -1429,7 +1495,8 @@ ldflags  = []
   映射为它所代表的东西:每个包的源码映射为 `<name>@<version>/…`(根包同样如此,报告读作
   `app@1.2.0/src/main.cpp`),存储、home、构建目录、工具链与 sysroot 分别映射为 `/mcpp/store`、
   `/mcpp/home`、`/mcpp/build`、`/mcpp/toolchain` 与 `/mcpp/sysroot`。同一棵树的两个检出因此嵌入
-  相同的路径。它作用于 `build`、`run` 与 `pack` 的产物,不作用于 `mcpp test`:测试二进制在构建处运行,
+  相同的路径。一个单元的映射只含固定根与它所属包的依赖闭包中各包的根,所以无论构建选择哪些工作空间成员,
+  依赖的命令行都相同(2026.10.26.2+)。它作用于 `build`、`run` 与 `pack` 的产物,不作用于 `mcpp test`:测试二进制在构建处运行,
   且常借 `__FILE__` 找到它的夹具。带调试信息的构建还在输出旁写出 `source-map.gdbinit` 与 `source-map.lldbinit`,
   供调试器把路径映射回来。cl.exe 没有文档化的等价开关,构建会报告一次。在 profile 下写
   `ndebug = false` 或 `trim_paths = false` 可保留以前的产物;升级后第一次发布档构建会提示一次。
@@ -1830,6 +1897,8 @@ discover = ["tests/**/*.cpp"]    # the default
 | `discover` | glob 数组 | 每个被某条 glob 匹配到的文件都是一个测试程序；以 `!` 开头的 glob 会移除它匹配到的文件；`[]` 不发现任何测试 |
 | `windows_code_page` | `"utf-8"` 或 `"legacy"` | Windows 上每个测试程序的 ANSI 代码页，含义与同名的 target 键相同；默认 `"legacy"`，即系统代码页 *(2026.10.5.2+)* |
 | `windows_long_paths` | `true` 或 `false` | Windows 上每个测试程序是否支持长路径，含义与同名的 target 键相同；默认 `false` *(2026.10.16.1+)* |
+| `main` | `{ from = "<依赖>/<入口>" }` | 每个测试程序的起点所在的入口目标；测试文件随之成为程序的普通翻译单元，不定义 `main`（§2.2，`kind = "entry"`） *(2026.10.26.2+)* |
+| `start` | 符号 | 独立目标上每个测试镜像的入口符号（§2.2，`start`） *(2026.10.26.2+)* |
 
 这些 glob 使用与 `[build] sources` 相同的词汇。一个测试的名字，是它
 相对第一条匹配到它的 glob 所在的固定目录的路径，去掉扩展名。两个

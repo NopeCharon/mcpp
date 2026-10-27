@@ -32,7 +32,7 @@
 export module mcpp.build.refusal;
 
 import std;
-import mcpp.platform.env;   // an offline download is a refused `network` effect (exit 5)
+import mcpp.effects;
 
 export namespace mcpp::build::refusal {
 
@@ -185,6 +185,13 @@ enum class Code {
     // discover them from (2026.10.5.2). Distinct from every other code: both
     // statements are the author's, and one of them has to change.
     LtoExportDiscovery,
+    // A build of `<arch>-openkal` that links an image finds no `okld` -- the
+    // format's tool, which writes the image's requirements note and checks the
+    // convention before the image is published (design 2026-10-26 part 2,
+    // §8.5). Distinct from LldRequiredAbsent, which is about the toolchain's
+    // payload: `okld` is a program of the dependency graph, and declaring
+    // openkal-tools under `[build-dependencies]` supplies it.
+    ImageToolAbsent,
     Other,                 // a refusal that has not been given a code yet
 };
 
@@ -239,6 +246,7 @@ constexpr std::string_view name(Code c) {
         case Code::LocalToolchain:       return "local-toolchain";
         case Code::TargetBase:           return "target-base";
         case Code::LtoExportDiscovery:   return "lto-export-discovery";
+        case Code::ImageToolAbsent:      return "image-tool-absent";
         case Code::Other:                return "other";
     }
     return "other";
@@ -270,7 +278,7 @@ void record(Code c) {
     // `--offline` is `--deny network`, and the process exits 5 (design
     // 2026-10-26 D23).
     if (c == Code::OfflineDownloadRequired)
-        mcpp::platform::env::note_effect_refused("network", "a download is required");
+        mcpp::effects::note_effect_refused("network", "a download is required");
 }
 
 Code take() { Code c = g_last; g_last = Code::None; return c; }

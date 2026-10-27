@@ -25,7 +25,8 @@
 export module mcpp.toolchain.triple;
 
 import std;
-import mcpp.platform;
+import mcpplibs.os.platform;
+import mcpp.toolchain.platform;
 
 export namespace mcpp::toolchain::triple {
 
@@ -227,6 +228,9 @@ struct Triple {
         // and the OS segment is the platform layer rather than a kernel, which
         // is why `object_format()` reads the ARCH for this row.
         if (os == "emscripten") return arch + "-unknown-emscripten";
+        // An ok image (openkal SPEC clause 12) is compiled for no operating
+        // system: what it calls is `kal_*`, bound by the loader that runs it.
+        if (os == "openkal") return arch + "-unknown-none-elf";
         if (os == "none")  return str();   // freestanding: already LLVM's form
         return str();
     }
@@ -309,6 +313,16 @@ struct Triple {
     // freestanding decision keys off, spelled once here so no consumer
     // re-derives it from `os == "none"` and drifts.
     bool is_freestanding() const { return os == "none"; }
+    // AN OK IMAGE: ONE ARTIFACT PER ARCHITECTURE THAT A LOADER RUNS ON EVERY
+    // SYSTEM (openkal SPEC clause 12; design 2026-10-26 part 2, §8.5).
+    //
+    // Not freestanding: the program is hosted -- a C library and a C++ run-time
+    // may be in the image, above `kal_*` -- and the kernel interface is
+    // openkal's, fixed for the target. Not any operating system either: the
+    // compiler is told none (`<arch>-unknown-none-elf`), `cfg(unix)` and
+    // `cfg(windows)` are both false, and the system it runs on is the
+    // loader's, known at run time (`os::host()`).
+    bool is_openkal() const { return os == "openkal"; }
 
     // WHETHER THIS ROW'S TOOLCHAIN PIN IS A CAPABILITY RATHER THAN A
     // CONVENTION — the distinction that decides whether an author may override
@@ -357,7 +371,7 @@ struct Triple {
     // the triple are the NDK's own requirements, not flags a user can be
     // expected to supply to a different compiler.
     bool pin_is_capability() const {
-        return is_freestanding() || (is_pe() && is_musl()) || is_wasm()
+        return is_freestanding() || is_openkal() || (is_pe() && is_musl()) || is_wasm()
             || is_android();
     }
 
@@ -870,6 +884,13 @@ inline constexpr TargetInfo kKnownTargets[] = {
     // directories kept off the ARTIFACT's link line. For every row that
     // predates this one those two are the same directory.
     { "wasm32-emscripten",     "verified",  "wasm","emsdk@6.0.9","",                            true  },
+    // OK IMAGES (openkal SPEC clause 12; design 2026-10-26 part 2, §8.5). One
+    // artifact per architecture, run by `okrun` on Linux, macOS and Windows of
+    // that architecture. clang emits it from one binary for either row; the C
+    // library and the C++ run-time are the graph's (`provides`), and an image
+    // with neither is legal. The two architectures the loader relocates.
+    { "x86_64-openkal",        "preview",   "ok",  "llvm@23.1.3","",                            true  },
+    { "aarch64-openkal",       "preview",   "ok",  "llvm@23.1.3","",                            true  },
 };
 
 inline std::span<const TargetInfo> known_targets() { return kKnownTargets; }
@@ -1043,8 +1064,8 @@ std::optional<std::string> did_you_mean(std::string_view input);
 // user-facing host default, independent of how mcpp itself was linked).
 inline Triple host_triple() {
     Triple t;
-    t.arch = std::string(mcpp::platform::host_arch);
-    t.os   = std::string(mcpp::platform::name);
+    t.arch = std::string(mcpp::toolchain::platform::host_arch);
+    t.os   = std::string(mcpp::toolchain::platform::name);
     // Derived from the machine rather than written by anyone, so it states no
     // request: a host build must not be refused for "contradicting" a C library
     // its own triple never asked for.
@@ -1116,12 +1137,12 @@ namespace pins {
     }
 
     inline std::string_view host_default_toolchain(bool msvcUsable) {
-        if constexpr (mcpp::platform::is_macos) {
+        if constexpr (mcpplibs::os::is_macos) {
             return kFirstRunMac;
-        } else if constexpr (mcpp::platform::is_windows) {
+        } else if constexpr (mcpplibs::os::is_windows) {
             return msvcUsable ? kFirstRunWinMsvc : kFirstRunWinGnu;
         } else {
-            return linux_default_toolchain(mcpp::platform::host_arch);
+            return linux_default_toolchain(mcpp::toolchain::platform::host_arch);
         }
     }
 } // namespace pins
@@ -1129,7 +1150,7 @@ namespace pins {
 // ── Artifact naming conventions ──────────────────────────────────────────────
 //
 // How a built artifact is NAMED is a property of the TARGET, never of the
-// machine doing the build. `mcpp::platform::{exe_suffix,lib_prefix,…}` answer a
+// machine doing the build. `mcpp::toolchain::platform::{lib_prefix,…}` answer a
 // different question — "what does THIS machine call its own binaries" — and
 // using them to name build outputs is wrong the moment host != target.
 //
@@ -1159,7 +1180,7 @@ struct ArtifactNaming {
 
 // Naming for an explicit target triple. An EMPTY triple means "build for this
 // machine", and only then is the host answer the correct one — so the caller
-// passes it in rather than this module reaching for mcpp::platform, which keeps
+// passes it in rather than this module reaching for the host's facts, which keeps
 // the decision testable from any host (and keeps this module dependency-free).
 inline ArtifactNaming artifact_naming(const Triple& t, const ArtifactNaming& hostNaming) {
     if (t.empty()) return hostNaming;
@@ -1186,6 +1207,14 @@ inline ArtifactNaming artifact_naming(const Triple& t, const ArtifactNaming& hos
         return ArtifactNaming{
             .exeSuffix = "", .libPrefix = "lib",
             .staticLibExt = ".a", .sharedLibExt = ".so",
+            .sharedNeedsImportLib = false,
+        };
+    }
+    // SPEC 12: an executable image is `*.oke`, an image another loads `*.okso`.
+    if (t.os == "openkal") {
+        return ArtifactNaming{
+            .exeSuffix = ".oke", .libPrefix = "lib",
+            .staticLibExt = ".a", .sharedLibExt = ".okso",
             .sharedNeedsImportLib = false,
         };
     }
@@ -1277,7 +1306,7 @@ inline std::string android_abi(const Triple& t) {
 // a claim nothing can yet check; the unit test asserts every known row's
 // `platform_name` is a member.
 inline constexpr std::string_view kPlatformNames[] = {
-    "linux", "macos", "windows", "ios", "android", "emscripten",
+    "linux", "macos", "windows", "ios", "android", "emscripten", "openkal",
 };
 
 inline std::string platform_name(const Triple& t) {
@@ -1408,6 +1437,7 @@ std::optional<Triple> parse(std::string_view s) {
         // filesystem shim, its `main` loop -- which is the same kind of thing
         // `linux` names and not the same kind of thing `musl` names.
         if (starts_with(k, "emscripten"))       { t.os = "emscripten"; sawOs = true; t.env.clear(); continue; }
+        if (k == "openkal")                     { t.os = "openkal"; sawOs = true; t.env.clear(); continue; }
 
         // Bare-metal object-format / ABI segments. Only meaningful with
         // os=none: `riscv64-none-elf`, `arm-none-eabi`, `arm-none-eabihf`.
@@ -1468,7 +1498,7 @@ std::optional<Triple> parse(std::string_view s) {
     // macOS carries no env segment at all, so nothing was declined there. iOS
     // and Emscripten are the same shape: the platform layer is the whole of the
     // identity past the arch, and there is no C-library axis to decline.
-    if (t.os == "macos" || t.os == "emscripten"
+    if (t.os == "macos" || t.os == "emscripten" || t.os == "openkal"
         || (t.os == "ios" && t.env != "sim")) {
         t.env.clear(); t.envExplicit = false;
     }

@@ -20,11 +20,14 @@ import mcpp.build.refusal;
 import mcpp.diag;
 import mcpp.freestanding.target;
 import mcpp.freestanding.linkline;
+import mcpp.okimage;
 import mcpp.manifest.types;
 import mcpp.manifest.flag_words;
 import mcpp.modgraph.scanner;
-import mcpp.platform;
-import mcpp.platform.runtime_search;
+import mcpplibs.os.platform;
+import mcpp.toolchain.platform;
+import mcpp.toolchain.apple_sdk;
+import mcpp.runtime.search;
 import mcpp.toolchain.clang;
 import mcpp.toolchain.detect;
 import mcpp.toolchain.dialect;
@@ -68,6 +71,10 @@ struct CompileFlags {
     // The link words that name the island's C++ runtime (design 2026-10-26
     // §6.3), placed after the build's own runtime in each C++ unit's tail.
     std::string ldForeignRuntime;
+    // `trim_paths` (mcpp#844): the rendered prefix map of each package, by
+    // `CompileUnit::packageName`, appended to that package's C and C++ units.
+    // Empty on cl.exe, which has no such switch.
+    std::map<std::string, std::string, std::less<>> trimByPackage;
     // A compile-command prefix stated with a toolchain named by path
     // (`launcher = "ccache"`, mcpp#755): written in front of the compiler in
     // the build graph, and not into the compile database, whose consumers
@@ -256,8 +263,8 @@ LinkShape link_shape(LinkHost host, mcpp::build::dist::Format targetFormat,
 
 // The host this binary was built for, in `link_shape`'s vocabulary.
 constexpr LinkHost current_link_host() {
-    return mcpp::platform::is_windows            ? LinkHost::Windows
-         : mcpp::platform::needs_explicit_libcxx ? LinkHost::MacOS
+    return mcpplibs::os::is_windows            ? LinkHost::Windows
+         : mcpp::toolchain::platform::needs_explicit_libcxx ? LinkHost::MacOS
                                                  : LinkHost::Linux;
 }
 
@@ -492,7 +499,7 @@ std::string shell_quote_arg(std::string_view arg) {
     if (arg.find_first_of(kNeedsQuote) == std::string_view::npos)
         return std::string(arg);
 
-    if constexpr (mcpp::platform::is_windows) {
+    if constexpr (mcpplibs::os::is_windows) {
         // MSVCRT argument rules: inside double quotes a run of backslashes is
         // literal unless a `"` follows it, in which case every backslash of
         // the run is doubled and the quote is escaped. The closing quote is
@@ -530,7 +537,7 @@ std::string shell_quote_arg(std::string_view arg) {
 std::string ninja_command_word(std::string_view word) {
     // An empty word is still a word. shell_quote_arg leaves it empty, which is
     // right for its callers that append optional pieces, and wrong here.
-    if (word.empty()) return mcpp::platform::is_windows ? "\"\"" : "''";
+    if (word.empty()) return mcpplibs::os::is_windows ? "\"\"" : "''";
     std::string out;
     for (char c : shell_quote_arg(word)) {
         if (c == '$') out.push_back('$');
@@ -644,8 +651,8 @@ dist::Format target_object_format(const mcpp::toolchain::Toolchain& tc) {
     return mcpp::toolchain::is_mingw_target(tc)
         ? dist::Format::Pe
         : dist::format_for(tc.targetTriple,
-              mcpp::platform::needs_explicit_libcxx ? dist::Format::MachO
-            : mcpp::platform::is_windows            ? dist::Format::Pe
+              mcpp::toolchain::platform::needs_explicit_libcxx ? dist::Format::MachO
+            : mcpplibs::os::is_windows            ? dist::Format::Pe
                                                     : dist::Format::Elf);
 }
 
@@ -716,7 +723,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         auto t = mcpp::toolchain::triple::parse(plan.toolchain.targetTriple);
         return t && t->os == "macos";
     }();
-    std::string macosDeploymentTarget = mcpp::platform::macos::deployment_target(
+    std::string macosDeploymentTarget = mcpp::toolchain::apple::deployment_target(
         targetIsMacos, plan.manifest.buildConfig.macosDeploymentTarget);
 
     f.cxxBinary = plan.toolchain.binaryPath;
@@ -752,7 +759,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
     const bool peTarget = [&] {
         if (auto t = mcpp::toolchain::triple::parse(plan.toolchain.targetTriple))
             return t->is_pe();
-        return bool(mcpp::platform::is_windows);
+        return bool(mcpplibs::os::is_windows);
     }();
     // READ, not re-derived. `make_plan` decides this once and the cache key
     // hashes the same bit; a second scan here is how the compiler and the
@@ -1092,9 +1099,9 @@ CompileFlags compute_flags(const BuildPlan& plan) {
             || triple.find("mingw") != std::string::npos)
             return LinkIntentFlavor::PeGnu;
         if (triple.empty()) {
-            if constexpr (mcpp::platform::is_windows)
+            if constexpr (mcpplibs::os::is_windows)
                 return LinkIntentFlavor::PeGnu;
-            if constexpr (mcpp::platform::needs_explicit_libcxx)
+            if constexpr (mcpp::toolchain::platform::needs_explicit_libcxx)
                 return LinkIntentFlavor::MachO;
         }
         return LinkIntentFlavor::Elf;
@@ -1124,7 +1131,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
     std::string farm_ld;
     if (linkIntentFlavor == LinkIntentFlavor::Elf) {
         for (auto const& dir : plan.runtimeSearch) {
-            if (dir.origin != mcpp::platform::search::Origin::SubosFarm) continue;
+            if (dir.origin != mcpp::runtime::search::Origin::SubosFarm) continue;
             farm_ld += ' ';
             farm_ld += shell_quote_arg(escape_ninja_chars(
                 "-Wl,-rpath," + dir.path.string()));
@@ -1183,8 +1190,16 @@ CompileFlags compute_flags(const BuildPlan& plan) {
                 "paths: the artifact keeps the absolute paths it was built from (clang on "
                 "`*-windows-msvc` trims them)");
         } else {
-            for (auto const& [from, to] : plan.trimMap)
-                opt_flag += " -ffile-prefix-map=" + escape_path(from) + "=" + to;
+            // Per package, not here (mcpp#844): a map of the whole plan in
+            // the flags every unit shares made a dependency's command line
+            // depend on the members the plan builds, and switching members
+            // recompiled it. A unit's map is its package's (`packageTrimMaps`).
+            for (auto const& [package, map] : plan.packageTrimMaps) {
+                std::string rendered;
+                for (auto const& [from, to] : map)
+                    rendered += " -ffile-prefix-map=" + escape_path(from) + "=" + to;
+                f.trimByPackage.emplace(package, std::move(rendered));
+            }
         }
     }
 
@@ -1345,7 +1360,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
     // the right answer for a host-target build, so it is threaded in as the
     // fallback rather than discarded.
     const bool full_static_ok = mcpp::toolchain::target_supports_full_static(
-        plan.toolchain.targetTriple, mcpp::platform::supports_full_static);
+        plan.toolchain.targetTriple, mcpp::toolchain::platform::supports_full_static);
     std::string full_static = (full_static_ok && f.linkage == "static") ? " -static" : "";
 
     // ---- C++ runtime distribution contract (issue #336) -------------------
@@ -1454,7 +1469,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
 
         dist::MechanismInput mi;
         mi.stdlibId       = linkedStdlib;
-        mi.hostIsWindows  = mcpp::platform::is_windows;
+        mi.hostIsWindows  = mcpplibs::os::is_windows;
         mi.fullStaticLibc = (f.linkage == "static");
         // The CRT model this WHOLE project is being compiled with. Per-role
         // contracts cannot move it: cl bakes _MSVC_MT / _MSVC_MD into the std
@@ -1537,8 +1552,9 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         const bool driverPlacesArchives =
             (format == dist::Format::Elf || format == dist::Format::MachO)
             && !mi.freestanding && !mi.graphCxxRuntime && !mi.appleCrossTarget;
-        const std::string driverFlags =
-            crossTarget + (isClangWithCfg ? " --no-default-config" : "");
+        std::vector<std::string> driverFlags;
+        if (!plan.toolchain.crossTargetFlag.empty()) driverFlags.push_back(plan.toolchain.crossTargetFlag);
+        if (isClangWithCfg) driverFlags.push_back("--no-default-config");
         auto find_archive = [&](std::string_view name) -> std::filesystem::path {
             auto searched = search_llvm_root(name);
             if (!driverPlacesArchives) return searched;
@@ -1768,7 +1784,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
     }
 
     std::string runtime_dirs;
-    if constexpr (mcpp::platform::supports_rpath) {
+    if constexpr (mcpp::toolchain::platform::supports_rpath) {
         // Toolchain runtime dirs (glibc/gcc) as before...
         for (auto& dir : plan.toolchain.linkRuntimeDirs) {
             runtime_dirs += " -L" + escape_path(dir);
@@ -2084,7 +2100,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         } else if (plan.toolchain.base.stated()
                    && plan.toolchain.base.address == mcpp::toolchain::base::Address::AppleIsysroot) {
             macos_sdk = " -isysroot " + escape_path(plan.toolchain.base.root);
-        } else if (auto sdk = mcpp::platform::macos::sdk_path()) {
+        } else if (auto sdk = mcpp::toolchain::apple::sdk_path()) {
             macos_sdk = " -isysroot " + escape_path(*sdk);
         }
         // AND KEPT, BECAUSE THE GRAPH BRANCH BELOW REPLACES THIS LINE.
@@ -2449,6 +2465,42 @@ CompileFlags compute_flags(const BuildPlan& plan) {
                 for (auto& r : f.ldStdlibCByRole) r.clear();
             }
         }
+    }
+
+    // ── An ok image (`<arch>-openkal`): the convention's flags, and the link
+    //    by `ld.lld` itself ──
+    //
+    // Applied by replacement, after every hosted decision, for the reason the
+    // freestanding block gives: an image has no loader path, no crt files and
+    // no system library, and what it holds above `kal_*` is the graph's,
+    // reached through the graph's own `-L`/`-l`. The compile keeps the hosted
+    // header model of a graph-supplied C library (`-nostdlibinc`, above); the
+    // C++ headers are withheld unless the graph supplies them too, because the
+    // payload's were configured for its own operating system.
+    if (const auto ot = mcpp::toolchain::triple::parse(plan.toolchain.targetTriple);
+        ot && ot->is_openkal()) {
+        std::string image;
+        for (auto const& w : mcpp::okimage::compile_flags(ot->arch)) image += " " + w;
+        if (!plan.targetSide.cxx.fromGraph()) image += " -nostdinc++";
+        // AN IMAGE WITH NO C LIBRARY IS A FREESTANDING C ENVIRONMENT, in the
+        // standard's sense: nothing defines `strlen`, so the compiler must not
+        // turn a loop into a call to it. Measured: `--release` of an image
+        // that defines only `memcpy` and `memset` was refused by `okld check`
+        // for importing `strlen`, which `-O2` had synthesised.
+        if (plan.targetSide.cAbi.absent()) image += " -ffreestanding";
+        f.cxx += image;
+        f.cc  += image;
+        f.as  += image;
+
+        f.ldDriver = mcpp::freestanding::resolve_lld(plan.toolchain.binaryPath);
+        f.ld  = mcpp::okimage::link_flags() + user_ldflags;
+        f.ldC = f.ld;
+        f.sysroot.clear();
+        f.bFlag.clear();
+        f.ldRuntimeFallback.clear();
+        f.linkage = "static";
+        for (auto& r : f.ldStdlibByRole)  r.clear();
+        for (auto& r : f.ldStdlibCByRole) r.clear();
     }
 
     // A LINKER STATED BY ROLE (mcpp#755, `tools = { ld = ... }`), AFTER EVERY

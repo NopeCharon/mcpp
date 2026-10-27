@@ -16,7 +16,7 @@ import mcpp.provider.select;
 import mcpp.provider.address_set;
 import mcpp.build.version_floor;
 import mcpp.home;
-import mcpp.platform.axis;
+import mcpp.effects;
 import mcpp.manifest;
 import mcpp.source_kind;
 import mcpp.modgraph.glob;
@@ -46,7 +46,6 @@ import mcpp.build.backend;      // BuildOptions for the tool sub-build
 import mcpp.build.ninja;        // make_ninja_backend — driving that sub-build
 import mcpp.config;
 import mcpp.toolchain.post_install;
-import mcpp.platform;
 import mcpp.pm.resolver;
 import mcpp.pm.index_spec;
 import mcpp.pm.index_contract;
@@ -381,19 +380,8 @@ static std::expected<std::set<std::filesystem::path>, std::string> package_sourc
                 mcpp::extension_table_for(depManifest.buildConfig.moduleExtensions,
                                           depManifest.buildConfig.deviceExtensions));
         }
-        // Glob exclusion (same as scan_one_into): `!` prefix removes.
-        std::set<std::filesystem::path> sourceFiles;
-        std::set<std::filesystem::path> excluded;
-        for (auto const& g : globs) {
-            if (!g.empty() && g[0] == '!') {
-                for (auto& p : mcpp::modgraph::expand_glob(srcRoot, g.substr(1)))
-                    excluded.insert(p);
-            } else {
-                for (auto& p : mcpp::modgraph::expand_glob(srcRoot, g))
-                    sourceFiles.insert(p);
-            }
-        }
-        for (auto& p : excluded) sourceFiles.erase(p);
+        // As the scanner selects (`select_sources`).
+        auto sourceFiles = mcpp::modgraph::select_sources(srcRoot, globs);
         if (sourceFiles.empty()) {
             return std::unexpected(std::format(
                 "stage: no source files found under '{}' (globs={})",
@@ -757,7 +745,27 @@ struct WorklistItemCtx {
     std::filesystem::path gitMemberCloneRoot;
     std::filesystem::path dep_root;
     std::optional<mcpp::manifest::Manifest> dep_manifest;
+    // The request is by version for an identity the root declared otherwise.
+    bool rootHeld = false;
 };
+
+// The identity a root declaration already holds for a dependency's request
+// by version, under the request's namespace, or the default namespace and none
+// for a bare name; nothing when the root declares no such package, or the
+// request is the root's own.
+static std::optional<ResolvedKey>
+root_held_identity(PrepareState& state, const WorkItem& item) {
+    if (!item.spec.isVersion() || state.declaredByRoot(item.consumerDepIndex)) return std::nullopt;
+    const std::string shortName = item.spec.shortName.empty() ? item.name : item.spec.shortName;
+    std::vector<std::string> namespaces;
+    if (!item.spec.namespace_.empty()) namespaces.push_back(item.spec.namespace_);
+    else namespaces = { std::string(mcpp::pm::kDefaultNamespace), std::string{} };
+    for (auto const& ns : namespaces)
+        if (auto it = state.resolved.find(ResolvedKey{ ns, shortName });
+            it != state.resolved.end() && it->second.fromRoot && it->second.source != "version")
+            return it->first;
+    return std::nullopt;
+}
 
 static std::expected<void, std::string>
 step4b_resolve_identity(PrepareState& state, WorklistItemCtx& ctx) {
@@ -775,7 +783,22 @@ step4b_resolve_identity(PrepareState& state, WorklistItemCtx& ctx) {
             }};
         }
 
-        if (auto r = state.selectDependencyCandidate(spec, name); !r) {
+        // A VERSION THE ROOT HAS ALREADY ANSWERED FOR. A dependency's request
+        // by version for an identity the root declared by path or git is
+        // overridden by the root's declaration (row 4 below), whatever the
+        // index holds; it is not the index's to select or pin. Asked of the
+        // index first, a package the index does not carry yet -- the case a
+        // root pins a checkout for, ahead of a release -- refused the build
+        // with "no package found for exact selector" (measured: openkal-musl's
+        // `openkal-ld = "0.1.0"` under `cfg(os = "openkal")` against a root's
+        // git checkout of it). The root's checkout still answers the
+        // requirement, at the conflict below.
+        if (auto held = root_held_identity(state, item)) {
+            spec.namespace_ = held->ns;
+            spec.shortName = held->shortName;
+            spec.candidates = {{ .namespace_ = held->ns, .shortName = held->shortName }};
+            ctx.rootHeld = true;
+        } else if (auto r = state.selectDependencyCandidate(spec, name); !r) {
             return std::unexpected(r.error());
         }
         // A root's declaration (a selected member's included) states the
@@ -834,9 +857,10 @@ step4b_resolve_identity(PrepareState& state, WorklistItemCtx& ctx) {
                 spec.version = "=" + pin->second;
         }
         // Pin SemVer constraint before dedup/fetch.
-        if (auto r = state.resolveSemver(spec, name); !r) {
-            return std::unexpected(r.error());
-        }
+        if (!ctx.rootHeld)
+            if (auto r = state.resolveSemver(spec, name); !r) {
+                return std::unexpected(r.error());
+            }
 
         auto& key = ctx.key;
         key = ResolvedKey{
@@ -1437,13 +1461,20 @@ step4b_acquire_dependency_source(PrepareState& state, WorklistItemCtx& ctx) {
                     name, need, spec.git, why, verb));
             };
             const bool offline =
-                !remoteIsLocal && mcpp::platform::env::offline_mode();
+                !remoteIsLocal && mcpp::effects::offline_mode();
 
             // ── 1. which commit ──
             std::string resolvedGitRev = spec.gitRev;
             bool fromLock = false;
+            // The key a lock line is written under: the declaring manifest's
+            // map key for a dependency the root declares, the qualified
+            // identity for one reached through another package.
+            const bool rootDeclared = state.declaredByRoot(item.consumerDepIndex);
+            const std::string lockKey = rootDeclared ? name
+                : mcpp::pm::compat::qualified_name(
+                      spec.namespace_, spec.shortName.empty() ? name : spec.shortName);
             if (spec.gitRefKind == "branch") {
-                auto it = state.gitLockAnchors.find(name);
+                auto it = state.gitLockAnchors.find(lockKey);
                 if (it != state.gitLockAnchors.end()
                     && it->second.url     == spec.git
                     && it->second.refKind == spec.gitRefKind
@@ -1459,11 +1490,8 @@ step4b_acquire_dependency_source(PrepareState& state, WorklistItemCtx& ctx) {
                             "resolve");
                     // The FIRST network step of a git dependency, and therefore
                     // the one a transient fault is most likely to meet.
-                    auto r = run_with_network_retry(std::format(
-                        "git ls-remote {} {} 2>&1",
-                        mcpp::platform::shell::quote(spec.git),
-                        mcpp::platform::shell::quote(
-                            std::format("refs/heads/{}", spec.gitRev))));
+                    auto r = run_with_network_retry({ "git", "ls-remote", spec.git,
+                                                      std::format("refs/heads/{}", spec.gitRev) });
                     if (r.exit_code != 0)
                         return std::unexpected(std::format(
                             "git ls-remote of '{}' failed:\n{}",
@@ -1528,29 +1556,48 @@ step4b_acquire_dependency_source(PrepareState& state, WorklistItemCtx& ctx) {
                 // history before the checkout. Only a tip just read from
                 // ls-remote is guaranteed present in a depth-1 clone.
                 //
-                // `git -C` rather than `cd <dir> &&`: on Windows `cd` does not
-                // change drive without /d, and the cache root routinely lives
-                // on a different one than the project.
-                auto cloneCmd = (spec.gitRefKind == "branch" && !fromLock)
-                    ? std::format(
-                        "git clone --progress --depth 1 --branch {} {} {} && "
-                        "git -C {} checkout --quiet {} 2>&1",
-                        mcpp::platform::shell::quote(spec.gitRev),
-                        mcpp::platform::shell::quote(spec.git),
-                        mcpp::platform::shell::quote(gitRoot.string()),
-                        mcpp::platform::shell::quote(gitRoot.string()),
-                        mcpp::platform::shell::quote(resolvedGitRev))
-                    : std::format(
-                        "git clone --progress {} {} && git -C {} checkout --quiet {} 2>&1",
-                        mcpp::platform::shell::quote(spec.git),
-                        mcpp::platform::shell::quote(gitRoot.string()),
-                        mcpp::platform::shell::quote(gitRoot.string()),
-                        mcpp::platform::shell::quote(resolvedGitRev));
+                // AND ONLY WHILE THE BRANCH STAYS WHERE ls-remote SAW IT. A push
+                // between the two leaves the clone at a newer tip without the
+                // commit the build resolved; the commit is then fetched by its
+                // name, or, from a server that refuses that, the branch's whole
+                // history. Measured in mcpp's own CI: a push to mcpplibs.os
+                // between ls-remote and the clone ended the build with
+                // "unable to read tree (787988c…)".
+                //
+                // `git -C` rather than a working directory: every step names
+                // the clone it acts on.
+                const auto dir = gitRoot.string();
+                auto git_in = [&](std::vector<std::string> args) {
+                    args.insert(args.begin(), { "git", "-C", dir });
+                    return args;
+                };
+                const bool tipJustRead = spec.gitRefKind == "branch" && !fromLock;
+                auto cloneArgv = tipJustRead
+                    ? std::vector<std::string>{ "git", "clone", "--progress", "--depth", "1",
+                                                "--branch", spec.gitRev, spec.git, dir }
+                    : std::vector<std::string>{ "git", "clone", "--progress", spec.git, dir };
                 // See `run_with_network_retry` for why, and for what the
                 // callback is removing between attempts.
-                auto r = run_with_network_retry(cloneCmd, [&] {
+                auto r = run_with_network_retry(cloneArgv, [&] {
                     std::filesystem::remove_all(gitRoot, ec);
                 }, spec.git);
+                if (r.exit_code == 0) {
+                    auto checkout = mcpp::run::execute(git_in({ "checkout", "--quiet", resolvedGitRev }));
+                    if (checkout.exit_code != 0 && tipJustRead) {
+                        // The commit by its name, else the branch's whole history.
+                        auto fetched = run_with_network_retry(
+                            git_in({ "fetch", "--quiet", "--depth", "1", "origin", resolvedGitRev }));
+                        if (fetched.exit_code != 0)
+                            fetched = run_with_network_retry(
+                                git_in({ "fetch", "--quiet", "--unshallow", "origin" }));
+                        if (fetched.exit_code == 0)
+                            checkout = mcpp::run::execute(git_in({ "checkout", "--quiet", resolvedGitRev }));
+                        else
+                            checkout.output += fetched.output;
+                    }
+                    r.exit_code = checkout.exit_code;
+                    r.output += checkout.output;
+                }
                 if (r.exit_code != 0) {
                     std::filesystem::remove_all(gitRoot, ec);
                     return std::unexpected(std::format(
@@ -1559,19 +1606,26 @@ step4b_acquire_dependency_source(PrepareState& state, WorklistItemCtx& ctx) {
             }
             // A selected workspace member's own git dependencies are locked
             // as a root's are (workspace design 2026-09-29 §15).
-            if (state.declaredByRoot(item.consumerDepIndex)) {
-                // Only root deps are locked: the writer below walks the root
-                // manifest's [dependencies], so a transitive git branch dep
-                // has no anchor and still resolves over the network.
+            //
+            // AND ONE REACHED THROUGH ANOTHER PACKAGE, under its qualified
+            // identity. Until 2026.10.26.2 only the root's were written, so a
+            // branch two edges away had no anchor: every build asked `git
+            // ls-remote` again, and an offline build stopped at it. Measured
+            // in mcpp's own CI: the platform member depends on mcpplibs.os by
+            // branch, os on openkal by branch, and `--offline test` refused
+            // with "mcpp.lock records no commit for branch 'openkal-0.17.0'".
+            {
                 auto source = std::format("git+{}#{}={}",
                     spec.git, spec.gitRefKind, spec.gitRev);
                 if (spec.gitRefKind == "branch") source += "@" + resolvedGitRev;
-                state.root_git_lock_identities[name] = GitLockIdentity{
+                auto& identities = rootDeclared ? state.root_git_lock_identities
+                                                : state.transitive_git_lock_identities;
+                identities.try_emplace(lockKey, GitLockIdentity{
                     .source = std::move(source),
                     .hash = "fnv1a:" + H(spec.git + "|"
                         + spec.gitRefKind + "|" + spec.gitRev + "|"
                         + resolvedGitRev),
-                };
+                });
             }
             sourceCommit = resolvedGitRev;
             dep_root = gitRoot;
@@ -1840,13 +1894,13 @@ step4b_finalize_dependency(PrepareState& state, WorklistItemCtx& ctx) {
                          : std::string{},
         });
         // The engine interface (mcpp#797) is addressed in the dependency cache
-        // as it always was: by the engine's name and version, in the global
-        // cache, because its directory is immutable for that version.
+        // by the engine's name and the version of its text, in the global
+        // cache, because its directory is a function of that text.
         if (sourceKind == "path" && mcpp::build::engine::is_engine_package(ctx.dep_root)) {
             auto& ident = state.dep_cache_identities.back();
             ident.indexName   = std::string(mcpp::build::engine::kCacheIndex);
             ident.packageName = std::string(mcpp::build::engine::kCachePackage);
-            ident.version     = state.dep_manifests.back()->package.version;
+            ident.version     = mcpp::build::engine::cache_version();
             ident.sourceKind  = "version";
             ident.sourceRef.clear();
         }

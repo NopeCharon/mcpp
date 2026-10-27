@@ -29,8 +29,9 @@ export module mcpp.build.result;
 import std;
 import mcpp.libs.json;
 import mcpp.version;                 // MCPP_VERSION
-import mcpp.platform.terminal;       // the protocol's stdout under StdoutToStderr
-import mcpp.platform.process;        // the files an interrupt leaves
+import mcpp.run;
+import mcpp.ui.terminal;
+import mcpp.invocation;
 
 export namespace mcpp::build::result {
 
@@ -41,11 +42,22 @@ struct Launch {
     std::string via;   // "" | "runner" | "run_under"
 };
 
+// Where a program begins and where its image is entered (design 2026-10-26
+// §24.4 item 10): `from` is `<package>/<entry>` when a dependency's entry
+// target is the beginning, `start` the stated entry symbol and `startFrom`
+// the statement that named it. Absent from the record when all are empty.
+struct Entry {
+    std::string from;
+    std::string start;
+    std::string startFrom;
+};
+
 struct Artifact {
     std::string name;
     std::string kind;   // bin | test | shared | static
     std::filesystem::path path;
     std::optional<Launch> launch;
+    std::optional<Entry>  entry;
 };
 
 // A compiler's diagnostic, from the output of a failed step.
@@ -136,6 +148,15 @@ nlohmann::json to_json(const Record& r) {
     for (auto const& a : r.artifacts) {
         nlohmann::json j{{"name", a.name}, {"kind", a.kind}, {"path", a.path.generic_string()}};
         if (a.launch) j["launch"] = to_json(*a.launch);
+        if (a.entry) {
+            nlohmann::json e = nlohmann::json::object();
+            if (!a.entry->from.empty()) e["from"] = a.entry->from;
+            if (!a.entry->start.empty()) {
+                e["start"] = a.entry->start;
+                e["start_from"] = a.entry->startFrom;
+            }
+            j["entry"] = std::move(e);
+        }
         artifacts.push_back(std::move(j));
     }
     nlohmann::json diags = nlohmann::json::array();
@@ -192,7 +213,12 @@ std::optional<Record> read(const std::filesystem::path& outputDir) {
         r.compileDatabase = d["compileDatabase"].get<std::string>();
     if (d.contains("artifacts") && d["artifacts"].is_array())
         for (auto const& a : d["artifacts"]) {
-            Artifact art{a.value("name", ""), a.value("kind", ""), a.value("path", ""), std::nullopt};
+            Artifact art{a.value("name", ""), a.value("kind", ""), a.value("path", ""),
+                         std::nullopt, std::nullopt};
+            if (a.contains("entry") && a["entry"].is_object()) {
+                const auto& e = a["entry"];
+                art.entry = Entry{e.value("from", ""), e.value("start", ""), e.value("start_from", "")};
+            }
             if (a.contains("launch") && a["launch"].is_object()) {
                 const auto& l = a["launch"];
                 Launch launch;
@@ -236,6 +262,8 @@ std::string render_last(const Record& r) {
 }  // namespace
 
 void write(const Record& r) {
+    // mcpp is ending at a request: the record it leaves is already written.
+    if (mcpp::run::ending()) return;
     write_atomically(r.outputDir / "result.json", render(r));
     const auto last = r.projectRoot / "target" / ".last-result.json";
     if (!r.projectRoot.empty()) write_atomically(last, render_last(r));
@@ -248,9 +276,9 @@ void write(const Record& r) {
         std::vector<std::pair<std::filesystem::path, std::string>> files{
             {r.outputDir / "result.json", render(cancelled)}};
         if (!r.projectRoot.empty()) files.emplace_back(last, render_last(cancelled));
-        mcpp::platform::process::set_interrupt_files(files);
+        mcpp::run::set_interrupt_files(files);
     } else {
-        mcpp::platform::process::clear_interrupt_files();
+        mcpp::run::clear_interrupt_files();
     }
 }
 
@@ -343,7 +371,7 @@ Record begin(const std::filesystem::path& projectRoot, const std::filesystem::pa
     r.outputDir = outputDir;
     r.projectRoot = projectRoot;
     r.fingerprint = outputDir.filename().string();
-    if (const char* c = std::getenv("MCPP_CLIENT")) r.client = c;
+    if (auto c = mcpp::invocation::get("MCPP_CLIENT")) r.client = *c;
     return r;
 }
 
@@ -355,7 +383,7 @@ void emit(std::string_view event, nlohmann::json fields) {
     nlohmann::json line{{"schemaVersion", 1}, {"kind", "mcpp.event"}, {"event", std::string(event)}};
     for (auto it = fields.begin(); it != fields.end(); ++it) line[it.key()] = it.value();
     std::lock_guard lock(g_emit);
-    mcpp::platform::terminal::write_protocol_stdout(line.dump() + "\n");
+    mcpp::ui::terminal::write_protocol_stdout(line.dump() + "\n");
 }
 
 }  // namespace mcpp::build::result

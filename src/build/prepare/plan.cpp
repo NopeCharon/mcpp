@@ -3,6 +3,7 @@
 // resolution.json are written by records.cpp.
 
 module mcpp.build.prepare;
+import mcpp.okimage;
 import :state;
 
 import mcpp.build.prepare_inputs;
@@ -17,8 +18,10 @@ import mcpp.runtime.elf;          // DT_NEEDED of a library the line names
 import mcpp.build.refusal;
 import mcpp.build.version_floor;
 import mcpp.home;
-import mcpp.platform.axis;
-import mcpp.platform.env;        // --deny write-project
+import mcpplibs.os.platform;
+import mcpp.invocation;
+import mcpp.effects;
+import mcpp.build.capacity;
 import mcpp.libs.json;
 import mcpp.log;
 import mcpp.manifest;
@@ -45,7 +48,6 @@ import mcpp.build.plan;
 import mcpp.build.schedule.policy;
 import mcpp.build.flags;          // compute_flags — the per-role contracts (#418)
 import mcpp.build.distribution;   // dist::Role / dist::Contract to_string
-import mcpp.platform.capacity;   // the host fallback handed to schedule::decide
 import mcpp.build.graph_shape;  // #407: the graph says which mode wrote it
 import mcpp.build.runtime_validation;  // declared artifact -> identity verdict
 import mcpp.build.cache_key;
@@ -62,9 +64,7 @@ import mcpp.config;
 import mcpp.provider;
 import mcpp.provider.select;
 import mcpp.runtime.binding;
-import mcpp.platform.runtime_search;
 import mcpp.toolchain.post_install;
-import mcpp.platform;
 import mcpp.build.runner_lookup;
 import mcpp.fetcher;
 import mcpp.fetcher.progress;
@@ -225,6 +225,14 @@ static std::expected<void, std::string> step13_source_packages(PrepareState& sta
 }
 
 static std::expected<void, std::string> step13_runner_and_xlings(PrepareState& state, BuildContext& ctx) {
+    // THE PROGRAMS THE GRAPH BUILT FOR THIS MACHINE COME FIRST. A runner a
+    // dependency's `tools` built (`okrun` from `openkal-tools`) is the one the
+    // project asked for by depending on it, ahead of a payload's and of PATH.
+    for (auto const& [name, path] : state.rootTools) {
+        auto dir = path.parent_path();
+        if (std::ranges::find(ctx.xlingsDepBinDirs, dir) == ctx.xlingsDepBinDirs.end())
+            ctx.xlingsDepBinDirs.push_back(std::move(dir));
+    }
     // Where a runner may find the programs this project declared (#544). The
     // same resolution `fillXpkgDirs` hands to build programs, kept as
     // directories rather than env vars because the reader is mcpp's own
@@ -445,6 +453,32 @@ static std::expected<void, std::string> step13_make_plan(PrepareState& state, Bu
                                              state.stdBmiPath, state.stdObjectPath, state.storeRoots);
     if (!planResult) return std::unexpected(planResult.error());
     ctx.plan        = std::move(*planResult);
+    // `trim_paths` per package (mcpp#844, design 2026-10-26 part 2 §10.4): a
+    // unit's map is the fixed roots and the roots of its package's dependency
+    // closure, which is every prefix its outputs can hold and does not depend
+    // on the members this plan builds.
+    if (!ctx.plan.trimMap.empty()) {
+        const auto n = state.packages.size();
+        std::vector<std::vector<std::size_t>> deps(n);
+        for (auto const& e : state.dependencyEdges)
+            if (e.consumerPackageIndex < n && e.dependencyPackageIndex < n)
+                deps[e.consumerPackageIndex].push_back(e.dependencyPackageIndex);
+        for (std::size_t i = 0; i < n; ++i) {
+            std::vector<char> closure(n, 0);
+            std::vector<std::size_t> todo{i};
+            while (!todo.empty()) {
+                const auto at = todo.back();
+                todo.pop_back();
+                if (closure[at]) continue;
+                closure[at] = 1;
+                for (auto d : deps[at]) todo.push_back(d);
+            }
+            ctx.plan.packageTrimMaps.try_emplace(
+                mcpp::build::qualified_package_name(state.packages[i].manifest),
+                mcpp::build::trim_map(state.packages, *state.tc, ctx.outputDir,
+                                      state.storeRoots, closure));
+        }
+    }
     note_root_link_words_withheld(state, ctx);
     if (auto r = scope_lto(state, ctx); !r) return std::unexpected(r.error());
     // The request the graph is planned for (§3, §15): the plan's members and
@@ -493,7 +527,7 @@ static std::expected<void, std::string> step13_make_plan(PrepareState& state, Bu
             if (source.empty() || commands.empty()) return;
             auto inv = mcpp::build::recover_invocation(
                 commands, source, state.tc->binaryPath, sm.cacheDir,
-                mcpp::platform::is_windows);
+                mcpplibs::os::is_windows);
             if (!inv) {
                 state.planNotes.push_back({"MCPP_BUILD_DATABASE_STD_UNIT_UNDESCRIBED",
                     std::format("no command that builds the {} module names its "
@@ -582,7 +616,7 @@ static std::expected<void, std::string> step13_cxx_islands(PrepareState& state, 
                 if (std::filesystem::exists(d / lib, ec)) { path = d / lib; break; }
         }
         if (path.empty() || !std::filesystem::exists(path, ec)) continue;
-        auto facts = mcpp::platform::elf::inspect_elf_runtime(path);
+        auto facts = mcpp::runtime::elf::inspect_elf_runtime(path);
         if (!facts) continue;
         for (auto const& n : facts->needed)
             if (rt::runtime_of_soname(n) == other) {
@@ -653,8 +687,8 @@ static std::expected<void, std::string> step13_cxx_private_runtime(PrepareState&
         auto const& bc = ctx.plan.manifest.buildConfig;
         const auto format = dist::format_for(
             state.tc->targetTriple,
-            mcpp::platform::is_windows ? dist::Format::Pe
-            : mcpp::platform::is_macos ? dist::Format::MachO
+            mcpplibs::os::is_windows ? dist::Format::Pe
+            : mcpplibs::os::is_macos ? dist::Format::MachO
                                        : dist::Format::Elf);
         const bool privateCopy =
             dist::stated_shared_library_contract(bc.cxxRuntime, bc.cxxRuntimeShared,
@@ -740,8 +774,8 @@ static std::expected<void, std::string> step13_cxx_process_runtime(PrepareState&
         auto const& bc = ctx.plan.manifest.buildConfig;
         const auto format = dist::format_for(
             state.tc->targetTriple,
-            mcpp::platform::is_windows ? dist::Format::Pe
-            : mcpp::platform::is_macos ? dist::Format::MachO
+            mcpplibs::os::is_windows ? dist::Format::Pe
+            : mcpplibs::os::is_macos ? dist::Format::MachO
                                        : dist::Format::Elf);
         const dist::CxxSharedLoad load{
             .program = mcpp::build::image_loads_cxx_shared_library(
@@ -1005,8 +1039,8 @@ static void step13_graph_and_schedule(PrepareState& state, BuildContext& ctx) {
             // and only when the user gave no job count — without it that
             // strategy ships `sched_cap = 0`, which disables the semaphore that
             // is its ONLY bound on how many compilers run at once.
-            mcpp::platform::capacity::recommended_jobs(
-                mcpp::platform::capacity::host_capacity()));
+            mcpp::build::capacity::recommended_jobs(
+                mcpp::build::capacity::host_capacity()));
         ctx.plan.scheduleTag         = std::string(mcpp::build::schedule::to_string(decision.strategy));
         ctx.plan.scheduleNinjaJobs   = decision.ninjaJobs;
         ctx.plan.scheduleCompilerCap = decision.compilerCap;
@@ -1155,7 +1189,7 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
             // wrapper's: a version change regenerates build.ninja, and a
             // binary moved under an unchanged version leaves a stale path,
             // exactly as it would for the compiler.
-            rep("${mcpp.self}",       mcpp::platform::fs::self_exe_path().generic_string());
+            rep("${mcpp.self}",       mcpp::invocation::self_exe_path().generic_string());
             // ABSOLUTE, unlike `${mcpp.target_file:}` and for the same reason
             // stated the other way round: the staged tree lives outside the
             // build directory and no ninja edge produces it, so there is no
@@ -1448,6 +1482,36 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
 }
 
 static std::expected<void, std::string> step13_assembly_units(PrepareState& state, BuildContext& ctx) {
+    // AN OK IMAGE IS FINISHED BY `okld` (mcpp.okimage): the graph's, a
+    // declared payload's, or this machine's, in that order. Its absence is a
+    // refusal before anything compiles, naming the dependency that supplies
+    // it -- not a link that succeeds and an image no loader accepts.
+    // After `make plan`, which builds the plan these fields belong to.
+    if (auto tt = mcpp::toolchain::triple::parse(state.tc->targetTriple); tt && tt->is_openkal()) {
+        const std::string tool(mcpp::okimage::kTool);
+        if (auto it = state.rootTools.find(tool); it != state.rootTools.end()) {
+            ctx.plan.okldPath = it->second;
+        } else {
+            for (auto const& dir : ctx.xlingsDepBinDirs) {
+                for (auto const& name : { tool, tool + ".exe" }) {
+                    std::error_code ec;
+                    if (std::filesystem::is_regular_file(dir / name, ec)) { ctx.plan.okldPath = dir / name; break; }
+                }
+                if (!ctx.plan.okldPath.empty()) break;
+            }
+            if (ctx.plan.okldPath.empty())
+                if (auto found = mcpp::invocation::which(tool)) ctx.plan.okldPath = *found;
+        }
+        // Only a build that links an image needs it: a library's archive is
+        // objects, and the image that takes them is checked where it is linked.
+        const bool linksAnImage = std::ranges::any_of(ctx.plan.linkUnits, [](auto const& lu) {
+            return lu.kind != mcpp::build::LinkUnit::StaticLibrary;
+        });
+        if (ctx.plan.okldPath.empty() && linksAnImage && !state.overrides.plan_only) {
+            mcpp::build::refusal::record(mcpp::build::refusal::Code::ImageToolAbsent);
+            return std::unexpected(mcpp::okimage::no_tool_message(tt->str(), tool));
+        }
+    }
     // Clang: discover clang-scan-deps for P1689 dyndep scanning.
     if (mcpp::toolchain::is_clang(*state.tc)) {
         if (auto sd = mcpp::toolchain::clang::find_scan_deps(*state.tc)) {
@@ -1601,6 +1665,7 @@ static std::expected<void, std::string> step13_dependency_cache(PrepareState& st
 
         // Sources belonging to each package, package-root-relative and sorted.
         std::vector<std::vector<std::string>> pkgSources(state.packages.size());
+        std::vector<char> pkgProvidesModule(state.packages.size(), 0);
         for (auto& cu : ctx.plan.compileUnits) {
             // Longest matching root wins. Package roots can nest — a workspace
             // member lives under the workspace root — and taking the first match
@@ -1623,7 +1688,10 @@ static std::expected<void, std::string> step13_dependency_cache(PrepareState& st
                     best = p; bestLen = len; bestRel = std::move(rels);
                 }
             }
-            if (best != state.packages.size()) pkgSources[best].push_back(std::move(bestRel));
+            if (best != state.packages.size()) {
+                if (!cu.providesModule.empty()) pkgProvidesModule[best] = 1;
+                pkgSources[best].push_back(std::move(bestRel));
+            }
         }
         for (auto& v : pkgSources) std::ranges::sort(v);
 
@@ -1690,6 +1758,11 @@ static std::expected<void, std::string> step13_dependency_cache(PrepareState& st
                                     state.storeRoots.empty() ? std::filesystem::path{}
                                                        : state.storeRoots.front());
             pa.sources = pkgSources[idx];
+            // A GCC BMI records its imports' paths as the module map spells
+            // them, and the map names the BMI directory as its repository
+            // (`plan.cppm`, the module scopes). See `bmiPathConvention`.
+            if (pkgProvidesModule[idx] && state.tc->compiler == mcpp::toolchain::CompilerId::GCC)
+                pa.bmiPathConvention = "$root=bmi-dir";
             // What `scope_lto` appended to this package's units is part of
             // their command, so it is part of the entry's identity.
             if (state.ltoWithheld.contains(
@@ -2083,8 +2156,8 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
     // pass that only describes (plan_only) plans into its own directory.
     // `--deny write-project` stops here, before the first write (design
     // 2026-10-26 §5.5).
-    if (!state.overrides.plan_only && mcpp::platform::env::effect_denied("write-project")) {
-        mcpp::platform::env::note_effect_refused("write-project", ctx.outputDir.generic_string());
+    if (!state.overrides.plan_only && mcpp::effects::effect_denied("write-project")) {
+        mcpp::effects::note_effect_refused("write-project", ctx.outputDir.generic_string());
         return std::unexpected(std::format(
             "effect denied: write-project -- the build writes {}, and the caller denied writing "
             "the project (--deny write-project)", ctx.outputDir.generic_string()));
