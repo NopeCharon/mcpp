@@ -4,10 +4,10 @@
 |---|---|
 | 规范编号 | SPEC-014 |
 | 标题 | 打包与分发:链接、闭包、容器三个维度与构建腿,暂存树与包元数据,通用包、单文件、签名、压缩、合并与分发描述 |
-| 状态 | 评审中 v1.1 |
-| 版本 | 1.1 |
+| 状态 | 评审中 v1.2 |
+| 版本 | 1.2 |
 | 最后修改 | 2026-10-28 |
-| 对应实现 | mcpp >= 2026.10.27.1 |
+| 对应实现 | mcpp >= 2026.10.28.1 |
 | 相关设计文档 | `.agents/docs/2026-10-28-platforms-part2-packaging-and-distribution-design.md`(§2–§7、§14)、`.agents/docs/2026-10-28-platforms-design.md`(§4.7) |
 | 相关 issue | mcpp#847、mcpp#849 |
 | 相关规范 | [SPEC-007](build-plugins.md)(包格式提供者、artifact action)、[SPEC-011](concurrency.md)(原子发布)、[SPEC-013](platforms.md)(平台、载体) |
@@ -35,7 +35,8 @@
 
 `--linkage`(未给出时取 `[pack] linkage`)是这次打包的构建的依赖链接,优先于 `[build] dependency_linkage`
 与构建配置中的值;都未给出时每个库按它自己的声明链接,包元数据记为 `declared`。原生 Linux 目标上 `static`
-选择 `<arch>-linux-musl` 行(`-linux-gnu` 目标换成对应的 musl 行),全静态程序不论 `--mode` 为何都整体打包;
+选择 `<arch>-linux-musl` 行:未给出目标且工程没有 `[build] target` 时为本机架构的 musl 行,`--target` 的 `-linux-gnu`
+目标换成对应的 musl 行,工程自己的 `[build] target` 照原样打包;全静态程序不论 `--mode` 为何都整体打包;
 openkal 目标上 `static` 为一个 `.oke`、无 `.okso`,`shared` 为 `.oke` 加其所需的 `.okso`。
 
 ### 1.2 闭包
@@ -154,7 +155,8 @@ WebAssembly 的同名文件族,ok 映像的 `bin/`),规定见 docs/10。
   mcpp-package.json
 ```
 
-包名带平台名(平台包名去掉 `-platform`),不带系统与架构。`[runtime] deploy` 放置的文件位于每条腿的映像旁边。
+包名带平台名(平台包名去掉 `-platform`),不带系统与架构;模式不是 `vendored` 时带模式的后缀(`-system`、`-static`、
+`self-contained` 为 `-bundle-all`),与原生包的命名相同。`[runtime] deploy` 放置的文件位于每条腿的映像旁边。
 
 ### 4.3 启动器
 
@@ -227,7 +229,9 @@ WebAssembly 的同名文件族,ok 映像的 `bin/`),规定见 docs/10。
 与两个摘要;同一路径的文件摘要**必须**相同,每个文件只取一份;合并后的树重新描述。`mcpp-package.json` 中的每个
 路径**必须**是包内的规范相对路径。输出**必须**是新的路径,或一个已有的、不是输入之一的本命令写出的归档;目录输出
 只写新目录。
-容器取 `--pkg-format`,否则取 `-o` 的扩展名,否则取第一个输入的容器;`-o` 缺省为当前目录下与树同名的文件。
+容器取 `--pkg-format`,否则取 `[pack] format`,否则取 `-o` 的扩展名,否则取第一个输入的容器;`-o` 缺省为当前目录下与树同名的文件。
+合并后的包的目录以输出命名,与 `mcpp pack -o` 相同:归档名去掉其扩展名(`-o app-1.0-openkal.zip` 含
+`app-1.0-openkal/`);不带 `-o` 时取第一个输入的目录名。
 不进行任何构建。
 
 ## 5. 容器
@@ -267,7 +271,7 @@ liblzma)压缩,不调用 `tar` 等外部程序;产物扩展名为 `.tar.gz`(缺�
    使用它的结果;缓存目录在 POSIX 上只对当前用户可写,`mcpp/`、`single-file/` 或摘要目录为符号链接或属于其他
    用户时启动器拒绝运行。
 5. 以原有的参数执行树中的程序(`bin/<name>`;self-contained 的 Linux 树为根部的包装脚本;Windows 树为根部的
-   `<name>.exe`),退出状态即程序的退出状态。
+   `<name>.exe`),退出状态即程序的退出状态;启动器自身失败(载荷不可读、校验不符、无法执行)时写出原因并以 127 退出。
 
 openkal 目标的单文件:载体携带映像本身(映像不引用其他映像时),否则携带全部映像的一个 stored zip,各映像数据按
 64 KiB 对齐,`mcpp_carried_name` 为入口映像(SPEC-013 §11);`--systems` 的每个系统(缺省为本机系统)各写一个文件
@@ -296,15 +300,20 @@ openkal 目标的单文件:载体携带映像本身(映像不引用其他映像�
 ## 8. 分发描述
 
 `mcpp emit xpkg --package <归档> [--package ...] --url <前缀> [-o <文件>]` 由本命令写出的包的 `mcpp-package.json`
-生成 xim-pkgindex 条目(spec 2),资产地址为 `<前缀>/<文件名>`:
+生成 xim-pkgindex 条目(spec 2),资产地址为 `<前缀>/<文件名>`。每个归档各以一个 `--package` 给出;其后不带选项的
+词(例如 shell 通配展开的第二个文件)被拒绝,而不是不加描述。
 
 - 通用包是一个资产,`linux`、`macosx`、`windows` 三项的 URL 与 sha256 相同;包不携带运行器(非 `self-contained`)
-  时三项各以运行器为依赖(`deps = { "<runner>" }`,`<runner>` 为平台运行器 argv 首项的程序名,即 xim-pkgindex
-  中同名的包;openkal 为 `okrun`)。
+  时三项各以运行器为依赖(`deps = { "xim:<runner>" }`,`<runner>` 为平台运行器 argv 首项的程序名,即 xim-pkgindex
+  中同名的包;openkal 为 `okrun`)。依赖带命名空间:不带命名空间的名字在家目录列出的第二个索引也有同名包时有歧义,
+  xim-pkgindex 拒绝它。
 - 各系统各架构一个的包:每个系统一项,一个以 `${arch}` 代替架构的 URL 与每个架构的 sha256;文件名除架构外不同时
   拒绝。
-- 安装把归档的唯一顶层目录移到安装目录;配置以 xvm 注册程序(通用包为 `bin/<name>`,Windows 上为
-  `bin/<name>.cmd`;单腿原生包为程序所在的目录)。
+- 安装把归档的唯一顶层目录移到安装目录。该目录以归档命名(`mcpp pack` 的写法),安装取下载文件的名字去掉扩展名,
+  对每个系统、架构与索引日后追加的版本都成立;打包后改名的归档与 xim 不解开的文件(非 `.tar.gz`、`.tar.zst`、
+  `.tar.xz`、`.tar`、`.zip`)在写出条目时被拒绝;配置以 xvm 注册程序(通用包为 `bin/<name>`,Windows 上为
+  `bin/<name>.cmd`;单腿原生包为程序所在的目录)。各系统的包把程序放在不同目录时(Windows 的程序在包根,POSIX
+  的程序在 `bin/`,包根为便利脚本),条目按系统写出各自的目录(`bindir[os.host()]`)。
 
 不带 `--package` 时 `mcpp emit xpkg` 照旧生成源码包的描述。
 
@@ -337,3 +346,4 @@ openkal 目标的单文件:载体携带映像本身(映像不引用其他映像�
 |---|---|---|
 | 1.0 | 2026-10-28 | 首版(mcpp#847):三个维度与构建腿、组合的合法性、选项的全局用法与 `--pkg-format`、`[pack]` 的新键、管线、单腿与通用包的布局、启动器、`--systems`、`mcpp-package.json`、`--merge`、压缩、单文件、包格式提供者与平台插件、签名、分发描述、`mcpp.pack` 的新字段。 |
 | 1.1 | 2026-10-28 | 与实现对齐:zip 的条目以 DEFLATE 压缩;`[pack] universal`;压缩的拒绝与项目缺省值的搁置;`--systems` 也用于映像的单文件;启动器的根与退出状态;单文件的载荷格式、校验与执行;映像单文件的载体内容;`mcpp-package.json` 的 `linkage` 取值与角色判定;`--merge` 的输入、选项写法与容器;签名的范围;`mcpp emit xpkg --package`;判据对应 e2e 954–957。 |
+| 1.2 | 2026-10-28 | 包名的模式后缀;单文件启动器自身失败的退出状态 127;`--merge` 取 `[pack] format`,合并后的目录以输出命名;`--linkage static` 改为 musl 的行;`mcpp emit xpkg --package` 的每系统程序目录、带命名空间的运行器依赖、以归档名定位的顶层目录与多余词的拒绝。 |

@@ -140,6 +140,18 @@ std::string_view launcher_main();
 
 // ─── the distribution description (SPEC-014 §8) ───────────────────────────
 
+// The suffixes of the archives a package is written as, the longer of two
+// that end alike first.
+inline constexpr std::array<std::string_view, 6> kArchiveSuffixes{ ".tar.gz", ".tgz", ".tar.zst", ".tar.xz",
+                                                                   ".tar", ".zip" };
+
+// The name of a package's one directory: its archive's name without the
+// suffix (`app-1.0-openkal.zip` holds `app-1.0-openkal/`), and a name with no
+// archive's suffix as written (`-o app-1.0-openkal` with `--pkg-format dir`;
+// a stem would cut at the version's last dot). `mcpp pack -o` and `--merge -o`
+// name the directory so, and an index entry finds it so.
+std::string archive_directory(const std::filesystem::path& archive);
+
 // A package written by `mcpp pack`, as an index entry reads it.
 struct Asset {
     std::filesystem::path file;
@@ -1462,6 +1474,13 @@ std::string lua_list(const std::vector<std::string>& v) {
 
 }  // namespace
 
+std::string archive_directory(const fs::path& archive) {
+    const auto name = archive.filename().string();
+    for (auto suffix : kArchiveSuffixes)
+        if (name.ends_with(suffix)) return name.substr(0, name.size() - suffix.size());
+    return name;
+}
+
 std::expected<std::string, std::string> xpkg_descriptor(const std::vector<Asset>& assets,
                                                         std::string_view urlPrefix) {
     if (assets.empty()) return std::unexpected(std::string("no package to describe"));
@@ -1486,9 +1505,12 @@ std::expected<std::string, std::string> xpkg_descriptor(const std::vector<Asset>
                                                "(mcpp pack --merge)"));
         auto const& a = assets.front();
         for (auto const& [arch, _] : first.entry) archs.push_back(arch);
+        // The runner is a package of the index's own namespace; a bare name
+        // turns ambiguous as soon as a second index the home lists has one
+        // (xim-pkgindex refuses it: check-dep-namespace).
         std::string deps;
         if (first.mode != "self-contained")
-            deps = std::format("            deps = {{ \"{}\" }},\n",
+            deps = std::format("            deps = {{ \"xim:{}\" }},\n",
                                lua_text(std::filesystem::path(first.runner.front()).stem().string()));
         for (auto system : { "linux", "macosx", "windows" })
             blocks[system] = std::format(
@@ -1544,24 +1566,53 @@ std::expected<std::string, std::string> xpkg_descriptor(const std::vector<Asset>
     else if (!first.program.empty())
         command = std::filesystem::path(first.program).stem().string();
     if (command.empty()) command = first.name;
-    // Where the program lies in the installed tree.
-    std::string bindir = "\"bin\"", alias;
+    // Where the program lies in the installed tree. The packages of two
+    // systems may place it apart (a Windows program at the root, a POSIX one
+    // under bin/ beside the root's convenience script); the entry then names
+    // each system's directory.
+    std::string bindir = "\"bin\"", alias, bindirs;
     if (universal) {
         alias = std::format("if os.host() == \"windows\" then opts.alias = \"{}.cmd\" end\n    ",
                             lua_text(command));
     } else {
-        const auto program = std::filesystem::path(first.program);
-        bindir = program.has_parent_path() ? std::format("\"{}\"", lua_text(program.parent_path().generic_string()))
-                                           : std::string("\".\"");
+        std::map<std::string, std::string> dirOf;   // system -> the program's directory
+        for (auto const& a : assets) {
+            const auto program = std::filesystem::path(a.pkg.program);
+            dirOf[xlings_system(a.pkg.legs.front())] =
+                program.has_parent_path() ? program.parent_path().generic_string() : std::string(".");
+        }
+        const auto& one = dirOf.begin()->second;
+        if (std::ranges::all_of(dirOf, [&](auto const& e) { return e.second == one; })) {
+            bindir = std::format("\"{}\"", lua_text(one));
+        } else {
+            bindirs = "    local bindir = {";
+            for (auto const& [system, dir] : dirOf)
+                bindirs += std::format(" {} = \"{}\",", system, lua_text(dir));
+            bindirs.back() = ' ';
+            bindirs += "}\n";
+            bindir = "bindir[os.host()]";
+        }
     }
-    // The archives' top-level directory: the one of a single asset, else what
-    // the assets' names share (they differ by system and architecture).
-    std::string top = assets.front().top;
+    // xim unpacks the archive beside the file it downloaded, and `mcpp pack`
+    // names the archive's one top-level directory after the archive; the
+    // install takes the directory from that file's name, which holds for
+    // every system, architecture and later version of the entry.
+    std::array<bool, kArchiveSuffixes.size()> used{};
     for (auto const& a : assets) {
-        const auto [p, q] = std::ranges::mismatch(top, a.top);
-        top.erase(static_cast<std::size_t>(p - top.begin()));
+        const auto file = a.file.filename().string();
+        const auto ext = std::ranges::find_if(kArchiveSuffixes, [&](std::string_view e) { return file.ends_with(e); });
+        if (ext == kArchiveSuffixes.end())
+            return std::unexpected(std::format("{} is not an archive xim unpacks (.tar.gz, .tgz, .tar.zst, "
+                                               ".tar.xz, .tar, .zip)", file));
+        if (archive_directory(a.file) != a.top)
+            return std::unexpected(std::format(
+                "{} holds the directory {}/: an entry installs the directory named after the archive, as "
+                "mcpp pack writes it (name the archive {}{})", file, a.top, a.top, *ext));
+        used[static_cast<std::size_t>(ext - kArchiveSuffixes.begin())] = true;
     }
-    const auto wrapper = lua_text(assets.size() == 1 ? top : top + "*");
+    std::string exts;
+    for (std::size_t i = 0; i < kArchiveSuffixes.size(); ++i)
+        if (used[i]) exts += std::format("{}\"{}\"", exts.empty() ? "" : ", ", kArchiveSuffixes[i]);
     return std::format(
         "-- Generated by `mcpp emit xpkg --package` from the packages' mcpp-package.json\n"
         "-- (SPEC-014 §8).\n"
@@ -1578,15 +1629,19 @@ std::expected<std::string, std::string> xpkg_descriptor(const std::vector<Asset>
         "import(\"xim.libxpkg.pkginfo\")\n"
         "import(\"xim.libxpkg.xvm\")\n\n"
         "function install()\n"
-        "    -- The archive's one top-level directory is the package.\n"
-        "    os.tryrm(pkginfo.install_dir())\n"
-        "    for _, d in ipairs(os.dirs(\"{5}\")) do\n"
-        "        os.mv(d, pkginfo.install_dir())\n"
-        "        return true\n"
+        "    -- The archive's one top-level directory is the package; it is named\n"
+        "    -- after the archive, which xim unpacks beside it.\n"
+        "    local top = pkginfo.install_file()\n"
+        "    for _, ext in ipairs({{ {5} }}) do\n"
+        "        if top:sub(-#ext) == ext then top = top:sub(1, #top - #ext) break end\n"
         "    end\n"
-        "    return false\n"
+        "    if not os.isdir(top) then return false end\n"
+        "    os.tryrm(pkginfo.install_dir())\n"
+        "    os.mv(top, pkginfo.install_dir())\n"
+        "    return os.isdir(pkginfo.install_dir())\n"
         "end\n\n"
         "function config()\n"
+        "{9}"
         "    local opts = {{ bindir = path.join(pkginfo.install_dir(), {6}) }}\n"
         "    {7}xvm.add(\"{0}\", opts)\n"
         "    return true\n"
@@ -1597,7 +1652,7 @@ std::expected<std::string, std::string> xpkg_descriptor(const std::vector<Asset>
         "end\n",
         lua_text(command), lua_text(first.version),
         universal ? std::format(", one package for every system ({})", lua_text(first.platform)) : std::string(),
-        lua_list(archs), xpm, wrapper, bindir, alias, lua_text(first.name));
+        lua_list(archs), xpm, exts, bindir, alias, lua_text(first.name), bindirs);
 }
 
 // ─── --merge ──────────────────────────────────────────────────────────────
@@ -1665,7 +1720,10 @@ std::expected<fs::path, std::string> merge(const MergeRequest& req) {
                         differ("linkage", first.linkage, p.linkage), differ("mode", first.mode, p.mode) })
             if (r) return std::unexpected(*r);
     }
-    const auto wrapper = trees.front().first.filename();
+    // The merged package's directory: named after the output, as `mcpp pack
+    // -o` names it, else the first input's.
+    const fs::path wrapper = req.output.empty() ? trees.front().first.filename()
+                                                : fs::path(archive_directory(req.output));
 
     // The container: as asked, else as the output's name says, else as the
     // first input was written.

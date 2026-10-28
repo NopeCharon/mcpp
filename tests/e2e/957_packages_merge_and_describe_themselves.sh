@@ -11,12 +11,14 @@
 #
 # Criteria:
 #   A. `--merge a --merge b` writes one package whose legs and systems are the
-#      union, every file of both, and a `mcpp-package.json` that describes it.
+#      union, every file of both, and a `mcpp-package.json` that describes it;
+#      its directory is named after the output, as `mcpp pack -o` names one.
 #   B. A file both packages hold with different digests is refused, naming the
 #      file and both digests; packages of different versions are refused.
 #   C. `mcpp emit xpkg --package` of a universal package is one asset for
 #      linux, macosx and windows, with the runner as a dependency when the
-#      package does not carry it.
+#      package does not carry it; an archive named without its own --package
+#      (a shell glob's second file) is refused, not left undescribed.
 #   D. An archive merges as the directory it holds does.
 set -e
 
@@ -63,6 +65,8 @@ import hashlib, json, sys, zipfile
 z = zipfile.ZipFile(sys.argv[1])
 names = z.namelist()
 top = names[0].split("/")[0]
+# Named after the output, as `mcpp pack -o` names a package's directory.
+assert top == "merged" and all(n.startswith("merged/") for n in names), names[:3]
 d = json.loads(z.read(f"{top}/mcpp-package.json"))
 assert len(d["systems"]) == 4 and any(s.startswith("other-") for s in d["systems"]), d["systems"]
 assert sorted(d["legs"]) == ["aarch64-openkal", "x86_64-openkal"], d["legs"]
@@ -130,9 +134,15 @@ for system in ("linux", "macosx", "windows"):
     assert block, system
     b = block.group(1)
     assert "https://example.org/v0.1.0/mrg-0.1.0-openkal.zip" in b and sha in b, (system, b)
-    assert 'deps = { "okrun" }' in b, (system, b)
+    assert 'deps = { "xim:okrun" }' in b, (system, b)
 assert 'xvm.add("mrg"' in text
+assert 'local top = pkginfo.install_file()' in text and '{ ".zip" }' in text, text
 PY
+if "$MCPP" emit xpkg --package target/dist/mrg-0.1.0-openkal.zip target/dist/mrg-0.1.0-openkal.zip \
+        --url https://example.org/v0.1.0 > c2.lua 2> c2.err; then
+    fail "C: an archive without its own --package was taken" c2.lua
+fi
+grep -q "each archive is its own --package" c2.err || fail "C: the refusal does not say how" c2.err
 echo "ok: a universal package is one asset for every system"
 
 echo "PASS: 957 packages merge and describe themselves"

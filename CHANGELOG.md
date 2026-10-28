@@ -4,6 +4,73 @@
 > Each `## [<version>]` section is that release's notes. Entries are written in English
 > from 2026.9.28.3 on; earlier entries remain as written.
 
+## [2026.10.28.1] - 2026-10-28
+
+### Fixed
+
+- **A package's cache key covers every package whose module it imports.**
+  A BMI is bound to the BMIs it read, and the key folded in only the
+  dependencies a manifest states. A package can import a module its manifest
+  does not name: the libraries of a build program import the engine
+  interface (`mcpp`), which the engine adds to the build program's graph.
+  Such a package was served an entry compiled against another BMI of that
+  module and failed with "CRC mismatch" (measured: `mcpp.plugins` in a build
+  of an ok image, over a cache earlier builds had filled). The provider of
+  each imported module is now an upstream of the importer's key, a declared
+  edge or not; a module this build generates for a dependency below its
+  consumer's root is not one (e2e 849). e2e 959 serves a package an
+  interface it does not declare at two versions; the upgrade lane gains a
+  `programs` variant that builds an ok image over the previous release's
+  cache.
+- **A build ended by SIGTERM exits 143 however the race falls.** The watcher
+  that takes a request to end over ends the programs mcpp runs, writes the
+  cancelled record, runs the cleanups and then ends mcpp as asked; the main
+  thread, woken by its compiler's end, could return from `main` first with
+  the build's own failure (exit 1, seen once on CI in e2e 936 H). The end of
+  `main` now ends mcpp as the request asks, after the watcher has finished.
+- **`mcpp emit xpkg --package` names each system's program directory.** The
+  packages of one program for several systems may place it apart: a Windows
+  package holds the program at its root, a POSIX one under `bin/` beside the
+  root's convenience script. The entry registered the first package's
+  directory for every system, so on Windows xvm pointed at a `bin/` the
+  package does not have. It now writes `bindir[os.host()]` from a table of
+  each system's directory when they differ (SPEC-014 §8).
+- **`mcpp emit xpkg --package` states the runner dependency with its
+  namespace** (`deps = { "xim:okrun" }`). A bare name turns ambiguous once a
+  second index the home lists has a package of that name, and xim-pkgindex's
+  `check-dep-namespace` refuses it for a published package.
+- **The install of an `emit xpkg --package` entry finds the package.** It
+  looked the archive's directory up with `os.dirs("<name>-0.1.3-*")`, and
+  libxpkg's `os.dirs` lists `<base>/*` without matching names: no xlings
+  install of such an entry succeeded. The directory is now the downloaded
+  archive's name without its extension, which is what `mcpp pack` names it
+  after, so it holds for every system, architecture and later version; an
+  archive renamed since it was packed, or a file xim does not unpack, is
+  refused when the entry is written. `mcpp pack --merge -o <archive>` names
+  the merged package's directory after its output as `mcpp pack -o` does,
+  where it kept the first input's, so a merged package is described as
+  every other is.
+- **`mcpp emit xpkg` refuses a word that is not an option.** Each archive is
+  its own `--package`; `--package a.zip b.zip` (a shell glob's expansion)
+  described `a.zip` alone and left `b.zip` out without a word.
+- **The release proposes its index bump again.** `bump_index.sh` waited for
+  `auto/bump-xim-mcpp-<version>`, and the index's updater opens
+  `auto/bump-xim-mcpp`; the proposal is now found by the marker in its body.
+  A dispatch the token is refused for (it needs Actions: write on
+  openxlings/xim-pkgindex) names the permission and the command a maintainer
+  runs.
+
+### Changed
+
+- **`upgrade-lane-logs/` is no longer in the tree.** A local run's logs were
+  committed with 2026.10.17.1; the directory is ignored, as the lane writes
+  it beside the workspace for CI to upload.
+- **SPEC-014 1.2** states what 2026.10.27.1 already does: a package's name
+  carries its mode's suffix, a single file's launcher exits 127 on its own
+  failure, `--merge` takes its container from `[pack] format` before `-o`, and
+  `--linkage static` moves this machine's row and each `-linux-gnu` `--target`
+  to musl while a project's own `[build] target` is packed as it is.
+
 ## [2026.10.27.1] - 2026-10-27
 
 ### Added
