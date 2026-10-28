@@ -113,7 +113,7 @@ for m in cli gui; do
         || fail "M: $m's archive is not below the directory --output names" m1.log
 done
 [ "$(find out -maxdepth 1 -name '*.tar.gz' | wc -l | tr -d ' ')" = 2 ] || fail "M: the directory holds more than the two archives" m1.log
-"$MCPP" pack --mode system --workspace --format dir -o out-trees > m2.log 2>&1 || fail "M: --format dir with --output <dir> did not pack" m2.log
+"$MCPP" pack --mode system --workspace --pkg-format dir -o out-trees > m2.log 2>&1 || fail "M: --pkg-format dir with --output <dir> did not pack" m2.log
 for m in cli gui; do
     t=$(find out-trees -maxdepth 1 -type d -name "$m-0.1.0-*" | head -1)
     [ -n "$t" ] && [ -f "$t/bin/$m" ] || fail "M: $m's tree is not below the directory --output names" m2.log
@@ -144,7 +144,7 @@ for s in d["stages"]:
     assert set(s) == {"member", "dir", "manifest", "closure"}, s
     assert s["closure"] in ("walked", "not-walked"), s
 for a in d["artifacts"]:
-    assert set(a) == {"path", "type", "format", "targets", "member"}, a
+    assert set(a) == {"path", "type", "format", "targets", "member", "sha256"}, a
 EOF
 "$MCPP" pack --mode system -p cli --message-format json > o2.json 2> o2.log || fail "O: a pack of one member failed" o2.log
 python3 - <<'EOF' || fail "O: the envelope of one member changed" o2.json
@@ -152,7 +152,7 @@ import json
 d = json.load(open("o2.json"))["data"]
 assert "stages" not in d, d
 assert isinstance(d["stage"], dict) and set(d["stage"]) == {"dir", "manifest", "closure"}, d
-assert len(d["artifacts"]) == 1 and set(d["artifacts"][0]) == {"path", "type", "format", "targets"}, d
+assert len(d["artifacts"]) == 1 and set(d["artifacts"][0]) == {"path", "type", "format", "targets", "sha256"}, d
 EOF
 echo "ok: O, the envelope lists every member's artifacts and keeps the single-member shape"
 

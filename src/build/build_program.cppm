@@ -376,6 +376,10 @@ struct BuildProgramEnv {
     std::string               programIdentity;
     std::chrono::milliseconds programCompile{0};
     std::string               programError;
+    // THE ARGV THAT RUNS IT, `{}` the program: the host graph's platform's
+    // runner when the program is one of its images (SPEC-013 §6, `okrun {}`);
+    // empty: the program is run directly.
+    std::vector<std::string>  programRunner;
 };
 
 // The env-var name `hostprogram::xpkg_dir` reads back. One spelling of the
@@ -961,10 +965,18 @@ CacheRecord read_cache(const fs::path& bdir) {
     return r;
 }
 
+// The first value `vanished` answers for.
+template <class F>
+std::optional<std::string> first_vanished(const std::vector<std::string>& values, F&& vanished) {
+    for (auto const& v : values)
+        if (auto path = vanished(v)) return path;
+    return std::nullopt;
+}
+
 // Why the cached run is not valid, for the log; empty when it is.
 std::string cache_stale_reason(const fs::path& root, const fs::path& bdir, const CacheRecord& c,
                                const std::string& programHash, const std::string& compilerHash,
-                               const std::string& ctxHash) {
+                               const std::string& ctxHash, const fs::path& outDir = {}) {
     if (!c.loaded) return "no record";
     if (c.epoch != dirs::kCacheEpoch) return "record epoch";  // pre-epoch entries rerun once
     if (c.unknownRecord) return "unknown record line";
@@ -990,6 +1002,36 @@ std::string cache_stale_reason(const fs::path& root, const fs::path& bdir, const
         if (!def.mustExistAfterRun) continue;
         for (auto const& p : c.directives.at(def.slot))
             if (!fs::exists(abs_against_root(root, p))) return "output " + p;
+    }
+    // WHAT THE PROGRAM WROTE INTO ITS OUTPUT DIRECTORY AND NAMED: an include
+    // directory, a library directory, a file to deploy. A directive that names
+    // a path below `MCPP_OUT_DIR` which is no longer there was written by a
+    // run whose output was deleted since (`rm -rf target/.build-mcpp/out`),
+    // and replaying it hands the build a directory with nothing in it.
+    if (!outDir.empty()) {
+        const std::array<std::string, 2> spellings{ outDir.generic_string(), outDir.string() };
+        // The path a value names below the output directory, when it is gone.
+        auto vanished = [&](const std::string& v) -> std::optional<std::string> {
+            std::error_code ec;
+            for (auto const& text : spellings) {
+                const auto at = v.find(text);
+                if (at == std::string::npos) continue;
+                const auto end = v.find_first_of("\t\"", at);
+                auto path = v.substr(at, end == std::string::npos ? std::string::npos : end - at);
+                if (!fs::exists(path, ec)) return path;
+            }
+            return std::nullopt;
+        };
+        // Only what reaches a compile, a link or a run: a warning or a claim
+        // that mentions a path is text, and an action's outputs are the
+        // build's products, made again by the build whenever they are missing.
+        for (auto const& def : dirs::kTable) {
+            if (def.scope == dirs::Scope::Advisory || def.scope == dirs::Scope::Claim
+                || def.scope == dirs::Scope::RerunKey || def.scope == dirs::Scope::GraphNode)
+                continue;
+            if (auto path = first_vanished(c.directives.at(def.slot), vanished))
+                return "output " + *path;
+        }
     }
     return {};
 }
@@ -1104,7 +1146,8 @@ std::expected<void, std::string> run_build_program_impl(
     // Fast path: declared inputs + contract unchanged → reapply cached
     // directives, no run.
     CacheRecord cache = read_cache(bdir);
-    const auto stale = cache_stale_reason(root, bdir, cache, programHash, compilerHash, ctxHash);
+    const auto stale = cache_stale_reason(root, bdir, cache, programHash, compilerHash, ctxHash,
+                                          outDir);
     if (!stale.empty()) {
         std::string keys;
         if (stale == "environment contract") keys = changed_contract_keys(bdir, contractEnv);
@@ -1201,8 +1244,18 @@ std::expected<void, std::string> run_build_program_impl(
     // the one who knows how long it takes.
     const auto deadline =
         dirs::run_timeout_for(m.buildConfig.buildProgramTimeoutSecs);
+    std::vector<std::string> argv{bin.string()};
+    if (!env.programRunner.empty()) {
+        argv.clear();
+        bool placed = false;
+        for (auto const& a : env.programRunner) {
+            if (a == "{}") { argv.push_back(bin.string()); placed = true; }
+            else argv.push_back(a);
+        }
+        if (!placed) argv.push_back(bin.string());
+    }
     auto rres = mcpp::run::capture_exec_deadline(
-        {bin.string()}, childEnv, deadline, &timedOut, root.string());
+        argv, childEnv, deadline, &timedOut, root.string());
     if (timedOut) {
         // Name the manifest to edit. Without this the user edits their OWN
         // mcpp.toml when a dependency's build program is what timed out, and
@@ -1305,6 +1358,46 @@ std::expected<void, std::string> run_build_program_impl(
                 "       `mcpp::plugins::toolchain::configure` returns true.",
                 def.wire));
         }
+    } else if (env.phase == "platform") {
+        // THE PLATFORM PHASE STATES THE PLATFORM'S BUILD, LINK AND RUNNER
+        // FIELDS, AND THE PACKAGE FORMATS IT PROVIDES (SPEC-013 §4.2, SPEC-014
+        // §4): it describes a class of targets, not a package of sources, and
+        // what it states reaches every unit and every link of the target. A
+        // format is provided as any package provides one -- `pack-format` and
+        // the `artifact` actions that produce it from the staged tree. Refused
+        // rather than dropped, naming the first directive that does not belong.
+        for (auto const& def : dirs::kTable) {
+            switch (def.slot) {
+                case Slot::CxxFlags: case Slot::CFlags: case Slot::LdFlags:
+                case Slot::Runner: case Slot::NamedRunner: case Slot::RunnerLongLived:
+                case Slot::RunExclusive: case Slot::LinkStart: case Slot::LinkDriver:
+                case Slot::LinkInputs: case Slot::ArtifactNames: case Slot::Seal:
+                case Slot::RunHost: case Slot::RerunFiles: case Slot::RerunEnv:
+                case Slot::RerunGlobs: case Slot::Warnings: case Slot::Diagnostics:
+                case Slot::PackFormats:
+                    continue;
+                default: break;
+            }
+            if (d.at(def.slot).empty()) continue;
+            if (def.slot == Slot::Actions
+                && std::ranges::all_of(d.at(def.slot), [](std::string const& payload) {
+                       return dirs::action_role_of(payload).value_or("") == "artifact";
+                   }))
+                continue;
+            mcpp::build::refusal::record(mcpp::build::refusal::Code::PlatformPhaseDirective);
+            return std::unexpected(std::format(
+                "build.mcpp stated `mcpp:{}=` in its platform phase.\n"
+                "       A platform's plugin states the platform's build, link and runner\n"
+                "       fields (compile and link flags, the link driver, inputs, entry,\n"
+                "       artifact names, seal steps, runners) and the package formats it\n"
+                "       provides (`pack-format`, `artifact` actions); `mcpp::phase()` is\n"
+                "       \"platform\" there (SPEC-013 §4.2).",
+                def.wire));
+        }
+        if (!d.at(Slot::ToolchainStatement).empty())
+            return std::unexpected(std::string(
+                "build.mcpp stated `mcpp:toolchain=` in its platform phase; a platform's "
+                "toolchain is its `[platform] toolchain`"));
     } else if (!d.at(Slot::ToolchainStatement).empty()) {
         return std::unexpected(std::string(
             "build.mcpp stated `mcpp:toolchain=` outside the toolchain phase.\n"

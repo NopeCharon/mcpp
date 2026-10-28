@@ -7,6 +7,7 @@ import :state;
 import mcpp.build.prepare_inputs;
 
 import std;
+import mcpp.platform;
 import mcpp.diag;
 import mcpp.log;
 import mcpp.build.refusal;
@@ -181,10 +182,23 @@ static void step6_compat_library_edges(PrepareState& state) {
 // Nothing is cleared from a manifest: `compilesHere` reads the result, and the
 // link flags a package without a target instance contributed during
 // resolution are withdrawn from the root's link line.
-static void step6_instances(PrepareState& state) {
+void merge_program_platform(PrepareState& state, mcpp::manifest::platform::Statement stated,
+                            std::string_view who) {
+    for (auto* o : { &stated.link.driver.origin, &stated.link.inputsOrigin,
+                     &stated.link.exe.origin, &stated.link.shared.origin,
+                     &stated.link.sealOrigin, &stated.runner.origin })
+        if (o->tier == mcpp::manifest::platform::Tier::Program)
+            o->key = std::format("{} ({})", who, o->key);
+    if (!stated.empty() || !stated.runner.host.empty())
+        mcpp::platform::merge(state.programPlatform, stated);
+}
+
+PackageInstances package_instances(const PrepareState& state) {
     const auto n = state.packages.size();
-    if (n == 0) return;
-    std::vector<bool> target(n, false), host(n, false);
+    PackageInstances out{ std::vector<bool>(n, false), std::vector<bool>(n, false) };
+    if (n == 0) return out;
+    auto& target = out.target;
+    auto& host = out.host;
     std::vector<std::size_t> stack{0};
     target[0] = true;
     while (!stack.empty()) {
@@ -214,6 +228,13 @@ static void step6_instances(PrepareState& state) {
             stack.push_back(d);
         }
     }
+    return out;
+}
+
+static void step6_instances(PrepareState& state) {
+    const auto n = state.packages.size();
+    if (n == 0) return;
+    const auto [target, host] = package_instances(state);
     for (std::size_t d = 1; d < n; ++d) {
         state.packages[d].hostInstance = host[d];
         // A package no edge mentions is a bookkeeping gap, not a build
@@ -1788,6 +1809,13 @@ static std::expected<void, std::string> step6_dependency_build_programs(PrepareS
                         break;
                     }
             }
+            // THE PLATFORM'S PLUGIN (SPEC-013 §4.2): the platform package's
+            // program runs in the `platform` phase, and states only the
+            // platform's build, link and runner fields.
+            const bool platformPhase = state.platform.active && state.platformData.plugin.set
+                && std::filesystem::weakly_canonical(pkg.root)
+                       == std::filesystem::weakly_canonical(state.platform.root);
+            if (platformPhase) bpEnv.phase = "platform";
             bpEnv.languageModules = pkg.manifest.language.modules;
             bpEnv.ruleModules  = pkg.manifest.buildConfig.ruleModules;
             if (auto dit = state.deviceSourcesByPackage.find(pkg.root.string()); dit != state.deviceSourcesByPackage.end())
@@ -1814,12 +1842,15 @@ static std::expected<void, std::string> step6_dependency_build_programs(PrepareS
             if (!program && !state.overrides.plan_only) return std::unexpected(program.error());
             if (program) {
                 bpEnv.programBinary   = program->path;
+                bpEnv.programRunner   = program->runner;
                 bpEnv.programIdentity = program->identity;
                 bpEnv.programCompile  = program->compile;
             } else {
                 bpEnv.programError = program.error();
             }
             auto& bcDep = pkg.manifest.buildConfig;
+            const auto cxxN = bcDep.cxxflags.size();
+            const auto cN = bcDep.cflags.size();
             const auto mark = state.markDirectiveTail(pkg.manifest);
             const auto ldN = bcDep.ldflags.size();
             const auto actN = bcDep.actions.size();
@@ -1935,6 +1966,20 @@ static std::expected<void, std::string> step6_dependency_build_programs(PrepareS
                 state.m->buildConfig.runExclusive = true;
             state.m->buildConfig.ldflags.insert(state.m->buildConfig.ldflags.end(),
                 bcDep.ldflags.begin() + ldN, bcDep.ldflags.end());
+            // THE PLATFORM'S FIELDS A PROGRAM STATED (protocol 17), at the
+            // build-program tier of the build's platform statement, named
+            // after the package (SPEC-013 §4.1). A plugin's compile flags are
+            // the platform's, for every unit of the target, not its own.
+            {
+                auto stated = std::exchange(bcDep.programPlatform, {});
+                if (platformPhase) {
+                    stated.build.cxxflags.assign(bcDep.cxxflags.begin() + static_cast<std::ptrdiff_t>(cxxN),
+                                                 bcDep.cxxflags.end());
+                    stated.build.cflags.assign(bcDep.cflags.begin() + static_cast<std::ptrdiff_t>(cN),
+                                               bcDep.cflags.end());
+                }
+                merge_program_platform(state, std::move(stated), pkg.manifest.package.name);
+            }
         }
 
         // apply() may have added interface defines to packages' publicUsage

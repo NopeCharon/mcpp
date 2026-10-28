@@ -87,6 +87,7 @@ import mcpp.toolchain.post_install;
 import mcpp.toolchain.abi;
 import mcpp.toolchain.triple;
 import mcpp.build.plan;
+import mcpp.platform;
 import mcpp.build.flags;          // compute_flags — the per-role contracts (#418)
 import mcpp.build.graph_shape;  // #407: the graph says which mode wrote it
 import mcpp.build.build_program;
@@ -524,6 +525,17 @@ export struct BuildContext {
     // where it was stated, for the line that announces it.
     std::vector<std::string> runUnder;
     std::string              runUnderOrigin;
+    // THE HOST GRAPH'S PLATFORM (SPEC-013 §6): what the build programs and the
+    // tools of this build are built for. Inactive = the host conventions.
+    // The target's is `plan.platform`.
+    mcpp::platform::Resolved hostPlatform;
+    // The host graph's triple and compiler, prepared for `mcpp self env --host`
+    // only: under a host platform, the platform's target of this machine's
+    // architecture and the platform's toolchain; else the toolchain the build
+    // programs are compiled with.
+    std::string hostTriple;
+    std::string hostCompiler;
+    std::string hostCompilerOrigin;
     // The payload directory of every `[xlings]` address resolved above, for
     // the fast path's presence check (#716). See BuildCacheEntry::xlingsPayloads.
     std::vector<std::filesystem::path> xlingsPayloads;
@@ -803,6 +815,11 @@ export struct BuildOverrides {
     // project root, as the resolution input it is, while the lock this planning
     // produces is written under `work_dir`. Build programs still run.
     bool        plan_only = false;
+    // THE CONFIGURATION, NOT THE SOURCES (`prepare_configuration`, SPEC-013
+    // §9): what the project's sources would be refused for -- `import std`
+    // with no C++ run-time in the graph -- is a note of the report, and the
+    // configuration is still reported.
+    bool        configuration_only = false;
     // #355 tool provisioning re-enters prepare_build for the tool package. A
     // tool package's own build.mcpp may legitimately want another tool (gRPC's
     // wants protoc), so the depth cannot be 1 — but an unbounded chain is a
@@ -869,6 +886,10 @@ export struct BuildOverrides {
     // same relationship --target has with [toolchain].
     std::string accel;
     bool        force_static = false; // --static (or implied by musl target)
+    // `mcpp pack --linkage` (SPEC-014 §1): the whole graph's dependency
+    // linkage for this build, over `[build] dependency_linkage` and the
+    // profile's. Empty: as the project states it.
+    std::string dependency_linkage;
     std::string package_filter;      // -p <name>: only build this workspace member
     // The workspace members this plan builds, as written in `[workspace]
     // members` ("." is a rooted workspace's own package), all of one
@@ -971,6 +992,16 @@ export struct BuildOverrides {
     // `prepare_build` itself, never by a caller.
     std::vector<std::string> toolchain_statement;
     std::string              bootstrap_spec;
+    // THE PLATFORM PACKAGE'S DIRECTORY, when this prepare is the second pass
+    // of a build whose platform states a target base (`[platform] sysroot`):
+    // the base is read before the graph exists, so the first pass fetched the
+    // package and the second reads its `[platform]` from here at once
+    // (SPEC-013 §7). Set by `prepare_build` itself, never by a caller.
+    std::filesystem::path    platform_root;
+    // THE PLATFORM THIS PREPARE'S TARGET USES, stated by the caller: the
+    // host graph's platform, given to the build programs' sub-build (SPEC-013
+    // §6). Read as the flag tier; empty on every other prepare.
+    std::string              platform_choice;
 };
 
 // ── git dependency helpers ──────────────────────────────────────────────────
@@ -1033,6 +1064,16 @@ export std::expected<BuildContext, std::string>
 prepare_build(bool print_fingerprint, bool includeDevDeps = false,
               std::vector<mcpp::manifest::Target> extraTargets = {},
               BuildOverrides overrides = {});
+
+// ONE CONFIGURATION, PREPARED WITHOUT A BUILD (SPEC-013 §9): what `mcpp self
+// env --target` reports and what `mcpp toolchain install --target` fetches --
+// the toolchain, the platform package, the packages it adds and the tools it
+// builds for this machine -- so a later build of that target works offline.
+// Inside a project the project's own configuration is prepared (its
+// `[target.<selector>]` tables apply); elsewhere an empty program in the
+// home's cache stands for one. Nothing is compiled but the tools.
+export std::expected<BuildContext, std::string>
+prepare_configuration(std::string_view targetTriple);
 
 // The PlanNotes a failed call recorded before the phase that failed it.
 //

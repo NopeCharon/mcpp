@@ -682,8 +682,14 @@ static void step4a_define_candidate_selection_closures(PrepareState& state) {
                 }
                 // Offline with no local copy of the index at all, the miss says
                 // nothing about the package: nothing has been downloaded to look
-                // in. That is a download the run needs, not a wrong selector.
-                if (mcpp::effects::offline_mode()) {
+                // in. That is a download the run needs, not a wrong selector --
+                // unless every candidate's namespace is served by an index of
+                // the project's own (`[indices]`), which is on disk and answered.
+                const bool servedByProjectIndex = std::ranges::all_of(candidates,
+                    [&](const mcpp::pm::DependencyCoordinate& c) {
+                        return state.index_route(nullptr).find_for_ns(c.namespace_) != nullptr;
+                    });
+                if (mcpp::effects::offline_mode() && !servedByProjectIndex) {
                     if (auto cfgO = state.get_cfg(true);
                         cfgO && !mcpp::provider::open(mcpp::config::make_xlings_env(**cfgO))->default_index_status(0).present) {
                         hint += "\n  offline: the package index has never been fetched; "
@@ -1058,6 +1064,38 @@ step4a_load_version_dep_fetch(PrepareState& state, LoadVersionDepCtx& ctx) {
             mcpp::invocation::ScopedEnv hookVar4(hookVars.at(4).first, hookVars.at(4).second);
             mcpp::invocation::ScopedEnv hookVar5(hookVars.at(5).first, hookVars.at(5).second);
             auto r = install_one(target);
+            // A MISS AT INSTALL REFRESHES THE INDEX, THEN ASKS ONCE MORE. The
+            // walk refreshes when a descriptor is missing, and deliberately not
+            // when a descriptor is present without the version asked for:
+            // version tables are per system, so that absence is not proof. The
+            // provider's "not found" for that version is, and it is the only
+            // place the stale case shows (measured: `openkal-llvm-runtime =
+            // "0.16.3"` against an index synced before 0.16.3, refused until
+            // `mcpp index update`). The policy decides (offline, `auto_refresh`,
+            // the debounce, one sync per run). A project's own index is read as
+            // it is, so it is not refreshed here.
+            // What mcpp did about the miss, for the message if it stays one
+            // (L4): the refresh, and why it ran or did not.
+            std::string refreshNote;
+            const bool missedVersion = r && r->exitCode != 0
+                && mcpp::pm::install_failure_policy(r->error ? r->error->code : std::string{}).refreshIndex;
+            if (missedVersion && !ctx.useProjectEnv) {
+                const auto env = mcpp::config::make_xlings_env(**cfg);
+                auto decision = mcpp::pm::decide_for_miss(
+                    mcpp::pm::policy_for(**cfg), env, target, mcpp::pm::RefreshReason::InstallMiss);
+                if (auto applied = mcpp::pm::apply(decision, env); !applied) {
+                    mcpp::ui::warning(applied.error());
+                    refreshNote = std::format("refreshing it failed: {}", applied.error());
+                } else if (decision.shouldRefresh) {
+                    r = install_one(target);
+                    refreshNote = "refreshed it now, and the version is still not in it";
+                } else {
+                    refreshNote = std::format("did not refresh it: {}",
+                                              mcpp::pm::reason_text(decision.reason));
+                }
+            } else if (missedVersion) {
+                refreshNote = "did not refresh it: a project's own index is read as it is";
+            }
             // The first address's failure is the one about the package; a
             // compat spelling tried after it fails as "not found" whatever
             // the cause was.
@@ -1067,11 +1105,14 @@ step4a_load_version_dep_fetch(PrepareState& state, LoadVersionDepCtx& ctx) {
                 if (r->error)
                     firstError += (firstError.empty() ? "" : "; ") + r->error->message;
             }
-            if (r && r->exitCode != 0 &&
+            if (r && r->exitCode != 0 && !ctx.luaContent &&
                 (ns.empty() || ns == mcpp::pm::kDefaultNamespace)) {
                 // Compat retry for a bare/default-namespace request whose
                 // descriptor could not be read (no `wireAddr` to trust): the
-                // package may still be a `compat` one. Try BOTH spellings — a
+                // package may still be a `compat` one. A descriptor that was
+                // read names the package, and its failure is that package's:
+                // another namespace is not tried and not shown as downloading.
+                // Try BOTH spellings — a
                 // SPEC-001 index keys it `compat:<short>`, a pre-SPEC-001 index
                 // keys it by the literal `compat.<short>`. Sending only the
                 // latter is what left the retry pointing at a name the migrated
@@ -1113,13 +1154,38 @@ step4a_load_version_dep_fetch(PrepareState& state, LoadVersionDepCtx& ctx) {
                     childErr += r->error->message;
                 }
                 auto target = std::format("{}@{}", depName, version);
-                auto diag = mcpp::pm::format_install_failure_diagnostic(
-                    target, r->exitCode, indexRepos, childErr);
                 std::string tried;
                 for (auto& a : attempted) {
                     if (!tried.empty()) tried += ", ";
                     tried += a;
                 }
+                // A VERSION THE INDEX DOES NOT HAVE IS SAID BY MCPP (L4): which
+                // index, at which revision and how old, and what was done about
+                // it. The provider's own sentence ("the index is current") is
+                // about its index, not mcpp's, and reads as the opposite of the
+                // cause; it stays available with -v.
+                if (missedVersion) {
+                    std::string diag = std::format(
+                        "the package index has no {} to install\n"
+                        "  index: {}\n"
+                        "  mcpp {}\n"
+                        "  if the version was published since, `mcpp index update` fetches it; "
+                        "otherwise the version is not in the index",
+                        target, ctx.useProjectEnv ? std::string("the project's own index")
+                                                  : mcpp::pm::staleness_note(mcpp::config::make_xlings_env(**cfg)),
+                        refreshNote.empty() ? std::string("did not refresh it") : refreshNote);
+                    if (auto hint = mcpp::pm::unusable_index_hint(); !hint.empty()) diag += "\n" + hint;
+                    if (mcpp::log::is_verbose())
+                        diag += "\n  " + mcpp::pm::format_install_failure_diagnostic(
+                            target, r->exitCode, indexRepos, childErr);
+                    else if (!childErr.empty())
+                        diag += "\n  (the provider's own report: run with -v)";
+                    diag += std::format("\n  wire address{} tried: {}",
+                                        attempted.size() == 1 ? "" : "es", tried);
+                    return std::unexpected(std::move(diag));
+                }
+                auto diag = mcpp::pm::format_install_failure_diagnostic(
+                    target, r->exitCode, indexRepos, childErr);
                 diag += std::format("\n  wire address{} tried: {}",
                                     attempted.size() == 1 ? "" : "es", tried);
                 return std::unexpected(std::move(diag));

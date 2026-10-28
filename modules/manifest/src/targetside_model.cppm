@@ -245,6 +245,9 @@ struct Layer {
     std::string interfaceName;   // openkal / linux / win32 / darwin / musl / glibc / libc++
     std::string impl;            // package@version, or an xpkg reference
     bool        subset = false;  // C++ layer: a freestanding subset, not the whole library
+    // The package was added to the graph by the target's platform (SPEC-013
+    // §4.3): still a graph package, reported as the platform's.
+    bool        byPlatform = false;
 
     bool absent()   const { return origin == Origin::None; }
     bool prebuilt() const { return origin == Origin::Payload || origin == Origin::Xpkg; }
@@ -566,10 +569,11 @@ struct Inputs {
     std::string targetOs;              // mcpp's own OS field, for the payload interface name
     std::string targetEnv;             // mcpp's own ENV field ("musl", "gnu", …)
     bool        freestandingTarget = false;
-    // An ok image (`<arch>-openkal`): its kernel interface is openkal's, held
-    // by the loader that runs it rather than by a package or a payload, and
+    // A target whose loader supplies the system (an ok image, `<arch>-openkal`):
+    // its kernel interface is the one the triple names (`targetOs`), held by
+    // the loader that runs it rather than by a package or a payload, and
     // every layer above it is the graph's or absent.
-    bool        openkalTarget = false;
+    bool        loaderTarget = false;
 
     // The compiler, which is always a payload and never a package (see
     // `layer_is_suppliable_by_package`). Present here so that the layering rule
@@ -721,10 +725,10 @@ inline TargetSide resolve(const Inputs& in) {
         ts.compilerRuntime = { Origin::Graph,
                                in.compilerRuntime->display_interface(),
                                in.compilerRuntime->id(), false };
-    else if (in.payloadCompilerRuntimeAbsent || in.openkalTarget)
-        // An ok image's runtime routines are the image's own (a C++
-        // run-time package, or the program): the payload's are built for an
-        // operating system the image does not have.
+    else if (in.payloadCompilerRuntimeAbsent || in.loaderTarget)
+        // The runtime routines of a program its loader runs are its own (a
+        // C++ run-time package, or the program): the payload's are built for
+        // an operating system the program does not have.
         ts.compilerRuntime = { Origin::None, {}, {}, false };
     else if (!in.compilerFamily.empty())
         ts.compilerRuntime = { Origin::Payload, in.compilerFamily, {}, false };
@@ -733,10 +737,10 @@ inline TargetSide resolve(const Inputs& in) {
     if (in.kernelAbi)
         ts.kernelAbi = { Origin::Graph, in.kernelAbi->display_interface(),
                          in.kernelAbi->id(), false };
-    else if (in.openkalTarget)
+    else if (in.loaderTarget)
         // Fixed by the target: an ok image calls `kal_*` and nothing else,
-        // and the loader binds them to its implementation (SPEC 12.3).
-        ts.kernelAbi = { Origin::Payload, "openkal", "the loader (okrun)", false };
+        // and the loader binds them to its implementation (openkal SPEC 12.3).
+        ts.kernelAbi = { Origin::Payload, in.targetOs, "the loader", false };
     else if (in.freestandingTarget)
         // Not a gap. A bare machine has no kernel, and saying so is the
         // information: the same target reads `openkal` when an implementation
@@ -757,7 +761,7 @@ inline TargetSide resolve(const Inputs& in) {
         ts.cAbi = { Origin::Xpkg,
                     in.sysrootLibc.empty() ? xpkg_interface(in.sysrootXpkg) : in.sysrootLibc,
                     in.sysrootXpkg, false };
-    else if (in.freestandingTarget || in.openkalTarget)
+    else if (in.freestandingTarget || in.loaderTarget)
         ts.cAbi = { Origin::None, {}, {}, false };
     else
         ts.cAbi = { Origin::Payload, payload_libc_name(in.targetOs, in.targetEnv),
@@ -1081,13 +1085,14 @@ inline std::string format_layers(const TargetSide& ts, bool verbose) {
         std::string suffix = l.subset ? ", subset" : "";
         // One column layout whether or not an implementation is named, so the
         // rows read as a table rather than as a list of sentences.
+        const std::string_view from = l.byPlatform ? std::string_view("platform")
+                                                   : origin_name(l.origin);
         if (l.impl.empty())
             out += std::format("{}{:<17} {:<14} ({}{})\n", kIndent, label,
-                               l.interfaceName, origin_name(l.origin), suffix);
+                               l.interfaceName, from, suffix);
         else
             out += std::format("{}{:<17} {:<14} ({}, {}{})\n", kIndent, label,
-                               l.interfaceName, l.impl, origin_name(l.origin),
-                               suffix);
+                               l.interfaceName, l.impl, from, suffix);
     }
     return out;
 }

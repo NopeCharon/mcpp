@@ -260,7 +260,7 @@ step9_gather_target_side_candidates(PrepareState& state) {
                 in.targetOs           = tt->os;
                 in.targetEnv          = tt->env;
                 in.freestandingTarget = tt->is_freestanding();
-                in.openkalTarget      = tt->is_openkal();
+                in.loaderTarget       = tt->loader_supplies_os();
                 // NOT `tt->envExplicit`. By this line the triple has been
                 // canonicalised, and the canonical form of `x86_64-linux` is
                 // `x86_64-linux-gnu` — re-parsing it reports a segment the
@@ -463,9 +463,9 @@ step9_resolve_and_realise_cabi(PrepareState& state, TargetSideGather& gather) {
             auto realised = mcpp::toolchain::cenv::realise(
                 *state.resolvedTargetSide.cAbiDecl, tt ? tt->os : std::string{},
                 tt ? tt->arch : std::string{},
-                // An ok image is told no operating system, as a bare machine
-                // is: the C library's identity macros are the only ones.
-                tt && (tt->is_freestanding() || tt->is_openkal()));
+                // A program its loader runs is told no operating system, as a
+                // bare machine is: the C library's identity macros are the only ones.
+                tt && (tt->is_freestanding() || tt->loader_supplies_os()));
             if (!realised) {
                 refusal::record(refusal::Code::CEnvUnrealisable);
                 return std::unexpected(realised.error());
@@ -626,12 +626,12 @@ step9_resolve_and_realise_cabi(PrepareState& state, TargetSideGather& gather) {
         // availability check links and runs without the archive; refusing it
         // would trade a diagnosed hazard for a regression. The degradation
         // names the platform, the file and the package that supplies it.
-        // An ok image's runtime routines are the image's own by design
-        // (mcpp.okimage), so its absence there is not a gap to report.
+        // The runtime routines of a program its loader runs are its own by
+        // design, so their absence there is not a gap to report.
         if (auto okt = state.tc ? mcpp::toolchain::triple::parse(state.tc->targetTriple)
                                 : std::optional<mcpp::toolchain::triple::Triple>{};
             state.resolvedTargetSide.compilerRuntime.absent() && state.tc
-            && !(okt && okt->is_openkal())) {
+            && !(okt && okt->loader_supplies_os())) {
             auto tt = mcpp::toolchain::triple::parse(state.tc->targetTriple);
             mcpp::diag::degraded("target/compiler-runtime", std::format(
                 "the toolchain payload carries no compiler runtime for {} "
@@ -1086,9 +1086,12 @@ step9_pin_and_linkage_diagnostics(PrepareState& state) {
             auto tt = mcpp::toolchain::triple::parse(state.resolvedTargetCanonical);
             return tt && tt->pin_is_capability();
         }();
+        // AND NOT WHEN THE PIN IS THE PLATFORM'S (SPEC-013 §4.5): the platform
+        // is what supplies the system here, and its toolchain is part of that
+        // statement, not a row's guess made before the graph was known.
         if (!state.pinReplacedDefault.empty()
             && state.resolvedTargetSide.system_from_graph()
-            && !pinIsCapability) {
+            && !pinIsCapability && !state.platformToolchainPin) {
             mcpp::diag::warning("toolchain", std::format(
                 "this project's target side comes from its dependency graph, so "
                 "{} would have served {}.\n"
@@ -1202,9 +1205,9 @@ step9_same_os_check_and_report(PrepareState& state) {
                     "same-OS check: '{}'(os={}) vs '{}'(os={})",
                     reportedTargetName, want ? want->os : "<unparsed>",
                     state.resolvedTargetSide.llvmTriple, got ? got->os : "<unparsed>"));
-            // An ok image is compiled for no operating system by design
-            // (`<arch>-unknown-none-elf`): the loader is its environment.
-            const bool okImage = want && got && want->is_openkal() && got->is_freestanding();
+            // A program its loader runs is compiled for no operating system
+            // by design (`<arch>-unknown-none-elf`): the loader is its environment.
+            const bool okImage = want && got && want->loader_supplies_os() && got->is_freestanding();
             if (want && got && !want->os.empty() && !got->os.empty()
                 && want->os != got->os && !okImage) {
                 refusal::record(refusal::Code::OsMismatch);
@@ -1221,6 +1224,22 @@ step9_same_os_check_and_report(PrepareState& state) {
                     reportedTargetName, state.resolvedTargetSide.llvmTriple,
                     reportedTargetName, reportedTargetName));
             }
+        }
+        // A layer whose package the platform added is the platform's in the
+        // report (SPEC-013 §9), whatever else the graph holds.
+        if (state.platform.active) {
+            auto injected = [&](std::string_view impl) {
+                const auto name = impl.substr(0, impl.find('@'));
+                for (auto const& q : state.platformInjected) {
+                    const std::string_view qs = q;
+                    const auto shortName = qs.substr(qs.find('.') == std::string_view::npos ? 0 : qs.find('.') + 1);
+                    if (name == qs || name == shortName) return true;
+                }
+                return false;
+            };
+            for (auto* l : { &state.resolvedTargetSide.compilerRuntime, &state.resolvedTargetSide.kernelAbi,
+                             &state.resolvedTargetSide.cAbi, &state.resolvedTargetSide.cxx })
+                if (l->fromGraph() && injected(l->impl)) l->byPlatform = true;
         }
         mcpp::ui::info("Target", tsd::format_report(
             state.resolvedTargetSide, reportedTargetName, mcpp::log::is_verbose()));
@@ -1724,6 +1743,7 @@ static std::expected<void, std::string> step9_root_build_program(PrepareState& s
         // The program, as the build programs' graph compiled it (mcpp#797).
         if (auto program = build_program_binary(state, 0); program) {
             bpEnv.programBinary   = program->path;
+            bpEnv.programRunner   = program->runner;
             bpEnv.programIdentity = program->identity;
             bpEnv.programCompile  = program->compile;
         } else if (!state.overrides.plan_only) {
@@ -2121,6 +2141,7 @@ static std::expected<void, std::string> step9_member_build_programs(PrepareState
         // The program, as the build programs' graph compiled it (mcpp#797).
         if (auto program = build_program_binary(state, i); program) {
             bpEnv.programBinary   = program->path;
+            bpEnv.programRunner   = program->runner;
             bpEnv.programIdentity = program->identity;
             bpEnv.programCompile  = program->compile;
         } else {
@@ -2201,6 +2222,10 @@ static std::expected<void, std::string> step9_member_build_programs(PrepareState
             who  = pkg.manifest.package.name;
         }
         if (bc.runExclusive && !exclusiveBefore) rootBc.runExclusive = true;
+        // The platform's fields the member's program stated, as a dependency's
+        // program's are (SPEC-013 §4.1).
+        merge_program_platform(state, std::exchange(bc.programPlatform, {}),
+                               pkg.manifest.package.name);
     }
     if (auto err = state.checkVersionFloors(); err) return std::unexpected(*err);
     // What the programs published (an include directory, an interface

@@ -28,12 +28,53 @@ import mcpp.wire;
 import mcpp.home;                 // --list-formats plans outside the project
 import mcpp.pack.stage_tree;       // the built-in formats
 import mcpp.toolchain.fingerprint;  // hash_string
+import mcpp.toolchain.platform;     // host_arch: the static row of `--linkage static`
+import mcpp.pack.compress;          // --compress
+import mcpp.toolchain.triple;       // which --target values are images' rows
+import mcpp.pack.distribution;      // --merge
+import mcpplibs.os.platform;
 
 namespace mcpp::cli {
 
 // `mcpp emit xpkg ...` — only one subcommand defined, so the action sits
 // directly on the `emit xpkg` nested subcommand and receives its ParsedArgs.
 export int cmd_emit_xpkg(const mcpplibs::cmdline::ParsedArgs& parsed) {
+    // `--package`: the distribution description of packages `mcpp pack` wrote
+    // (SPEC-014 §8), read from their mcpp-package.json.
+    if (parsed.option("package")) {
+        namespace d = mcpp::pack::distribution;
+        std::vector<d::Asset> assets;
+        std::error_code ec;
+        auto made = d::work_directory("emit");
+        if (!made) { mcpp::ui::error(made.error()); return 1; }
+        const auto work = *made;
+        for (auto const& p : parsed.option("package")->get().values) {
+            const std::filesystem::path file{p};
+            // An entry names a published file, which a directory is not.
+            if (std::filesystem::is_directory(file, ec)) {
+                mcpp::ui::error(std::format("--package {} is a directory; an index entry names the "
+                                            "archive that is published (--pkg-format zip | tar)", p));
+                std::filesystem::remove_all(work, ec);
+                return 2;
+            }
+            auto root = d::unpack(file, work / std::to_string(assets.size()));
+            if (!root) { mcpp::ui::error(root.error()); std::filesystem::remove_all(work, ec); return 2; }
+            auto pkg = d::read(*root);
+            if (!pkg) { mcpp::ui::error(pkg.error()); std::filesystem::remove_all(work, ec); return 2; }
+            assets.push_back({ file, std::move(*pkg), d::sha256_file(file), root->filename().string() });
+        }
+        std::filesystem::remove_all(work, ec);
+        auto lua = d::xpkg_descriptor(assets, parsed.value("url").value_or(""));
+        if (!lua) { mcpp::ui::error(lua.error()); return 2; }
+        if (auto out = parsed.value("output")) {
+            std::ofstream os(*out, std::ios::binary | std::ios::trunc);
+            os << *lua;
+            if (!os) { mcpp::ui::error(std::format("cannot write '{}'", *out)); return 1; }
+            return 0;
+        }
+        std::print("{}", *lua);
+        return 0;
+    }
     return mcpp::publish::emit_xpkg_to(
         parsed.option_or_empty("version").value(),
         std::filesystem::path{parsed.option_or_empty("output").value()},
@@ -175,6 +216,27 @@ export int cmd_place_dlls(const mcpplibs::cmdline::ParsedArgs& parsed) {
 
 namespace {
 
+// THE PACKAGE FORMAT IS `--pkg-format`. `--format` names the output encoding
+// of a reporting command everywhere else in mcpp (`self env --format json`),
+// and `mcpp pack`'s machine output is `--message-format`; pack's own
+// `--format` is accepted as the earlier spelling and says so.
+std::optional<std::string> pack_format_option(const mcpplibs::cmdline::ParsedArgs& parsed) {
+    auto pkg = parsed.value("pkg-format");
+    auto old = parsed.value("format");
+    // Said once per command, however often the value is read.
+    static bool warned = false;
+    if (old && !std::exchange(warned, true)) {
+        if (pkg && *pkg != *old) {
+            mcpp::ui::warning(std::format(
+                "--format '{}' and --pkg-format '{}' disagree; --pkg-format is used", *old, *pkg));
+        } else if (!pkg) {
+            mcpp::ui::warning("`mcpp pack --format` is the earlier spelling of --pkg-format, "
+                              "the package format; --format names an output encoding elsewhere");
+        }
+    }
+    return pkg ? pkg : old;
+}
+
 int cmd_pack_body(const mcpplibs::cmdline::ParsedArgs& parsed,
                   mcpp::pack::PackOutcome* report,
                   mcpp::pack::LibraryPackReport* libraryReport,
@@ -307,18 +369,22 @@ export int cmd_pack(const mcpplibs::cmdline::ParsedArgs& parsed) {
         std::error_code ec;
         nlohmann::json t = nlohmann::json::array();
         for (auto const& x : targets) t.push_back(x);
+        const bool dir = std::filesystem::is_directory(p, ec);
         return nlohmann::json{
             {"path", std::filesystem::absolute(p, ec).lexically_normal().string()},
-            {"type", std::filesystem::is_directory(p, ec) ? "directory" : "file"},
+            {"type", dir ? "directory" : "file"},
             {"format", format},
             {"targets", std::move(t)},
+            // SPEC-014 §9: the digest of a file, which a release publishes.
+            {"sha256", dir ? nlohmann::json(nullptr)
+                           : nlohmann::json(mcpp::pack::distribution::sha256_file(p))},
         };
     };
     nlohmann::json artifacts = nlohmann::json::array();
     nlohmann::json stage = nullptr;
     nlohmann::json stages = nullptr;
     if (libraryRoute) {
-        const auto fmt = parsed.value("format").value_or("tar");
+        const auto fmt = pack_format_option(parsed).value_or("tar");
         artifacts.push_back(artifact_json(library.artifact, fmt, library.targets));
     } else if (outcome.members.size() > 1) {
         // Several members (member selection design 2026-09-30, K1). Fields are
@@ -352,6 +418,16 @@ export int cmd_pack(const mcpplibs::cmdline::ParsedArgs& parsed) {
     }
     env.data = nlohmann::json{{"artifacts", std::move(artifacts)}, {"stage", std::move(stage)}};
     if (!stages.is_null()) env.data["stages"] = std::move(stages);
+    // The three axes and the legs the package was made with (SPEC-014 §9).
+    if (!libraryRoute) {
+        auto const& first = outcome.members.empty() ? mcpp::pack::PackOutcome::Member{}
+                                                    : outcome.members.front();
+        env.data["linkage"]   = outcome.linkage.empty() ? first.linkage : outcome.linkage;
+        env.data["mode"]      = outcome.mode.empty() ? first.mode : outcome.mode;
+        env.data["pkgFormat"] = outcome.format;
+        env.data["legs"]      = outcome.targets;
+        env.data["systems"]   = outcome.systems;
+    }
     mcpp::wire::emit(env);
     return 0;
 }
@@ -506,19 +582,187 @@ int cmd_pack_body(const mcpplibs::cmdline::ParsedArgs& parsed,
     // exists to remove. The refusal moves to `build_and_pack`, after build
     // programs have declared what they provide and before anything is
     // compiled, where it can name what IS available instead of a fixed list.
-    if (auto v = parsed.value("format")) {
-        if (*v == "tar")      opts.format = mcpp::pack::Format::Tar;
-        else if (*v == "dir") opts.format = mcpp::pack::Format::Dir;
-        else if (v->empty()) {
-            mcpp::ui::error("--format needs a value: tar | dir | a format the "
-                            "resolved graph provides");
-            return 2;
-        } else {
+    // THE PROJECT'S DEFAULTS OF THE THREE AXES (`[pack]`, SPEC-014 §1), read
+    // from the package this command packs; a flag states over each.
+    mcpp::manifest::PackConfig packCfg;
+    std::string projectTarget;   // `[build] target`: the project's own default triple
+    if (auto root = mcpp::project::find_manifest_root(std::filesystem::current_path()))
+        if (auto eff = mcpp::project::load_effective_manifest(*root)) {
+            packCfg = eff->manifest.packConfig;
+            projectTarget = eff->manifest.buildConfig.target;
+        }
+    if (parsed.option("merge")) {
+        std::vector<std::string> inputs;
+        for (auto const& v : parsed.option("merge")->get().values) {
+            std::size_t at = 0;
+            while (at <= v.size()) {
+                auto comma = v.find(',', at);
+                if (comma == std::string::npos) comma = v.size();
+                if (comma > at) inputs.push_back(v.substr(at, comma - at));
+                at = comma + 1;
+            }
+        }
+        mcpp::pack::distribution::MergeRequest req;
+        for (auto const& i : inputs) req.inputs.emplace_back(i);
+        if (auto v = parsed.value("output")) req.output = *v;
+        if (auto f = pack_format_option(parsed)) req.format = *f;
+        else if (!packCfg.format.empty()) req.format = packCfg.format;
+        // Only the flag's compression is the command's (a project's `[pack]
+        // compress` describes that project's packs, not a merge of packages);
+        // `merge` decides the container and refuses a compression that does
+        // not fit it.
+        if (auto text = parsed.value("compress")) {
+            auto c = mcpp::pack::compress::parse(*text);
+            if (!c) { mcpp::ui::error(std::format("--compress: {}", c.error())); return 2; }
+            req.compression = *c;
+        }
+        auto merged = mcpp::pack::distribution::merge(req);
+        if (!merged) { mcpp::ui::error(merged.error()); return 1; }
+        mcpp::ui::status("Packed", merged->string());
+        if (report) {
+            report->rc = 0;
+            report->artifacts.push_back(*merged);
+            std::error_code mec;
+            const auto name = merged->filename().string();
+            report->format = std::filesystem::is_directory(*merged, mec) ? std::string("dir")
+                           : name.ends_with(".zip") ? std::string("zip") : std::string("tar");
+            // What the merged package says of itself.
+            if (auto work = mcpp::pack::distribution::work_directory("merged")) {
+                if (auto root = mcpp::pack::distribution::unpack(*merged, *work / "tree"))
+                    if (auto pkg = mcpp::pack::distribution::read(*root)) {
+                        report->targets = pkg->legs;
+                        report->systems = pkg->systems;
+                        report->linkage = pkg->linkage;
+                        report->mode    = pkg->mode;
+                    }
+                std::filesystem::remove_all(*work, mec);
+            }
+        }
+        return 0;
+    }
+
+    std::string formatText;
+    if (auto v = pack_format_option(parsed)) formatText = *v;
+    else formatText = packCfg.format;
+    if (auto v = pack_format_option(parsed); v && v->empty()) {
+        mcpp::ui::error("--pkg-format needs a value: tar | zip | dir | single-file | a format "
+                        "the resolved graph provides");
+        return 2;
+    }
+    if (!formatText.empty()) {
+        opts.formatStated = true;
+        if (formatText == "tar")              opts.format = mcpp::pack::Format::Tar;
+        else if (formatText == "dir")         opts.format = mcpp::pack::Format::Dir;
+        else if (formatText == "zip")         opts.format = mcpp::pack::Format::Zip;
+        else if (formatText == "single-file") opts.format = mcpp::pack::Format::SingleFile;
+        else {
             opts.format     = mcpp::pack::Format::Dispatched;
-            opts.formatName = *v;
+            opts.formatName = formatText;
         }
     }
     if (auto v = parsed.value("output")) opts.output = outputFromUser ? outputFromUser->string() : *v;
+
+    // ─── Linkage, compression, universal, systems, signer ────────────
+    {
+        std::string linkage = parsed.value("linkage").value_or(packCfg.linkage);
+        if (!linkage.empty()) {
+            if (linkage == "static")      opts.linkage = mcpp::pack::Linkage::Static;
+            else if (linkage == "shared") opts.linkage = mcpp::pack::Linkage::Shared;
+            else {
+                mcpp::ui::error(std::format("invalid --linkage '{}'; expected: static | shared",
+                                            linkage));
+                return 2;
+            }
+        }
+        // `--mode static` IS `--linkage static --mode self-contained` (SPEC-014
+        // §1): the program carries its libraries, and the machine provides
+        // nothing.
+        if (opts.mode == mcpp::pack::Mode::Static) {
+            if (opts.linkage == mcpp::pack::Linkage::Shared) {
+                mcpp::ui::error("--mode static is --linkage static --mode self-contained; "
+                                "--linkage shared contradicts it.\n"
+                                "  use: --linkage shared --mode self-contained");
+                return 2;
+            }
+            opts.linkage = mcpp::pack::Linkage::Static;
+        }
+        // `--compress` states the container's compression; `[pack] compress`
+        // is the project's default, which a container it does not fit (a
+        // directory, a zip given zstd, a single file given xz) leaves aside.
+        const auto compressFlag = parsed.value("compress");
+        std::string compressText = compressFlag.value_or(packCfg.compress);
+        if (!compressText.empty()) {
+            auto c = mcpp::pack::compress::parse(compressText);
+            if (!c) {
+                mcpp::ui::error(std::format("{}: {}", compressFlag ? "--compress" : "[pack] compress",
+                                            c.error()));
+                return 2;
+            }
+            opts.compression = *c;
+            opts.compressionFromFlag = compressFlag.has_value();
+        }
+        using mcpp::pack::compress::Algorithm;
+        const auto alg = opts.compression.algorithm;
+        const bool fits =
+            !(opts.format == mcpp::pack::Format::Dir || opts.format == mcpp::pack::Format::Dispatched)
+            && !(opts.format == mcpp::pack::Format::Zip && (alg == Algorithm::Zstd || alg == Algorithm::Xz))
+            && !(opts.format == mcpp::pack::Format::SingleFile && (alg == Algorithm::Gzip || alg == Algorithm::Xz));
+        if (opts.compression.stated && !compressFlag && !fits) opts.compression = {};
+        if (opts.compression.stated) {
+            if (opts.format == mcpp::pack::Format::Dir || opts.format == mcpp::pack::Format::Dispatched) {
+                mcpp::ui::error(std::format(
+                    "--compress {} compresses a container, and --pkg-format {} writes none.\n"
+                    "  use: --pkg-format tar | zip | single-file",
+                    mcpp::pack::compress::name(alg),
+                    opts.format == mcpp::pack::Format::Dir ? std::string("dir") : opts.formatName));
+                return 2;
+            }
+            if (opts.format == mcpp::pack::Format::Zip && (alg == Algorithm::Zstd || alg == Algorithm::Xz)) {
+                mcpp::ui::error(std::format(
+                    "a zip's members are deflated (gzip) or stored (none); --compress {} is a "
+                    "tar's.\n  use: --pkg-format tar --compress {}, or --compress gzip | none",
+                    mcpp::pack::compress::name(alg), mcpp::pack::compress::name(alg)));
+                return 2;
+            }
+            if (opts.format == mcpp::pack::Format::SingleFile
+                && (alg == Algorithm::Gzip || alg == Algorithm::Xz)) {
+                mcpp::ui::error(std::format(
+                    "a single file's payload is zstd (or none): its launcher decompresses one "
+                    "codec.\n  use: --compress zstd[:<level>] | none"));
+                return 2;
+            }
+        } else if (opts.format == mcpp::pack::Format::SingleFile) {
+            opts.compression.algorithm = Algorithm::Zstd;
+        }
+        if (parsed.is_flag_set("no-universal")) opts.universal = false;
+        else opts.universal = packCfg.universal;
+        if (auto v = parsed.value("systems")) {
+            std::size_t at = 0;
+            while (at <= v->size()) {
+                auto comma = v->find(',', at);
+                if (comma == std::string::npos) comma = v->size();
+                auto word = v->substr(at, comma - at);
+                if (!word.empty()) {
+                    if (word != "linux" && word != "macos" && word != "windows") {
+                        mcpp::ui::error(std::format(
+                            "--systems names '{}'; the systems are linux, macos and windows", word));
+                        return 2;
+                    }
+                    if (std::ranges::find(opts.systems, word) == opts.systems.end())
+                        opts.systems.push_back(word);
+                }
+                at = comma + 1;
+            }
+        }
+        opts.sign = packCfg.sign;
+        // A single file carries what it runs: the machine provides nothing.
+        if (opts.format == mcpp::pack::Format::SingleFile && opts.mode == mcpp::pack::Mode::None) {
+            mcpp::ui::error("--pkg-format single-file carries what the program runs, and --mode "
+                            "system leaves it to the machine.\n"
+                            "  use: --mode vendored | self-contained | static");
+            return 2;
+        }
+    }
 
     // `value()`, not `option_or_empty()`, for `profile` — and NOT for
     // anything whose name a positional shares. `ParsedArgs::value()` falls back
@@ -543,7 +787,30 @@ int cmd_pack_body(const mcpplibs::cmdline::ParsedArgs& parsed,
     // form is not a shared object.
     std::vector<std::string> triples;
     if (auto o = parsed.option("target")) triples = o->get().values;
+    // `--linkage static` OF A LINUX PROGRAM IS THE MUSL ROW (SPEC-014 §1): a
+    // program with no shared library at all, the C library's included, which
+    // is what `--mode static` has always built. On another system the
+    // libraries of the graph are linked in and the system's stay its own.
+    if (opts.linkage == mcpp::pack::Linkage::Static) {
+        // This machine's row only when the project names no target of its own.
+        if (triples.empty() && projectTarget.empty()) {
+            if constexpr (mcpplibs::os::is_linux)
+                triples.push_back(std::format("{}-linux-musl", mcpp::toolchain::platform::host_arch));
+        } else {
+            for (auto& t : triples)
+                if (auto at = t.find("-linux-gnu"); at != std::string::npos)
+                    t.replace(at, 10, "-linux-musl");
+        }
+    }
     if (!triples.empty()) opts.targetTriple = triples.back();
+    // A program with no shared library is packed whole whatever the mode
+    // asked: there is nothing beside it to vendor, and nothing for the machine
+    // to provide.
+    if (opts.linkage == mcpp::pack::Linkage::Static
+        && opts.targetTriple.find("-linux-musl") != std::string::npos) {
+        opts.mode = mcpp::pack::Mode::Static;
+        modeFromUser = true;
+    }
 
     // ─── Several members ─────────────────────────────────────────────
     //
@@ -604,12 +871,12 @@ int cmd_pack_body(const mcpplibs::cmdline::ParsedArgs& parsed,
         // a library package while the user asked for an installer.
         if (opts.format == mcpp::pack::Format::Dispatched) {
             mcpp::ui::error(std::format(
-                "--format {} is a distributable produced from a program's staged "
+                "--pkg-format {} is a distributable produced from a program's staged "
                 "bundle, and '{}' is a library target.\n"
                 "  A library package ships an interface plus prebuilt binaries "
                 "per triple; there is no\n"
                 "  single staged tree to hand a distribution format.\n"
-                "  use: --format tar | dir, or name a program target",
+                "  use: --pkg-format tar | dir, or name a program target",
                 opts.formatName, route->targetName));
             return 2;
         }
@@ -621,6 +888,19 @@ int cmd_pack_body(const mcpplibs::cmdline::ParsedArgs& parsed,
         if (libraryRoute) *libraryRoute = true;
         return mcpp::pack::build_and_pack_library(route->targetName, triples, opts,
                                                   libraryReport);
+    }
+    // SEVERAL IMAGES' TARGETS ARE ONE UNIVERSAL PACKAGE'S LEGS (SPEC-014
+    // §1.4): the pack builds the first and the others as its legs; whether the
+    // platform packs them into one package is decided once it is known.
+    if (triples.size() > 1 && std::ranges::all_of(triples, [](std::string const& t) {
+            auto p = mcpp::toolchain::triple::parse(t);
+            return p && p->loader_supplies_os();
+        })) {
+        opts.legTargets = triples;
+        opts.targetTriple = triples.front();
+        auto out = mcpp::pack::build_and_pack(std::move(opts), modeFromUser, route->targetName);
+        if (report) *report = out;
+        return out.rc;
     }
     if (triples.size() > 1) {
         // #630 A9: THE ROUTE IS CHOSEN BY THE ARTIFACT'S FORM, NOT BY THE

@@ -398,6 +398,14 @@ void merge_layer_root_position(mcpp::manifest::Manifest& member,
         if (to.runner.empty())     to.runner = from.runner;
         for (auto const& [n, argv] : from.namedRunners) to.namedRunners.try_emplace(n, argv);
     }
+
+    // The platform part of `[workspace.target.<sel>]` (SPEC-013 §13): the
+    // workspace's tables merge first, so of two tables of one selector the
+    // member's wins field by field; between selectors the more specific wins,
+    // as for the other keys above. `[host]` is not a workspace table.
+    member.platformOverrides.insert(member.platformOverrides.begin(),
+                                    layer.platformOverrides.begin(),
+                                    layer.platformOverrides.end());
 }
 
 }  // namespace detail
@@ -1073,6 +1081,14 @@ export std::string root_position_key(
         for (auto const& [name, argv] : e.namedRunners)
             list("target." + triple + ".runners." + name, argv);
     }
+    // The platform rows (SPEC-013 §4.5). A row that asks which platform is
+    // selected cannot be decided before the platform is, so it always counts.
+    for (auto const& o : m.platformOverrides) {
+        if (applies && !applies(o.selector) && o.selector.find("platform") == std::string::npos)
+            continue;
+        field("platform", mcpp::manifest::platform::identity(o));
+    }
+    if (m.hostPlatform.platformSet) field("host.platform", mcpp::manifest::platform::identity(m.hostPlatform));
     field("standard", m.package.standard);
     auto const& b = m.buildConfig;
     auto dialect = b.dialectCxxflags;
@@ -1147,6 +1163,8 @@ virtual_workspace_root(const mcpp::manifest::Manifest& workspace,
     v.cppStandard = first.cppStandard;
     v.toolchain = first.toolchain;
     v.targetOverrides = first.targetOverrides;
+    v.platformOverrides = first.platformOverrides;
+    v.hostPlatform = first.hostPlatform;
     v.indices = first.indices;
     v.profiles = first.profiles;
     v.capabilityPins = first.capabilityPins;

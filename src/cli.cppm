@@ -208,6 +208,24 @@ int enter_system_home(int argc, char** argv) {
     return 0;
 }
 
+// `mcpp self env` with `--target` or `--host` reports one configuration
+// (SPEC-013 §9), prepared by the build commands' module.
+int cmd_env_any(const mcpplibs::cmdline::ParsedArgs& p) {
+    if (p.value("target") || p.is_flag_set("host")) return cmd_env_configuration(p);
+    return cmd_env(p);
+}
+
+// `mcpp toolchain install --target <t>` with no compiler named installs the
+// target's whole configuration once its toolchain is in (SPEC-013 §7).
+int cmd_toolchain_any(const mcpplibs::cmdline::ParsedArgs& p) {
+    const int rc = cmd_toolchain(p);
+    if (rc != 0 || p.subcommand_name() != "install" || !p.subcommand_matches) return rc;
+    auto const& sub = *p.subcommand_matches;
+    auto target = sub.value("target");
+    if (!target || target->empty() || !sub.positional(0).empty()) return rc;
+    return cmd_install_configuration(*target);
+}
+
 int run(int argc, char** argv) {
     namespace cl = mcpplibs::cmdline;
     ReportUnnarrowablePaths reportUnnarrowable_;
@@ -382,6 +400,19 @@ int run(int argc, char** argv) {
             if (i + 1 < argc) mcpp::invocation::set("MCPP_SYSROOT", argv[++i]);
         }
         else if (a.starts_with("--sysroot=")) mcpp::invocation::set("MCPP_SYSROOT", std::string(a.substr(10)));
+        // --platform and --host-platform are `MCPP_PLATFORM` and
+        // `MCPP_HOST_PLATFORM` for this invocation (SPEC-013 §3, §6.1), for
+        // the reason --sysroot is: the selection is made deep in prepare, and
+        // the fast paths read the variables to know the configuration moved.
+        else if (a == "--platform") {
+            if (i + 1 < argc) mcpp::invocation::set("MCPP_PLATFORM", argv[++i]);
+        }
+        else if (a.starts_with("--platform=")) mcpp::invocation::set("MCPP_PLATFORM", std::string(a.substr(11)));
+        else if (a == "--host-platform") {
+            if (i + 1 < argc) mcpp::invocation::set("MCPP_HOST_PLATFORM", argv[++i]);
+        }
+        else if (a.starts_with("--host-platform="))
+            mcpp::invocation::set("MCPP_HOST_PLATFORM", std::string(a.substr(16)));
         else if (a.starts_with("-j") && a.size() > 2)
             mcpp::invocation::set("MCPP_JOBS", std::string(a.substr(2)));
         // --play-game rides the same channel: its value is optional
@@ -583,6 +614,10 @@ int run(int argc, char** argv) {
                 .help("Build with this toolchain for one build, e.g. llvm@22.1.8"))
             .option(cl::Option("sysroot").takes_value().value_name("SYSROOT")
                 .help("The target's base for this invocation (= MCPP_SYSROOT): a package, glibc@system, path:<dir>, none"))
+            .option(cl::Option("platform").takes_value().value_name("SPEC")
+                .help("The target's platform for this invocation (= MCPP_PLATFORM): <name>@<version>, path:<dir>, none"))
+            .option(cl::Option("host-platform").takes_value().value_name("SPEC")
+                .help("The host graph's platform for this invocation (= MCPP_HOST_PLATFORM)"))
             .option(cl::Option("no-cache")
                 .help("Deprecated alias for --cache=off (also clears the build dir)"))
             .option(cl::Option("target").takes_value().help(
@@ -655,6 +690,10 @@ int run(int argc, char** argv) {
                 .help("Build with this toolchain for one invocation, e.g. llvm@22.1.8"))
             .option(cl::Option("sysroot").takes_value().value_name("SYSROOT")
                 .help("The target's base for this invocation (= MCPP_SYSROOT): a package, glibc@system, path:<dir>, none"))
+            .option(cl::Option("platform").takes_value().value_name("SPEC")
+                .help("The target's platform for this invocation (= MCPP_PLATFORM): <name>@<version>, path:<dir>, none"))
+            .option(cl::Option("host-platform").takes_value().value_name("SPEC")
+                .help("The host graph's platform for this invocation (= MCPP_HOST_PLATFORM)"))
             .option(cl::Option("cache").takes_value().value_name("MODE")
                 .help("Global dependency cache: global (default) | local | off"))
             .option(cl::Option("no-cache")
@@ -706,10 +745,12 @@ int run(int argc, char** argv) {
             // given a run-specific spelling, because it is the same request:
             // "produce this distributable", asked from a command that also
             // executes it afterward.
-            .option(cl::Option("format").takes_value()
-                .help("Run the distributable a `--format <name>` pack would produce "
-                      "(same values as `mcpp pack --format`); refused together with "
+            .option(cl::Option("pkg-format").takes_value().value_name("FORMAT")
+                .help("Run the distributable a `--pkg-format <name>` pack would produce "
+                      "(same values as `mcpp pack --pkg-format`); refused together with "
                       "--no-runner"))
+            .option(cl::Option("format").takes_value()
+                .help("Earlier spelling of --pkg-format"))
             .option(cl::Option("play-game")
                 .help("Play a game in the status row while it builds: --play-game=snake|stack|runner, or one at random"))
             .option(cl::Option("print-launch")
@@ -755,6 +796,10 @@ int run(int argc, char** argv) {
                 .help("Build the tests with this toolchain for one invocation, e.g. llvm@22.1.8"))
             .option(cl::Option("sysroot").takes_value().value_name("SYSROOT")
                 .help("The target's base for this invocation (= MCPP_SYSROOT): a package, glibc@system, path:<dir>, none"))
+            .option(cl::Option("platform").takes_value().value_name("SPEC")
+                .help("The target's platform for this invocation (= MCPP_PLATFORM): <name>@<version>, path:<dir>, none"))
+            .option(cl::Option("host-platform").takes_value().value_name("SPEC")
+                .help("The host graph's platform for this invocation (= MCPP_HOST_PLATFORM)"))
             .option(cl::Option("cache").takes_value().value_name("MODE")
                 .help("Global dependency cache: global (default) | local | off"))
             .option(cl::Option("no-cache")
@@ -790,6 +835,10 @@ int run(int argc, char** argv) {
                 .help("Ask about this toolchain, e.g. llvm@22.1.8"))
             .option(cl::Option("sysroot").takes_value().value_name("SYSROOT")
                 .help("The target's base for this invocation (= MCPP_SYSROOT): a package, glibc@system, path:<dir>, none"))
+            .option(cl::Option("platform").takes_value().value_name("SPEC")
+                .help("The target's platform for this invocation (= MCPP_PLATFORM): <name>@<version>, path:<dir>, none"))
+            .option(cl::Option("host-platform").takes_value().value_name("SPEC")
+                .help("The host graph's platform for this invocation (= MCPP_HOST_PLATFORM)"))
             .option(cl::Option("features").takes_value().value_name("LIST")
                 .help("Resolve with these features, as `build --features` does (root features and <dependency>/<feature>)"))
             .option(cl::Option("format").takes_value().value_name("json")
@@ -848,17 +897,36 @@ int run(int argc, char** argv) {
             // package. Omit it and mcpp picks the only packable target.
             .arg(cl::Arg("target").help("Target name from [targets.*] (optional)"))
             .option(cl::Option("mode").takes_value()
-                .help("system | vendored (default) | self-contained | static"))
+                .help("What the machine that runs it provides: system | vendored (default) | "
+                      "self-contained | static (= --linkage static --mode self-contained)"))
+            .option(cl::Option("linkage").takes_value().value_name("static|shared")
+                .help("The program's libraries in it (static) or beside it (shared); rebuilds "
+                      "with [build] dependency_linkage (default: as the project builds)"))
             .option(cl::Option("target").takes_value().multiple()
                 .help("Triple, e.g. x86_64-linux-musl (repeatable: one leg per triple)"))
+            .option(cl::Option("no-universal")
+                .help("Pack the selected target alone where its platform packs all its targets "
+                      "into one universal package"))
+            .option(cl::Option("systems").takes_value().value_name("LIST")
+                .help("Self-contained universal package: the systems whose loaders it carries "
+                      "(linux,macos,windows; default: this machine's)"))
+            .option(cl::Option("compress").takes_value().value_name("ALG[:LEVEL]")
+                .help("The container's compression: gzip (tar default) | zstd | xz | none; "
+                      "a zip deflates unless none"))
+            .option(cl::Option("merge").takes_value().multiple().value_name("PACKAGE")
+                .help("Merge packages this command wrote (universal legs, systems) into one; "
+                      "repeatable, nothing is built"))
             // "plus any format the resolved graph provides", because the
             // values are no longer a fixed list. A package declares one with
             // `mcpp::provides_pack_format` and `--format <name>` dispatches to
             // it; an unknown value names what IS available rather than a
             // constant, so the help text does not have to enumerate them.
+            .option(cl::Option("pkg-format").takes_value().value_name("FORMAT")
+                .help("The package format: tar | zip | dir | single-file | any format the "
+                      "resolved graph provides (e.g. appimage, msi, okb); default: zip for a "
+                      "Windows program, tar elsewhere"))
             .option(cl::Option("format").takes_value()
-                .help("tar (default; .zip for a Windows target) | dir | any "
-                      "format the resolved graph provides (e.g. appimage, msi)"))
+                .help("Earlier spelling of --pkg-format"))
             .option(cl::Option("output").short_name('o').takes_value()
                 .help("Override output path; with several members, the directory each archive or tree is written below"))
             // Packaging builds RELEASE by default — the artifact leaves this
@@ -874,6 +942,10 @@ int run(int argc, char** argv) {
                 .help("Build with this toolchain for one invocation, e.g. llvm@22.1.8"))
             .option(cl::Option("sysroot").takes_value().value_name("SYSROOT")
                 .help("The target's base for this invocation (= MCPP_SYSROOT): a package, glibc@system, path:<dir>, none"))
+            .option(cl::Option("platform").takes_value().value_name("SPEC")
+                .help("The target's platform for this invocation (= MCPP_PLATFORM): <name>@<version>, path:<dir>, none"))
+            .option(cl::Option("host-platform").takes_value().value_name("SPEC")
+                .help("The host graph's platform for this invocation (= MCPP_HOST_PLATFORM)"))
             .option(cl::Option("features").takes_value().value_name("LIST")
                 .help("Activate root-package features, and a dependency's as <dependency>/<feature>, for every build pass of the pack (comma-separated)"))
             // `--format` names the PACKAGE format here, so machine output is
@@ -906,7 +978,12 @@ int run(int argc, char** argv) {
                 .option(cl::Option("namespace").takes_value().value_name("NS")
                     .help("Package namespace for the emitted descriptor "
                           "(overrides [package] namespace). Emits both "
-                          "`namespace` and the fully-qualified `name`")))
+                          "`namespace` and the fully-qualified `name`"))
+                .option(cl::Option("package").takes_value().multiple().value_name("ARCHIVE")
+                    .help("Describe packages `mcpp pack` wrote (repeatable): an xim-pkgindex entry "
+                          "of the program, from their mcpp-package.json"))
+                .option(cl::Option("url").takes_value().value_name("PREFIX")
+                    .help("With --package: where the packages are published (<PREFIX>/<file>)")))
             // `sbom` belongs HERE rather than at the top level: `emit`
             // already means "generate a document describing this project" and
             // already carries `-o`. A separate `mcpp sbom` would be a second
@@ -932,6 +1009,10 @@ int run(int argc, char** argv) {
                     .help("Describe the build with this toolchain, e.g. llvm@22.1.8"))
                 .option(cl::Option("sysroot").takes_value().value_name("SYSROOT")
                     .help("The target's base for this invocation (= MCPP_SYSROOT): a package, glibc@system, path:<dir>, none"))
+                .option(cl::Option("platform").takes_value().value_name("SPEC")
+                    .help("The target's platform for this invocation (= MCPP_PLATFORM): <name>@<version>, path:<dir>, none"))
+                .option(cl::Option("host-platform").takes_value().value_name("SPEC")
+                    .help("The host graph's platform for this invocation (= MCPP_HOST_PLATFORM)"))
                 .option(cl::Option("accel").takes_value().value_name("SPEC")
                     .help("Device backends and architectures (same axis as `mcpp build --accel`)"))
                 .option(cl::Option("no-accel")
@@ -1000,7 +1081,9 @@ int run(int argc, char** argv) {
                 .arg(cl::Arg("compiler").help("gcc | llvm | msvc | emsdk | android-ndk (or gcc@16.1.0; legacy aliases accepted)"))
                 .arg(cl::Arg("version").help("e.g. 16.1.0, 15, 15.1"))
                 .option(cl::Option("target").takes_value().help(
-                    "Install the toolchain payload for <triple> (e.g. x86_64-windows-gnu)")))
+                    "Install the toolchain payload for <triple> (e.g. x86_64-windows-gnu)"))
+                .option(cl::Option("platform").takes_value().value_name("SPEC")
+                    .help("With --target: the target's platform for this invocation (= MCPP_PLATFORM)")))
             .subcommand(cl::App("default")
                 .description("Set the default toolchain (and optionally the default target)")
                 // Same dual-form as `install`: `gcc@16.1.0` or `gcc 16.1.0`,
@@ -1021,7 +1104,7 @@ int run(int argc, char** argv) {
                 .arg(cl::Arg("version").help("(optional, alternative to @-form)"))
                 .option(cl::Option("target").takes_value().help(
                     "Remove the payload for <triple> instead of the host one")))
-            .action(wrap_rc(cmd_toolchain)))
+            .action(wrap_rc(cmd_toolchain_any)))
         .subcommand(cl::App("cache")
             .description("Inspect and manage the global build cache")
             .subcommand(cl::App("dir")
@@ -1124,7 +1207,15 @@ int run(int argc, char** argv) {
             .subcommand(cl::App("doctor")
                 .description("Diagnose mcpp environment health"))
             .subcommand(cl::App("env")
-                .description("Print mcpp paths and configuration")
+                .description("Print mcpp paths and configuration; with --target, one configuration: toolchain, platform, tools, runner")
+                .option(cl::Option("target").takes_value().value_name("TRIPLE")
+                    .help("Report this target's configuration (prepared, not built; the project's when run in one)"))
+                .option(cl::Option("host")
+                    .help("Report the host graph's configuration: what build programs and tools are built for"))
+                .option(cl::Option("platform").takes_value().value_name("SPEC")
+                    .help("The target's platform for this invocation (= MCPP_PLATFORM): <name>@<version>, path:<dir>, none"))
+                .option(cl::Option("host-platform").takes_value().value_name("SPEC")
+                    .help("The host graph's platform for this invocation (= MCPP_HOST_PLATFORM)"))
                 .option(cl::Option("format").takes_value().value_name("json")
                     .help("Machine-readable output (enveloped; see docs/50-machine-output.md)")))
             .subcommand(cl::App("config")
@@ -1135,7 +1226,7 @@ int run(int argc, char** argv) {
                 .description("Show mcpp version"))
             .subcommand(cl::App("explain")
                 .description("Show extended description for an error code")
-                .arg(cl::Arg("code").help("Error code such as E0001").required()))
+                .arg(cl::Arg("code").help("Error code such as E0001, or a refusal's reason token such as platform-version-group").required()))
             .subcommand(cl::App("store")
                 .description("Compare this home's payloads with its upstreams")
                 .subcommand(cl::App("dedupe")
@@ -1146,7 +1237,7 @@ int run(int argc, char** argv) {
                     {"store",     cmd_self_store},
                     {"init",      cmd_self_init},
                     {"doctor",    cmd_doctor},
-                    {"env",       cmd_env},
+                    {"env",       cmd_env_any},
                     {"config",    cmd_self_config},
                     {"version",   cmd_self_version},
                     {"explain",   cmd_explain_action},
@@ -1158,7 +1249,7 @@ int run(int argc, char** argv) {
         // `mcpp self explain E0001`.
         .subcommand(cl::App("explain")
             .description("Show extended description for an error code")
-            .arg(cl::Arg("code").help("Error code such as E0001").required())
+            .arg(cl::Arg("code").help("Error code such as E0001, or a refusal's reason token such as platform-version-group").required())
             .action(wrap_rc(cmd_explain_action)))
 
         // ─── bareword `version` alias ─────────────────────────────────
@@ -1212,11 +1303,13 @@ int run(int argc, char** argv) {
             .action(wrap_rc([&passthrough](const cl::ParsedArgs& p) {
                 return cmd_link_output(p, std::span<const std::string>(passthrough));
             })))
-        .subcommand(cl::App("okimage-finish")
-            .description("(internal: invoked by ninja for <arch>-openkal) Write an ok image's requirements note and check it with okld, then publish it")
-            .option(cl::Option("okld").takes_value().value_name("PATH").help("the okld program"))
+        .subcommand(cl::App("platform-step")
+            .description("(internal: invoked by ninja for a platform's link) `capture --out F -- argv…` saves a program's output; `seal --steps F -- <linked> <artifact> [needed…]` runs the platform's seal steps, then publishes")
+            .arg(cl::Arg("mode").help("capture | seal"))
+            .option(cl::Option("out").takes_value().value_name("PATH").help("capture: the file the output is saved as"))
+            .option(cl::Option("steps-hex").takes_value().value_name("HEX").help("seal: the steps, one per line, words separated by a tab, hex-encoded (the command is the steps, so a changed step reseals)"))
             .action(wrap_rc([&passthrough](const cl::ParsedArgs& p) {
-                return cmd_okimage_finish(p, std::span<const std::string>(passthrough));
+                return cmd_platform_step(p, std::span<const std::string>(passthrough));
             })))
         .subcommand(cl::App("place-dlls")
             .description("(internal: invoked by ninja) Place beside a Windows program the DLLs it imports from its runtime search directories")
@@ -1687,7 +1780,7 @@ int run(int argc, char** argv) {
                 "update", "search", "publish", "pack", "emit", "xpkg",
                 "toolchain", "cache", "index", "self", "explain",
                 "version", "dyndep", "why", "resolve", "stage", "bmi-equal", "coff-def",
-                "place-dlls", "link-output", "okimage-finish",
+                "place-dlls", "link-output", "platform-step",
                 "bmi-compile", "bmi-supervise", "bmi-await",
             });
             bool ok = false;

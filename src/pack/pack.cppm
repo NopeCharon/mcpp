@@ -47,6 +47,9 @@ import mcpp.pack.relocate;
 import mcpp.pack.stage_tree;
 import mcpp.pack.strip;
 import mcpp.pack.zip;
+import mcpp.pack.compress;
+import mcpp.pack.distribution;
+import mcpp.modgraph.glob;     // [pack] include / exclude
 import mcpplibs.os.platform;
 import mcpp.toolchain.platform;
 import mcpp.invocation;
@@ -61,6 +64,7 @@ import mcpp.toolchain.triple;
 import mcpp.toolchain.base;
 import mcpp.ui;
 import mcpp.runtime.elf;
+import mcpp.platform;
 
 export namespace mcpp::pack {
 
@@ -81,7 +85,28 @@ enum class Mode { None, Static, BundleProject, BundleAll };
 // anyone else's release. dpkg's control fields, AppImage's runtime, WiX's
 // schema and Apple's notarisation each couple an mcpp release to a release mcpp
 // does not control.
-enum class Format { Tar, Dir, Dispatched };
+enum class Format { Tar, Dir, Zip, SingleFile, Dispatched };
+
+// THE LINKAGE AXIS (SPEC-014 §1): a property of the program -- whether the
+// libraries of its graph are in it or beside it -- which a pack states for the
+// build it makes (`--linkage`, `[pack] linkage`). Unstated: as the project
+// builds it.
+enum class Linkage { Unstated, Static, Shared };
+
+// The container an archive format writes, decided once in `make_plan`: a tar
+// (compressed as `Options::compression` says), a zip, or none (a directory, a
+// single file, a dispatched format).
+enum class ArchiveKind { None, Tar, Zip };
+
+// One more architecture of a universal package (SPEC-014 §3): a leg of the
+// platform's targets other than the one the pack built first, built by the
+// pipeline before staging. `artifact` is that leg's program image; the images
+// it names are found beside it, as for the first leg.
+struct LoadedLeg {
+    std::string           triple;   // canonical
+    std::string           arch;     // the directory under `lib/`
+    std::filesystem::path artifact;
+};
 
 // What happens when a FORMAT's dependency closure cannot be resolved on this
 // host, as a function of the format alone — never of the reason (a Mach-O
@@ -105,6 +130,29 @@ ClosureUnavailableOutcome closure_unavailable_outcome(Format format) {
 
 struct Options {
     Mode                            mode         = Mode::BundleProject;
+    // The three axes (SPEC-014 §1) beyond `mode` and `format`: the linkage
+    // the pack builds with, whether the format was stated (a format left to
+    // the target is a zip for a Windows program and a tar elsewhere), and the
+    // container's compression.
+    Linkage                         linkage      = Linkage::Unstated;
+    bool                            formatStated = false;
+    mcpp::pack::compress::Choice    compression;
+    bool                            compressionFromFlag = false;   // --compress, not [pack]
+    // Universal packages (SPEC-014 §3). `universal`: nullopt follows the
+    // platform's `universal`; false packs the selected target alone. When the
+    // pipeline decides a universal package it sets `universalName` (the
+    // platform's name, which names the package instead of a triple) and
+    // `systems` (the systems whose loaders a self-contained package carries,
+    // `<os>`, from `--systems`; empty: this machine's).
+    std::optional<bool>             universal;
+    std::string                     universalName;
+    std::vector<std::string>        systems;
+    // Several `--target` naming a universal platform's targets: the legs, in
+    // place of the platform's whole `targets` (SPEC-014 §1.4).
+    std::vector<std::string>        legTargets;
+    // `[pack] sign`: run on each program, image, library and loader of the
+    // staged tree before the container is written, `{}` the file.
+    std::vector<std::string>        sign;
     // The build stated its target base (design 2026-10-23 §4.11): the base it
     // was built against becomes the C library floor the package states.
     bool                            baseStated   = false;
@@ -229,6 +277,14 @@ struct Plan {
     std::string                          binaryName;        // basename(builtBinary)
     std::filesystem::path                stagingRoot;       // target/dist/<root-dir>/
     std::filesystem::path                archivePath;       // …/<name>.tar.gz | .zip
+    ArchiveKind                          archive = ArchiveKind::None;
+    // The linkage the package's `mcpp-package.json` states: `static`,
+    // `shared`, or `declared` (each library as it declares itself). Set by the
+    // caller from the build.
+    std::string                          linkageName = "declared";
+    // The other legs of a universal package (SPEC-014 §3), set by the caller
+    // after `make_plan` as `extraSharedLegs` is.
+    std::vector<LoadedLeg>               loadedLegs;
     std::string                          packageName;
     std::string                          packageVersion;
     std::string                          triple;            // e.g. "x86_64-linux-musl"
@@ -251,10 +307,13 @@ struct Plan {
     // the file `.js` in the first place (see `artifact_naming`), so it is the
     // one fact this format IS recorded under.
     bool                                 targetIsWasm = false;
-    // Is the artifact an ok image (`<arch>-openkal`, openkal SPEC 12)? From the
-    // triple, as for wasm: the file is an ELF shared object that no loader of
-    // this machine runs, and its closure is the images it names.
-    bool                                 targetIsOkImage = false;
+    // Is the artifact one a loader runs (an ok image, `<arch>-openkal`)? From
+    // the triple, as for wasm: the file is an ELF shared object that no loader
+    // of this machine runs, and its closure is the images it names.
+    bool                                 targetIsLoaded = false;
+    // The target's platform (SPEC-013): the carrier a self-contained pack of
+    // a loaded artifact is built over (§4.7).
+    mcpp::platform::Resolved             platform;
     // #622 A3/A10: is `builtBinary` an `Application` target whose link form
     // on THIS row is a shared object (`*-linux-android`,
     // `toolchain::triple::application_form`)? Read from the CALLER, which
@@ -473,6 +532,24 @@ make_plan(const mcpp::manifest::Manifest& manifest,
 std::expected<ClosureResult, Error>
 run(const Plan& plan, const mcpp::config::GlobalConfig& cfg);
 
+// THE SINGLE FILE (SPEC-014 §5.2), made from the tree `run` staged: for an
+// image, the platform's carrier carrying it (or, when it names shared images,
+// a stored zip of all of them aligned for mapping), one file per system of
+// `Options::systems`; for a native program, the engine's launcher carrying the
+// tree as a zstd frame. Returns the files written.
+std::expected<std::vector<std::filesystem::path>, Error> single_file(const Plan& plan);
+
+// The row a program of `system` (linux | macos | windows) and `arch` is built
+// on -- an image's single file, a universal package's runner -- when this mcpp
+// builds no program for it: a row its table states as planned (`x86_64-macos`)
+// or does not state (`aarch64-windows-gnu`). Empty when it builds one.
+std::string unbuilt_row(std::string_view system, std::string_view arch);
+
+// The tree made a package: signed and described (`mcpp-package.json`). `run`
+// does it before writing a container; a dispatched format whose tree was
+// staged without its closure is finalized by the caller.
+std::expected<void, Error> finalize_staged(const Plan& plan);
+
 // Helpers used by cli.cppm to render mode names + parse `--mode`.
 // Canonical name shown in `--help`/diagnostics (renamed for legibility).
 std::string_view mode_cli_name(Mode m);
@@ -536,9 +613,11 @@ namespace detail {
 // `.zip` whoever built it, and a `.tar.gz` full of DLLs is a package most
 // Windows users cannot open without installing something first.
 std::string default_archive_name(std::string_view name, std::string_view version,
-                                 std::string_view triple, Mode mode, bool pe)
+                                 std::string_view triple, Mode mode, ArchiveKind kind,
+                                 mcpp::pack::compress::Algorithm compression)
 {
-    std::string_view ext = pe ? ".zip" : ".tar.gz";
+    std::string_view ext = kind == ArchiveKind::Zip ? std::string_view(".zip")
+                         : mcpp::pack::compress::tar_extension(compression);
     auto sfx = mode_tarball_suffix(mode);
     if (sfx.empty())
         return std::format("{}-{}-{}{}", name, version, triple, ext);
@@ -552,11 +631,14 @@ std::string default_archive_name(std::string_view name, std::string_view version
 std::string wrapper_dirname_from_archive(const std::filesystem::path& archive) {
     auto name = archive.filename().string();
     for (auto suffix : {std::string_view{".tar.gz"}, std::string_view{".tgz"},
-                        std::string_view{".zip"}}) {
+                        std::string_view{".tar.zst"}, std::string_view{".tar.xz"},
+                        std::string_view{".tar"}, std::string_view{".zip"}}) {
         if (name.ends_with(suffix)) return name.substr(0, name.size() - suffix.size());
     }
-    // No recognised compression suffix — fall back to the bare stem.
-    return archive.stem().string();
+    // No archive's suffix: the name as written (`-o app-0.1.0-openkal` with
+    // `--pkg-format dir` is that directory; a stem would cut at the version's
+    // last dot and write `app-0.1`).
+    return name;
 }
 
 } // namespace detail
@@ -661,7 +743,7 @@ make_plan(const mcpp::manifest::Manifest& manifest,
     if (auto t = mcpp::toolchain::triple::parse(p.triple)) {
         p.targetIsWasm =
             t->object_format() == mcpp::toolchain::triple::ObjectFormat::Wasm;
-        p.targetIsOkImage = t->is_openkal();
+        p.targetIsLoaded = t->loader_supplies_os();
     }
 
     // THE CONTRACT REACHES PACKAGING. Until now it stopped at the compile and
@@ -706,10 +788,37 @@ make_plan(const mcpp::manifest::Manifest& manifest,
     if (opts.carryToolchainRuntime)
         for (auto const& d : opts.toolchainRuntimeDirs) p.searchDirs.push_back(d);
 
+    // THE CONTAINER. A format left unstated follows the artifact -- a zip for
+    // a Windows program, which its users open without installing anything, a
+    // tar elsewhere; `tar` and `zip` stated are what they say (SPEC-014 §1).
+    p.archive = opts.format == Format::Zip ? ArchiveKind::Zip
+              : opts.format != Format::Tar ? ArchiveKind::None
+              : (p.targetIsPe && !opts.formatStated) ? ArchiveKind::Zip
+              : ArchiveKind::Tar;
+    // A zip deflates or stores: a zstd or xz the format left to the artifact
+    // cannot honour is refused when the command stated it, and the project's
+    // default leaves it aside (SPEC-014 §5.1).
+    if (p.archive == ArchiveKind::Zip
+        && (opts.compression.algorithm == mcpp::pack::compress::Algorithm::Zstd
+            || opts.compression.algorithm == mcpp::pack::compress::Algorithm::Xz)) {
+        if (opts.compressionFromFlag)
+            return std::unexpected(Error{std::format(
+                "{} is packed as a zip (a Windows program's archive), whose members are deflated "
+                "or stored; --compress {} is a tar's.\n  use: --pkg-format tar --compress {}, or "
+                "--compress gzip | none", p.binaryName,
+                mcpp::pack::compress::name(opts.compression.algorithm),
+                mcpp::pack::compress::name(opts.compression.algorithm))});
+        p.opts.compression = {};
+    }
+    // A universal package is named after its platform, not a triple: it is
+    // the same package on every system and architecture of the platform.
+    const std::string nameTriple = opts.universalName.empty() ? p.triple : opts.universalName;
     auto distDir = projectRoot / "target" / "dist";
     if (opts.output.empty()) {
         p.archivePath = distDir / detail::default_archive_name(
-            p.packageName, p.packageVersion, p.triple, opts.mode, p.targetIsPe);
+            p.packageName, p.packageVersion, nameTriple, opts.mode,
+            p.archive == ArchiveKind::None ? ArchiveKind::Tar : p.archive,
+            opts.compression.algorithm);
     } else if (!opts.output.has_parent_path()) {
         // `-o name.tar.gz` (bare filename) → place in target/dist/.
         // `-o ./name.tar.gz` or `-o sub/name.tar.gz` → use as-is.
@@ -723,6 +832,10 @@ make_plan(const mcpp::manifest::Manifest& manifest,
     // matches what GUI extractors create on click and what `tar -xzf`
     // produces on the CLI.
     p.stagingRoot = distDir / detail::wrapper_dirname_from_archive(p.archivePath);
+    // A single file takes the tree's name in `target/dist`; its tree is
+    // staged outside it.
+    if (opts.format == Format::SingleFile)
+        p.stagingRoot = projectRoot / "target" / "single-file" / "stage" / p.stagingRoot.filename();
 
     p.includeGlobs    = manifest.packConfig.include;
     p.excludeGlobs    = manifest.packConfig.exclude;
@@ -1213,9 +1326,12 @@ void copy_if_exists(const std::filesystem::path& src,
 // every one of them, so a missing file is an error naming it rather than a
 // bundle that silently lacks it.
 std::expected<void, Error>
-stage_runtime_files(const Plan& plan, const std::filesystem::path& stagedExeDir)
+stage_runtime_files(const Plan& plan, const std::filesystem::path& stagedExeDir,
+                    const std::filesystem::path& builtExeDir = {})
 {
-    const auto builtDir = plan.builtBinary.parent_path();
+    // The leg's own build directory: another architecture's leg deployed its
+    // own files beside its own artifact.
+    const auto builtDir = builtExeDir.empty() ? plan.builtBinary.parent_path() : builtExeDir;
     for (auto const& rel : plan.opts.runtimeFiles) {
         const auto src = builtDir / rel;
         const auto dst = stagedExeDir / rel;
@@ -1395,27 +1511,152 @@ stage_closure(const Plan& plan, const ClosureRead& read,
 
 std::expected<void, Error>
 make_tarball(const std::filesystem::path& stagingRoot,
-             const std::filesystem::path& tarballPath)
+             const std::filesystem::path& tarballPath,
+             mcpp::pack::compress::Choice compression = {})
 {
-    std::error_code ec;
-    if (tarballPath.has_parent_path())
-        std::filesystem::create_directories(tarballPath.parent_path(), ec);
     // Pack with a top-level wrapper directory whose name matches the
     // tarball stem (computed by make_plan via wrapper_dirname_from_tarball).
-    // This keeps click-to-extract and `tar -xzf` aligned: both surface a
-    // single self-contained directory in the user's cwd.
-    // `--force-local` on Windows: GNU tar reads `C:/path/x.tar.gz` as the rsh
-    // form `host:path` and dies with `Cannot connect to C: resolve failed`,
-    // naming neither its argument nor the drive letter. Latent here rather than
-    // observed — a PE target is written as a zip — but it is the same command
-    // with the same hazard as the library packer's, and the two should not
-    // differ in whether they survive being run on Windows.
-    std::vector<std::string> argv{ "tar" };
-    if constexpr (mcpplibs::os::is_windows) argv.push_back("--force-local");
-    argv.insert(argv.end(), { "-czf", tarballPath.string(), "-C", stagingRoot.parent_path().string(),
-                              stagingRoot.filename().string() });
-    auto r = run_capture(argv);
-    if (!r) return std::unexpected(Error{r.error()});
+    // This keeps click-to-extract and `tar -xf` aligned: both surface a
+    // single self-contained directory in the user's cwd. The codec is mcpp's
+    // own (mcpp.pack.distribution::write_tar).
+    if (auto r = mcpp::pack::distribution::write_tar(stagingRoot, tarballPath, compression); !r)
+        return std::unexpected(Error{r.error()});
+    return {};
+}
+
+std::expected<void, Error>
+make_zip(const std::filesystem::path& stagingRoot, const std::filesystem::path& archive,
+         mcpp::pack::compress::Choice compression, std::string_view program = {})
+{
+    if (auto r = mcpp::pack::distribution::write_zip(stagingRoot, archive, compression, program); !r)
+        return std::unexpected(Error{r.error()});
+    return {};
+}
+
+// THE TREE MADE A PACKAGE (SPEC-014 §4.5, §7): each program, image, library
+// and loader signed by `[pack] sign`, then every file described in
+// `mcpp-package.json` with its role, its leg and its digest. Before the
+// container, so the archive holds what the document says.
+// `[pack] include`: the project's files the globs name, at the same path
+// below the tree's root, once whatever the legs (a `share/**` is the
+// package's, not an architecture's); `[pack] exclude` drops what it names.
+std::expected<std::vector<std::string>, Error> stage_included(const Plan& plan) {
+    namespace fs = std::filesystem;
+    std::vector<std::string> staged;
+    if (plan.includeGlobs.empty()) return staged;
+    std::vector<fs::path> files;
+    auto excluded = [&](const fs::path& f) {
+        return std::ranges::any_of(plan.excludeGlobs, [&](std::string const& g) {
+            return mcpp::modgraph::path_matches_glob(f, plan.projectRoot, g);
+        });
+    };
+    auto onFile = [&](const fs::path& f) {
+        const bool named = std::ranges::any_of(plan.includeGlobs, [&](std::string const& g) {
+            return mcpp::modgraph::path_matches_glob(f, plan.projectRoot, g);
+        });
+        if (named && !excluded(f)) files.push_back(f);
+    };
+    mcpp::modgraph::walk_glob_tree(plan.projectRoot, plan.projectRoot,
+                                   [](const fs::path&) { return true; }, onFile);
+    std::error_code ec;
+    for (auto const& f : files) {
+        const auto to = plan.stagingRoot / f.lexically_relative(plan.projectRoot);
+        fs::create_directories(to.parent_path(), ec);
+        fs::copy_file(f, to, fs::copy_options::overwrite_existing, ec);
+        if (ec) return std::unexpected(Error{std::format("[pack] include: cannot stage {}: {}",
+                                                         f.string(), ec.message())});
+        staged.push_back(f.lexically_relative(plan.projectRoot).generic_string());
+    }
+    return staged;
+}
+
+std::expected<void, Error> finalize_tree(const Plan& plan) {
+    namespace fs = std::filesystem;
+    namespace d = mcpp::pack::distribution;
+    std::error_code ec;
+    if (!fs::is_directory(plan.stagingRoot, ec)) return {};
+    auto included = stage_included(plan);
+    if (!included) return std::unexpected(included.error());
+    const auto canonical = [](std::string const& t) {
+        if (t.empty()) return mcpp::toolchain::triple::host_triple().str();
+        auto parsed = mcpp::toolchain::triple::parse(t);
+        return parsed ? parsed->str() : t;
+    };
+    d::Package pkg;
+    pkg.name     = plan.packageName;
+    pkg.version  = plan.packageVersion;
+    if (plan.platform.active) pkg.platform = std::format("{}@{}", plan.platform.package, plan.platform.version);
+    pkg.linkage  = plan.linkageName;
+    pkg.mode     = std::string(mode_cli_name(plan.opts.mode == Mode::Static && plan.targetIsLoaded
+                                             ? Mode::BundleAll : plan.opts.mode));
+    pkg.legs.push_back(canonical(plan.triple));
+    for (auto const& l : plan.loadedLegs) pkg.legs.push_back(l.triple);
+    for (auto const& l : plan.extraSharedLegs) pkg.legs.push_back(l.triple);
+    d::Stated stated;
+    if (!plan.opts.universalName.empty()) {
+        pkg.runner = plan.platform.fields.runner.cmd;
+        const auto stem = fs::path(plan.binaryName).stem().string();
+        stated.role["bin/" + stem] = "launcher";
+        stated.role["bin/" + stem + ".cmd"] = "launcher";
+        std::vector<std::pair<std::string, std::string>> legs{
+            { canonical(plan.triple), [&] { auto t = mcpp::toolchain::triple::parse(plan.triple);
+                                            return t ? t->arch : plan.triple; }() } };
+        for (auto const& l : plan.loadedLegs) legs.emplace_back(l.triple, l.arch);
+        // Every file of `lib/<arch>/` is an image of that leg.
+        auto state_leg = [&](std::string const& triple, std::string const& arch) {
+            for (auto const& e : fs::directory_iterator(plan.stagingRoot / "lib" / arch, ec)) {
+                const auto rel = std::format("lib/{}/{}", arch, e.path().filename().string());
+                stated.role[rel] = "image";
+                stated.leg[rel]  = triple;
+            }
+        };
+        for (auto const& [triple, arch] : legs) {
+            pkg.entry[arch] = std::format("lib/{}/{}", arch, plan.binaryName);
+            state_leg(triple, arch);
+        }
+        pkg.systems = d::loader_systems(plan.stagingRoot);
+    } else {
+        pkg.program = plan.targetIsPe ? plan.binaryName : "bin/" + plan.binaryName;
+        if (plan.targetIsLoaded && plan.opts.mode == Mode::BundleAll)
+            pkg.program = "bin/" + fs::path(plan.binaryName).stem().string()
+                        + std::string(mcpplibs::os::exe_suffix);
+        stated.role[pkg.program] = "program";
+    }
+    // What `[pack] include` named is the package's resource, whatever its name.
+    for (auto const& rel : *included) stated.role[rel] = "resource";
+    auto described = d::describe(plan.stagingRoot, pkg, stated);
+    if (!described) return std::unexpected(Error{described.error()});
+    if (plan.opts.sign.empty()) return {};
+    for (auto const& f : described->files) {
+        if (f.role != "program" && f.role != "image" && f.role != "library" && f.role != "loader")
+            continue;
+        std::vector<std::string> argv;
+        for (auto const& a : plan.opts.sign)
+            argv.push_back(a == "{}" ? (plan.stagingRoot / f.path).string() : a);
+        int spawnError = 0;
+        auto r = mcpp::run::capture_exec(argv, {}, {}, &spawnError);
+        if (spawnError != 0 || r.exit_code != 0)
+            return std::unexpected(Error{std::format(
+                "[pack] sign failed on {} (exit {}): {}\n{}", f.path, r.exit_code,
+                mcpp::build::command_line::display(argv), r.output)});
+    }
+    // The digests of what was signed.
+    if (auto again = d::describe(plan.stagingRoot, pkg, stated); !again)
+        return std::unexpected(Error{again.error()});
+    return {};
+}
+
+// The container of a built-in archive format, or nothing for a directory, a
+// single file or a dispatched format; the tree is finalized first.
+std::expected<void, Error> write_container(const Plan& plan) {
+    if (auto r = finalize_tree(plan); !r) return r;
+    switch (plan.archive) {
+        case ArchiveKind::None: return {};
+        case ArchiveKind::Tar:  return make_tarball(plan.stagingRoot, plan.archivePath,
+                                                    plan.opts.compression);
+        case ArchiveKind::Zip:  return make_zip(plan.stagingRoot, plan.archivePath,
+                                                plan.opts.compression, plan.binaryName);
+    }
     return {};
 }
 
@@ -1883,35 +2124,12 @@ run_pe(const Plan& plan)
             return std::unexpected(r.error());
     }
 
-    if (plan.opts.format != Format::Tar) return needs;
-
-    std::vector<mcpp::pack::zip::Entry> entries;
-    const auto wrapper = plan.stagingRoot.filename().string();
-    for (auto const& e :
-         std::filesystem::recursive_directory_iterator(plan.stagingRoot, ec)) {
-        if (!e.is_regular_file(ec)) continue;
-        auto rel = std::filesystem::relative(e.path(), plan.stagingRoot, ec);
-        if (ec) continue;
-        entries.push_back({
-            wrapper + "/" + rel.generic_string(),
-            e.path(),
-            e.path().filename() == plan.builtBinary.filename(),
-        });
-    }
-    // Deterministic order: a directory iteration order that leaks into an
-    // archive is how two identical builds get two different checksums.
-    //
-    // Plain `std::sort` with an explicit comparator, not
-    // `std::ranges::sort(entries, {}, &Entry::name)`. A ranges projection
-    // naming a member of an IMPORTED type is one of three module-boundary
-    // shapes this function used to carry, and together they crashed the clang
-    // 20.1.7 frontend (0xC0000005, no diagnostic) on every Windows job. See
-    // the note at the top of run_pe.
-    std::sort(entries.begin(), entries.end(),
-              [](const mcpp::pack::zip::Entry& a,
-                 const mcpp::pack::zip::Entry& b) { return a.name < b.name; });
-    if (auto r = mcpp::pack::zip::write(plan.archivePath, entries); !r)
-        return std::unexpected(Error{r.error()});
+    // The container: a zip unless `tar` was stated (`write_container`).
+    // Plain `std::sort` with an explicit comparator there, not a ranges
+    // projection onto an imported type's member: that shape was one of three
+    // that crashed the clang 20.1.7 frontend (0xC0000005, no diagnostic) on
+    // every Windows job. See the note at the top of run_pe.
+    if (auto r = write_container(plan); !r) return std::unexpected(r.error());
     return needs;
 }
 
@@ -1969,81 +2187,240 @@ run_wasm(const Plan& plan)
     copy_if_exists(plan.projectRoot / "README.md", plan.stagingRoot);
     copy_if_exists(plan.projectRoot / "LICENSE",   plan.stagingRoot);
 
-    if (plan.opts.format != Format::Tar) return {};
-    return make_tarball(plan.stagingRoot, plan.archivePath);
+    return write_container(plan);
 }
 
-// AN OK IMAGE (`<arch>-openkal`; design 2026-10-26 part 2, §8.2 and §8.5).
+// AN ARTIFACT A LOADER RUNS (an ok image, `<arch>-openkal`; design
+// 2026-10-26 part 2, §8.2 and §8.5; SPEC-013 §4.7).
 //
 // The modes keep their meaning -- what the machine that runs the package must
-// provide -- and on this row they are:
+// provide -- and on such a row they are:
 //
-//   system          the image alone; the machine provides `okrun` and every
-//                   image it names (M2);
-//   vendored        the image and the images it names (`DT_NEEDED`), beside it;
-//                   the machine provides `okrun` (M2, the default);
-//   self-contained  a program of THIS machine that carries the image as a
-//                   section and runs it through libokrun (M3), with the images
-//                   it names beside it; the machine provides nothing. The image
-//                   is not recompiled: the program is a generated entry, the
-//                   image's bytes and `openkal-run`, built by mcpp for this
-//                   machine. Another system's M3 is packed on that system.
-//   static          refused: an image is loaded, never linked into one file
-//                   with its loader by `ld`.
+//   system          the artifact alone; the machine provides the loader and
+//                   every artifact it names (M2);
+//   vendored        the artifact and the artifacts it names (`DT_NEEDED`),
+//                   beside it; the machine provides the loader (M2, the default);
+//   self-contained  a program of THIS machine that carries the artifact as a
+//                   section and runs it through the platform's CARRIER (M3),
+//                   with the artifacts it names beside it; the machine provides
+//                   nothing. The artifact is not recompiled: the program is the
+//                   carrier package, the carrier's entry source and the bytes,
+//                   built by mcpp with that system's own conventions -- the
+//                   bootstrap boundary (§6.2), so no platform is selected for it.
+//
+// A UNIVERSAL PACKAGE (SPEC-014 §3, §4.2) holds every target of a platform
+// that states `universal = true`: one `lib/<arch>/` per leg, launchers in
+// `bin/` that pick the machine's architecture and start the platform's
+// runner, and under `self-contained` the runner's program for each system of
+// `--systems` and each architecture -- the carrier built with nothing carried,
+// which runs the image its first argument names -- under
+// `libexec/<runner>/<os>-<arch>/`.
+//
+// `--linkage static` is a property of the image (no `.okso`), and `--mode
+// static` is `--linkage static --mode self-contained`.
+namespace {
+
+// A reference as a dependency entry of the generated manifest.
+std::string dependency_entry(const mcpp::manifest::platform::PackageRef& r) {
+    auto const& sp = r.spec;
+    const std::string ns = sp.namespace_.empty() ? std::string("mcpplibs") : sp.namespace_;
+    std::string value;
+    if (!sp.path.empty())
+        value = std::format("{{ path = \"{}\" }}", sp.path);
+    else if (!sp.git.empty())
+        value = std::format("{{ git = \"{}\", {} = \"{}\" }}", sp.git,
+                            sp.gitRefKind.empty() ? "rev" : sp.gitRefKind, sp.gitRev);
+    else
+        value = std::format("\"{}\"", sp.version);
+    return std::format("[dependencies.{}]\n{} = {}\n", ns, sp.shortName, value);
+}
+
+// The system names a package speaks of, and this machine's.
+constexpr std::string_view host_system() {
+    if constexpr (mcpplibs::os::is_windows) return "windows";
+    else if constexpr (mcpplibs::os::is_macos) return "macos";
+    else return "linux";
+}
+
+// The triple a program of `system` on `arch` is built for, and the mode it
+// is packed in: a Linux program is static (musl), the one form that runs on
+// every distribution; a program of this machine's system and architecture on
+// macOS or Windows takes this machine's own row; another system's is its
+// conventional row. `single`: the program is the whole package (a single
+// file), so on Windows it takes its C++ run-time from the system.
+struct ProgramRow { std::string triple; std::string mode; std::string platform; };
+
+// The platform a generated program of `triple` is built over, as `--platform`
+// names it: the target's platform where its hosted arrangement serves the
+// triple (SPEC-013 §5.4), else none. A Linux program over the hosted
+// arrangement is static on every architecture, its C library and C++ run-time
+// built by the graph with the platform's toolchain; the musl row's own payload
+// is a cross GCC published for an x86_64 host only.
+std::string hosted_platform_for(const mcpp::platform::Resolved* P, std::string_view triple) {
+    if (!P || !P->active || !P->fields.hosted.set) return {};
+    auto t = mcpp::toolchain::triple::parse(triple);
+    if (!t) return {};
+    auto const& targets = P->fields.hosted.targets;
+    const bool listed = !targets.set || std::ranges::any_of(targets.value, [&](std::string const& x) {
+        auto h = mcpp::toolchain::triple::parse(x);
+        return h && h->str() == t->str();
+    });
+    if (!listed) return {};
+    if (!P->selection.ref.spec.path.empty()) return "path:" + P->root.generic_string();
+    return std::format("{}@{}", P->package, P->version);
+}
+
+ProgramRow program_row(std::string_view system, std::string_view arch, bool single,
+                       const mcpp::platform::Resolved* P = nullptr) {
+    if (system == "linux") {
+        const auto triple = std::format("{}-linux-musl", arch);
+        return { triple, "static", hosted_platform_for(P, triple) };
+    }
+    // Another system's program is built over the platform's hosted arrangement
+    // where it serves the row, as Linux's is: the same program whichever
+    // machine packs it, needing no SDK and no C run-time of that system.
+    // Measured without it: on Linux an aarch64-macos runner needed the macOS
+    // SDK no payload carries, and a runner packed on Windows took the MSVC
+    // row and VCRUNTIME140.dll with it.
+    const auto triple = std::format("{}-{}", arch, system == "macos" ? "macos" : "windows-gnu");
+    const auto mode = system == "macos" || !single ? "vendored" : "system";
+    if (auto hosted = hosted_platform_for(P, triple); !hosted.empty()) return { triple, mode, hosted };
+    const bool here = system == host_system() && arch == mcpp::toolchain::platform::host_arch;
+    return { here ? std::string() : triple, mode };
+}
+
+// The bytes of `carried` as a section of a program of `system`, with the
+// symbols the carrier's entry reads; `name` and `digest` as strings. An empty
+// `carried` places nothing: `mcpp_carried_begin == mcpp_carried_end`.
+std::string carried_assembly(std::string_view system, std::string_view sectionName,
+                             const std::filesystem::path& carried, std::string_view name,
+                             std::string_view digest) {
+    const bool macho = system == "macos";
+    const bool coff  = system == "windows";
+    const std::string sym = macho ? "_" : "";
+    std::string bare(sectionName);
+    while (!bare.empty() && bare.front() == '.') bare.erase(bare.begin());
+    std::string upper = bare;
+    for (auto& ch : upper) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    const std::string section = macho ? std::format("\t.section __{},__carried\n", upper.substr(0, 14))
+                              : coff  ? std::format("\t.section .{},\"dr\"\n", bare)
+                                      : std::format("\t.section .{},\"a\",@progbits\n", bare);
+    std::string text = std::format(
+        "# What the program carries, unchanged, and its name (generated by mcpp pack).\n{}"
+        "\t.p2align 4\n\t.globl {}mcpp_carried_begin\n{}mcpp_carried_begin:\n",
+        section, sym, sym);
+    if (!carried.empty())
+        text += std::format("\t.incbin \"{}\"\n", std::filesystem::absolute(carried).generic_string());
+    text += std::format(
+        "\t.globl {0}mcpp_carried_end\n{0}mcpp_carried_end:\n"
+        "\t.globl {0}mcpp_carried_name\n{0}mcpp_carried_name:\n\t.asciz \"{1}\"\n"
+        "\t.globl {0}mcpp_carried_digest\n{0}mcpp_carried_digest:\n\t.asciz \"{2}\"\n",
+        sym, name, digest);
+    return text;
+}
+
+// A program generated under `dir` (its manifest, entry and carried section)
+// packed for `row` as a directory; returns the directory that holds the
+// program and what it needs beside it: the tree's `bin/`, or, for a Windows
+// program, whose tree is flat, the tree itself.
 std::expected<std::filesystem::path, Error>
-okimage_build_selfcontained(const Plan& plan, const std::filesystem::path& image)
+pack_generated_program(const std::filesystem::path& dir, const ProgramRow& row) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const auto out = dir / "target" / "dist" / "packed";
+    fs::remove_all(out, ec);
+    std::vector<std::string> argv{ mcpp::invocation::self_exe_path().string(), "pack",
+                                   "--pkg-format", "dir", "-o", "packed",
+                                   "--platform", row.platform.empty() ? std::string("none") : row.platform,
+                                   "--mode", row.mode };
+    if (!row.triple.empty()) argv.insert(argv.end(), { "--target", row.triple });
+    int spawnError = 0;
+    auto built = mcpp::run::capture_exec(argv, {}, dir.string(), &spawnError);
+    if (spawnError != 0 || built.exit_code != 0)
+        return std::unexpected(Error{std::format(
+            "packing the program under {} failed:\n{}", dir.string(), built.output)});
+    if (fs::is_directory(out / "bin", ec)) return out / "bin";
+    // A flat tree (PE) holds the generated program's own description beside
+    // it; what is placed from here is the program, and the package it is
+    // placed into describes itself.
+    if (fs::is_directory(out, ec)) {
+        fs::remove(out / "mcpp-package.json", ec);
+        return out;
+    }
+    return std::unexpected(Error{std::format("the program's package under {} was not written",
+                                             out.string())});
+}
+
+// THE STATIC ROW'S TOOLCHAIN, STATED: the carrier's own graph supplies a
+// kernel interface, which would otherwise cancel the row's convention and
+// leave a compiler without a musl C runtime to link with (L10, measured: clang
+// took the host GCC's `crtbeginT.o`). The row's own pin on this machine's
+// architecture; for another architecture's row the platform's toolchain,
+// which every host carries (the row's cross GCC is published for an x86_64
+// host only: measured, `x86_64-linux-musl-gcc@16.1.0` has no build for an
+// aarch64 Linux host).
+std::string static_row_pin(const ProgramRow& row, std::string_view platformToolchain = {}) {
+    if (!row.triple.ends_with("-linux-musl") || !row.platform.empty()) return {};
+    auto t = mcpp::toolchain::triple::parse(row.triple);
+    if (!t) return {};
+    std::string pin;
+    if (t->arch != mcpp::toolchain::platform::host_arch && !platformToolchain.empty())
+        pin = std::string(platformToolchain);
+    else if (auto* k = mcpp::toolchain::triple::find_known_target(*t); k && !k->pin.empty())
+        pin = std::string(k->pin);
+    if (pin.empty()) return {};
+    return std::format("\n[target.{}]\ntoolchain = \"{}\"\n", row.triple, pin);
+}
+
+// Whether this mcpp builds programs for `row`: a target its table does not
+// state (`aarch64-windows-gnu`), or states as planned (`x86_64-macos`, its
+// toolchain not published), is not built.
+bool row_is_built(const ProgramRow& row) {
+    if (row.triple.empty()) return true;   // this machine's own row
+    auto t = mcpp::toolchain::triple::parse(row.triple);
+    if (!t) return false;
+    auto* k = mcpp::toolchain::triple::find_known_target(*t);
+    return k && k->tier != "planned";
+}
+
+} // namespace
+
+// What a carrier carries and for which system it is built.
+struct CarrierBuild {
+    std::filesystem::path carried;       // empty: nothing (the runner's form)
+    std::string           carriedName;   // the artifact's name, as the carrier reports it
+    std::string           stem;          // the program's name
+    std::string           system;        // linux | macos | windows
+    std::string           arch;
+    bool                  single = false;
+};
+
+std::expected<std::filesystem::path, Error>
+carrier_build(const Plan& plan, const CarrierBuild& b)
 {
     namespace fs = std::filesystem;
-    // `openkal-run` from the source the project's `openkal-tools` came from:
-    // the same repository at the same reference selects its member by key
-    // (05 -- Dependencies), and a published version has a sibling of the same
-    // version.
-    //
-    // THE DECLARATION THE BUILD RESOLVED: after workspace inheritance, and
-    // with the conditional tables whose predicate the image's target meets
-    // (`[target.'cfg(os = "openkal")'.build-dependencies]`, which is where a
-    // program built for systems as well as images declares it). The raw file's
-    // `[build-dependencies]` alone missed both.
-    auto eff = mcpp::project::load_effective_manifest(plan.projectRoot);
-    if (!eff) return std::unexpected(Error{std::format(
-        "cannot read {}: {}", (plan.projectRoot / "mcpp.toml").string(), eff.error())});
-    const auto& man = eff->manifest;
-    std::optional<mcpp::manifest::DependencySpec> tools;
-    auto find_in = [&](const std::map<std::string, mcpp::manifest::DependencySpec>& deps) {
-        for (auto const& [key, spec] : deps)
-            if (key == "openkal-tools" || spec.shortName == "openkal-tools") tools = spec;
-    };
-    find_in(man.buildDependencies);
-    const auto ctx = mcpp::build::cfgpred::context_for(plan.triple);
-    for (auto const& cc : man.conditionalConfigs)
-        if (!mcpp::build::cfgpred::uses_layer(cc.predicate)
-            && mcpp::build::cfgpred::matches(cc.predicate, ctx))
-            find_in(cc.buildDependencies);
-    if (!tools) return std::unexpected(Error{
-        "--mode self-contained of an ok image builds a program over `openkal-run` from the "
-        "source of the project's `openkal-tools`, and its [build-dependencies] declare none"});
-    std::string runSpec;
-    if (!tools->git.empty()) {
-        runSpec = std::format("{{ git = \"{}\", {} = \"{}\" }}", tools->git,
-                              tools->gitRefKind.empty() ? "rev" : tools->gitRefKind, tools->gitRev);
-    } else if (!tools->path.empty()) {
-        auto root = fs::path(tools->path);
-        if (root.is_relative()) root = plan.projectRoot / root;
-        runSpec = std::format("{{ path = \"{}\" }}", (root.parent_path() / "run").generic_string());
-    } else {
-        runSpec = std::format("\"{}\"", tools->version);
-    }
-
-    const auto stem = fs::path(plan.binaryName).stem().string();
-    const auto dir = plan.projectRoot / "target" / "okimage-pack" / stem;
+    auto const& c = plan.platform.fields.carrier;
+    if (!plan.platform.active || !c.set)
+        return std::unexpected(Error{std::format(
+            "--mode self-contained of {} builds a program of the machine over its platform's "
+            "carrier, and {} states none ([platform] carrier = {{ package, section, main }}).",
+            plan.binaryName, plan.platform.display())});
     std::error_code ec;
+    if (c.main.empty() || !fs::is_regular_file(c.main, ec))
+        return std::unexpected(Error{std::format(
+            "the carrier of {} names its entry source {}, which is not a file ({})",
+            plan.platform.display(), c.main.empty() ? std::string("(none)") : c.main,
+            mcpp::platform::origin_text(c.origin))});
+
+    const auto row = program_row(b.system, b.arch, b.single, &plan.platform);
+    const auto dir = plan.projectRoot / "target" / "carrier-pack"
+                   / std::format("{}-{}-{}", b.stem, b.system, b.arch);
     fs::create_directories(dir / "src", ec);
     if (ec) return std::unexpected(Error{std::format("cannot create {}: {}", dir.string(), ec.message())});
-    // RESOLVED AS THE BUILD THAT MADE THE IMAGE RESOLVED ITS TOOLS. The
+    // RESOLVED AS THE BUILD THAT MADE THE ARTIFACT RESOLVED ITS PLATFORM. The
     // generated project is this pack's, not a project of its own: a lock it
-    // kept from an earlier pack held `openkal-run` at that pack's commit while
-    // the image's tools had moved on, and the program then carried a runner
-    // older than the one the image was checked by.
+    // kept from an earlier pack held the carrier at that pack's commit while
+    // the platform had moved on.
     fs::remove(dir / "mcpp.lock", ec);
 
     auto write = [&](const fs::path& p, std::string_view text) -> bool {
@@ -2052,130 +2429,187 @@ okimage_build_selfcontained(const Plan& plan, const std::filesystem::path& image
         return bool(out);
     };
     const std::string manifest = std::format(
-        "# Generated by `mcpp pack --mode self-contained` for {}: a program of this\n"
-        "# machine that carries the ok image as a section and runs it (M3).\n"
+        "# Generated by `mcpp pack` for {}: a program of {}-{} that {} through {}'s\n"
+        "# carrier (SPEC-013 §11, SPEC-014 §4.2).\n"
         "[package]\nname    = \"{}\"\nversion = \"{}\"\n\n"
         "[targets.{}]\nkind = \"bin\"\nmain = \"src/main.cpp\"\n\n"
-        "[build]\nsources = [\"src/main.cpp\", \"src/image.S\"]\n\n"
-        "[dependencies]\nopenkal-run = {}\n",
-        plan.binaryName, stem, plan.packageVersion.empty() ? "0.0.0" : plan.packageVersion,
-        stem, runSpec);
-    // The section, in the syntax of this machine's object format; the symbol
-    // spelling carries Mach-O's leading underscore.
-    const bool macho = mcpplibs::os::is_macos;
-    const bool coff  = mcpplibs::os::is_windows;
-    const std::string sym = macho ? "_" : "";
-    const std::string section = macho ? "\t.section __OKE,__image\n"
-                              : coff  ? "\t.section .oke,\"dr\"\n"
-                                      : "\t.section .oke,\"a\",@progbits\n";
-    const std::string assembly = std::format(
-        "# The image's bytes, unchanged (generated by mcpp pack).\n{}"
-        "\t.p2align 4\n\t.globl {}ok_image_begin\n{}ok_image_begin:\n"
-        "\t.incbin \"{}\"\n\t.globl {}ok_image_end\n{}ok_image_end:\n",
-        section, sym, sym, fs::absolute(image).generic_string(), sym, sym);
-    const std::string main = std::format(
-        "// Generated by mcpp pack: runs the image this program carries (M3).\n"
-        "#include <okrun.h>\n"
-        "#include <cstdio>\n"
-        "extern \"C\" const unsigned char ok_image_begin[], ok_image_end[];\n"
-        "int main(int argc, char** argv) {{\n"
-        "    char why[512];\n"
-        "    okrun_options options{{}};\n"
-        "    options.carried = 1;   // the program is the image's name, and what starts it again\n"
-        "    okrun_run_bytes(ok_image_begin, static_cast<unsigned long long>(ok_image_end - ok_image_begin),\n"
-        "                    \"{}\", argc, const_cast<const char* const*>(argv), &options, why, sizeof why);\n"
-        "    std::fprintf(stderr, \"{}: %s\\n\", why);\n"
-        "    return 127;\n"
-        "}}\n",
-        plan.binaryName, stem);
-    if (!write(dir / "mcpp.toml", manifest) || !write(dir / "src" / "image.S", assembly)
-        || !write(dir / "src" / "main.cpp", main))
+        "[build]\nsources = [\"src/main.cpp\", \"src/carried.S\"]\n\n"
+        "{}{}",
+        plan.binaryName, b.system, b.arch,
+        b.carried.empty() ? "runs the image it is given" : "carries it and runs it",
+        plan.platform.display(), b.stem,
+        plan.packageVersion.empty() ? "0.0.0" : plan.packageVersion, b.stem,
+        dependency_entry(c.package),
+        static_row_pin(row, plan.platform.fields.toolchain.set ? plan.platform.fields.toolchain.value
+                                                               : std::string()));
+    std::string mainText;
+    {
+        std::ifstream in(c.main, std::ios::binary);
+        mainText.assign(std::istreambuf_iterator<char>(in), {});
+    }
+    if (!write(dir / "mcpp.toml", manifest)
+        || !write(dir / "src" / "carried.S",
+                  carried_assembly(b.system, c.section, b.carried, b.carriedName, {}))
+        || !write(dir / "src" / "main.cpp", mainText))
         return std::unexpected(Error{std::format("cannot write the program's sources under {}", dir.string())});
 
     // PACKED, NOT MERELY BUILT: the program obeys every rule this command
     // keeps for a program -- no build-machine path, its closure beside it. On
-    // Linux it is static (musl), the one form that runs on every distribution;
-    // on macOS and Windows the system's own libraries are the only ones it
-    // names.
-    mcpp::ui::info("Packing", std::format("{} into a program of this machine (okrun, M3)", plan.binaryName));
-    // `-o` with a bare name: the package directory is `target/dist/<name>`.
-    const auto out = dir / "target" / "dist" / "packed";
-    fs::remove_all(out, ec);
-    std::vector<std::string> argv{ mcpp::invocation::self_exe_path().string(), "pack",
-                                   "--format", "dir", "-o", "packed" };
-    if constexpr (mcpplibs::os::is_linux) {
-        argv.insert(argv.end(), { "--target", std::format("{}-linux-musl", mcpp::toolchain::platform::host_arch),
-                                  "--mode", "static" });
-    } else {
-        argv.insert(argv.end(), { "--mode", "vendored" });
-    }
-    int spawnError = 0;
-    auto built = mcpp::run::capture_exec(argv, {}, dir.string(), &spawnError);
-    if (spawnError != 0 || built.exit_code != 0)
-        return std::unexpected(Error{std::format(
-            "packing the self-contained program failed (in {}):\n{}", dir.string(), built.output)});
-    if (!fs::is_directory(out / "bin", ec))
-        return std::unexpected(Error{std::format(
-            "the self-contained program's package under {} has no bin/", out.string())});
-    return out;
+    // macOS and Windows the system's own libraries are the only ones it names.
+    mcpp::ui::info("Packing", b.carried.empty()
+        ? std::format("{} for {}-{} ({}'s carrier, the runner of the package)", b.stem,
+                      b.system, b.arch, plan.platform.display())
+        : std::format("{} into a program of {}-{} ({}'s carrier, M3)", plan.binaryName,
+                      b.system, b.arch, plan.platform.display()));
+    return pack_generated_program(dir, row);
 }
 
+namespace {
+
+// The images an image names (`DT_NEEDED`), found where its build placed them.
+std::expected<std::vector<std::filesystem::path>, Error>
+needed_images(const std::filesystem::path& artifact, std::string_view binaryName) {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> needed;
+    auto facts = mcpp::runtime::elf::inspect_elf_runtime(artifact);
+    if (!facts) return std::unexpected(Error{facts.error()});
+    const auto builtDir = artifact.parent_path();
+    std::error_code ec;
+    for (auto const& name : facts->needed) {
+        fs::path hit;
+        for (auto const& d : { builtDir, builtDir.parent_path() / "lib" })
+            if (fs::is_regular_file(d / name, ec)) { hit = d / name; break; }
+        if (hit.empty()) return std::unexpected(Error{std::format(
+            "{} names the image '{}', which the build did not place beside it", binaryName, name)});
+        needed.push_back(hit);
+    }
+    return needed;
+}
+
+std::string arch_of(std::string_view triple) {
+    auto t = mcpp::toolchain::triple::parse(triple);
+    return t ? t->arch : std::string(triple.substr(0, triple.find('-')));
+}
+
+} // namespace
+
 std::expected<void, Error>
-run_okimage(const Plan& plan)
+run_loaded(const Plan& plan)
 {
     namespace fs = std::filesystem;
-    if (plan.opts.mode == Mode::Static)
-        return std::unexpected(Error{std::format(
-            "--mode static does not apply to an ok image: an image is loaded, not linked "
-            "with its loader into one file.\n"
-            "       `--mode self-contained` packs a program of this machine that carries {} "
-            "and needs nothing installed.", plan.binaryName)});
     std::error_code ec;
     fs::remove_all(plan.stagingRoot, ec);
     fs::create_directories(plan.stagingRoot / "bin", ec);
     if (ec) return std::unexpected(Error{std::format(
         "cannot create staging '{}': {}", plan.stagingRoot.string(), ec.message())});
+    auto copy = [&](const fs::path& from, const fs::path& to) -> std::expected<void, Error> {
+        fs::create_directories(to.parent_path(), ec);
+        fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
+        if (ec) return std::unexpected(Error{std::format("copy {} failed: {}", from.string(), ec.message())});
+        return {};
+    };
+    const bool bundles = plan.opts.mode != Mode::None;
 
-    // The images it names, found where the build placed them.
-    std::vector<fs::path> needed;
-    if (plan.opts.mode != Mode::None) {
-        auto facts = mcpp::runtime::elf::inspect_elf_runtime(plan.builtBinary);
-        if (!facts) return std::unexpected(Error{facts.error()});
-        const auto builtDir = plan.builtBinary.parent_path();
-        for (auto const& name : facts->needed) {
-            fs::path hit;
-            for (auto const& d : { builtDir, builtDir.parent_path() / "lib" })
-                if (fs::is_regular_file(d / name, ec)) { hit = d / name; break; }
-            if (hit.empty()) return std::unexpected(Error{std::format(
-                "{} names the image '{}', which the build did not place beside it",
-                plan.binaryName, name)});
-            needed.push_back(hit);
+    if (plan.opts.universalName.empty()) {
+        // ONE LEG: the image in `bin/`, the images it names beside it, or
+        // under `self-contained` the carrier that carries it (M3).
+        std::vector<fs::path> needed;
+        if (bundles) {
+            auto n = needed_images(plan.builtBinary, plan.binaryName);
+            if (!n) return std::unexpected(n.error());
+            needed = std::move(*n);
         }
-    }
-
-    fs::path staged;
-    if (plan.opts.mode == Mode::BundleAll) {
-        auto packed = okimage_build_selfcontained(plan, plan.builtBinary);
-        if (!packed) return std::unexpected(packed.error());
-        fs::copy(*packed, plan.stagingRoot,
-                 fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
-        staged = plan.stagingRoot / "bin"
-               / (fs::path(plan.binaryName).stem().string() + std::string(mcpplibs::os::exe_suffix));
+        fs::path staged;
+        // A single file is made from the images (`single_file`); the tree
+        // holds them as `vendored` does.
+        if (plan.opts.mode == Mode::BundleAll && plan.opts.format != Format::SingleFile) {
+            auto packed = carrier_build(plan, { plan.builtBinary, plan.binaryName,
+                fs::path(plan.binaryName).stem().string(), std::string(host_system()),
+                std::string(mcpp::toolchain::platform::host_arch), false });
+            if (!packed) return std::unexpected(packed.error());
+            fs::copy(*packed, plan.stagingRoot / "bin",
+                     fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+            staged = plan.stagingRoot / "bin"
+                   / (fs::path(plan.binaryName).stem().string() + std::string(mcpplibs::os::exe_suffix));
+        } else {
+            staged = plan.stagingRoot / "bin" / plan.binaryName;
+            if (auto r = copy(plan.builtBinary, staged); !r) return r;
+        }
+        for (auto const& n : needed)
+            if (auto r = copy(n, plan.stagingRoot / "bin" / n.filename()); !r) return r;
+        if (auto r = stage_runtime_files(plan, staged.parent_path()); !r) return r;
     } else {
-        staged = plan.stagingRoot / "bin" / plan.binaryName;
-        fs::copy_file(plan.builtBinary, staged, fs::copy_options::overwrite_existing, ec);
-    }
-    if (ec) return std::unexpected(Error{std::format("copy {} failed: {}", staged.string(), ec.message())});
-    for (auto const& n : needed) {
-        fs::copy_file(n, plan.stagingRoot / "bin" / n.filename(), fs::copy_options::overwrite_existing, ec);
-        if (ec) return std::unexpected(Error{std::format("copy {} failed: {}", n.string(), ec.message())});
+        // A UNIVERSAL PACKAGE: a `lib/<arch>/` per leg, the launchers, and the
+        // runner's program per system and architecture under `self-contained`.
+        auto const& runner = plan.platform.fields.runner;
+        if (!runner.set || runner.cmd.empty())
+            return std::unexpected(Error{std::format(
+                "a universal package of {} starts its images through the platform's runner, and "
+                "{} states none.\n  use: --no-universal",
+                plan.binaryName, plan.platform.display())});
+        struct Leg { std::string triple, arch; fs::path artifact; };
+        std::vector<Leg> legs{ { plan.triple, arch_of(plan.triple), plan.builtBinary } };
+        for (auto const& l : plan.loadedLegs) legs.push_back({ l.triple, l.arch, l.artifact });
+        mcpp::pack::distribution::Launch launch;
+        launch.name = fs::path(plan.binaryName).stem().string();
+        launch.runner = runner.cmd;
+        for (auto const& leg : legs) launch.entry[leg.arch] = leg.artifact.filename().string();
+        if (plan.opts.mode == Mode::BundleAll) launch.loader = fs::path(runner.cmd.front()).stem().string();
+        // A word a `.cmd` cannot hold is refused now, before anything is staged.
+        if (auto ok = mcpp::pack::distribution::launchable(launch); !ok)
+            return std::unexpected(Error{ok.error()});
+        for (auto const& leg : legs) {
+            const auto dir = plan.stagingRoot / "lib" / leg.arch;
+            if (auto r = copy(leg.artifact, dir / leg.artifact.filename()); !r) return r;
+            if (bundles) {
+                auto n = needed_images(leg.artifact, plan.binaryName);
+                if (!n) return std::unexpected(n.error());
+                for (auto const& f : *n)
+                    if (auto r = copy(f, dir / f.filename()); !r) return r;
+            }
+            if (auto r = stage_runtime_files(plan, dir, leg.artifact.parent_path()); !r) return r;
+        }
+        if (plan.opts.mode == Mode::BundleAll) {
+            std::vector<std::string> systems = plan.opts.systems;
+            if (systems.empty()) systems.emplace_back(host_system());
+            for (auto const& system : systems)
+                for (auto const& leg : legs) {
+                    // A row this mcpp builds no program for (a planned
+                    // target, `x86_64-macos`) carries no runner: said, and
+                    // the package's metadata lists the systems it carries.
+                    if (!row_is_built(program_row(system, leg.arch, false, &plan.platform))) {
+                        mcpp::ui::warning(std::format(
+                            "no runner for {}-{} in the package: this mcpp builds no program for "
+                            "that system and architecture; the launcher there looks for `{}` on PATH",
+                            system, leg.arch, launch.loader));
+                        continue;
+                    }
+                    auto packed = carrier_build(plan, { {}, {}, launch.loader, system, leg.arch, false });
+                    if (!packed) return std::unexpected(packed.error());
+                    const auto into = plan.stagingRoot / "libexec" / launch.loader
+                                    / std::format("{}-{}", system, leg.arch);
+                    fs::create_directories(into, ec);
+                    fs::copy(*packed, into,
+                             fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+                    if (ec) return std::unexpected(Error{std::format(
+                        "cannot place the runner for {}-{}: {}", system, leg.arch, ec.message())});
+                }
+        }
+        const auto posix = plan.stagingRoot / "bin" / launch.name;
+        {
+            std::ofstream out(posix, std::ios::binary | std::ios::trunc);
+            out << mcpp::pack::distribution::posix_launcher(launch);
+        }
+        fs::permissions(posix, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec
+                               | fs::perms::others_read | fs::perms::others_exec,
+                        fs::perm_options::replace, ec);
+        std::ofstream(plan.stagingRoot / "bin" / (launch.name + ".cmd"), std::ios::binary | std::ios::trunc)
+            << mcpp::pack::distribution::windows_launcher(launch);
     }
 
-    if (auto r = stage_runtime_files(plan, staged.parent_path()); !r) return r;
     copy_if_exists(plan.projectRoot / "README.md", plan.stagingRoot);
     copy_if_exists(plan.projectRoot / "LICENSE",   plan.stagingRoot);
-    if (plan.opts.format != Format::Tar) return {};
-    return make_tarball(plan.stagingRoot, plan.archivePath);
+    return write_container(plan);
 }
 
 // #622 A3/A10: the Application half whose form on this row is a shared
@@ -2324,9 +2758,7 @@ run_shared_program(const Plan& plan)
                 "       or link_library_dirs, or the compiler's library search path."),
             std::move(needs));
 
-    if (plan.opts.format == Format::Tar)
-        if (auto r = make_tarball(plan.stagingRoot, plan.archivePath); !r)
-            return std::unexpected(r.error());
+    if (auto r = write_container(plan); !r) return std::unexpected(r.error());
     return ClosureResult{true, {}, std::move(needs)};
 }
 
@@ -2369,8 +2801,8 @@ run(const Plan& plan, const mcpp::config::GlobalConfig& cfg)
 
     // An ok image: the images it names travel beside it, and under
     // `self-contained` the image is carried inside a program of this machine.
-    if (plan.targetIsOkImage) {
-        if (auto r = detail::run_okimage(plan); !r) return std::unexpected(r.error());
+    if (plan.targetIsLoaded) {
+        if (auto r = detail::run_loaded(plan); !r) return std::unexpected(r.error());
         return ClosureResult{};
     }
 
@@ -2427,9 +2859,7 @@ run(const Plan& plan, const mcpp::config::GlobalConfig& cfg)
                 std::move(needs));
         if (auto r = write_topentry_wrapper(plan.stagingRoot, plan.binaryName); !r)
             return std::unexpected(Error{r.error()});
-        if (plan.opts.format == Format::Tar)
-            if (auto r = make_tarball(plan.stagingRoot, plan.archivePath); !r)
-                return std::unexpected(r.error());
+        if (auto r = write_container(plan); !r) return std::unexpected(r.error());
         return ClosureResult{true, {}, std::move(needs)};
     }
 
@@ -2785,12 +3215,143 @@ run(const Plan& plan, const mcpp::config::GlobalConfig& cfg)
         }
 
         // Output.
-        if (plan.opts.format == Format::Tar) {
-            if (auto r = make_tarball(plan.stagingRoot, plan.archivePath); !r)
-                return std::unexpected(r.error());
-        }
+        if (auto r = write_container(plan); !r) return std::unexpected(r.error());
         return ClosureResult{true, {}, std::move(needs)};
     }
+}
+
+std::expected<void, Error> finalize_staged(const Plan& plan) {
+    return detail::finalize_tree(plan);
+}
+
+std::string unbuilt_row(std::string_view system, std::string_view arch) {
+    const auto row = detail::program_row(system, arch, true);
+    return detail::row_is_built(row) ? std::string() : row.triple;
+}
+
+std::expected<std::vector<std::filesystem::path>, Error> single_file(const Plan& plan) {
+    namespace fs = std::filesystem;
+    namespace d = mcpp::pack::distribution;
+    std::error_code ec;
+    const auto distDir = plan.projectRoot / "target" / "dist";
+    auto output_for = [&](std::string_view qualifier, std::string_view suffix) {
+        if (plan.opts.output.empty())
+            return distDir / std::format("{}-{}-{}{}", plan.packageName, plan.packageVersion,
+                                         qualifier, suffix);
+        if (!plan.opts.output.has_parent_path()) return distDir / plan.opts.output;
+        return plan.opts.output;
+    };
+    std::vector<fs::path> written;
+    if (plan.targetIsLoaded) {
+        // THE IMAGE, OR THE IMAGES AS ONE STORED ZIP: what the carrier's
+        // entry reads between `mcpp_carried_begin` and `mcpp_carried_end`
+        // (SPEC-013 §11): the image alone when it names no other, else every
+        // image of `bin/` as members of a zip whose data lies on 64 KiB
+        // boundaries, the entry named by `mcpp_carried_name`.
+        std::vector<fs::path> images;
+        for (auto const& e : fs::directory_iterator(plan.stagingRoot / "bin", ec))
+            if (e.is_regular_file(ec)) images.push_back(e.path());
+        std::ranges::sort(images);
+        fs::path carried = plan.stagingRoot / "bin" / plan.binaryName;
+        if (images.size() > 1) {
+            carried = plan.projectRoot / "target" / "carrier-pack"
+                    / (fs::path(plan.binaryName).stem().string() + ".carried.zip");
+            std::vector<mcpp::pack::zip::Entry> entries;
+            for (auto const& i : images) entries.push_back({ i.filename().string(), i, false, {} });
+            mcpp::pack::zip::WriteOptions o;
+            o.align = 65536;
+            if (auto r = mcpp::pack::zip::write(carried, entries, o); !r)
+                return std::unexpected(Error{r.error()});
+        }
+        auto t = mcpp::toolchain::triple::parse(plan.triple);
+        const std::string arch = t ? t->arch : std::string(mcpp::toolchain::platform::host_arch);
+        std::vector<std::string> systems = plan.opts.systems;
+        if (systems.empty()) systems.emplace_back(detail::host_system());
+        if (systems.size() > 1 && !plan.opts.output.empty())
+            return std::unexpected(Error{std::format(
+                "--output names one file, and --systems makes one single file per system ({}).\n"
+                "  use: leave --output out; each file is named <name>-<version>-<os>-<arch>",
+                systems.size())});
+        for (auto const& system : systems) {
+            const auto stem = fs::path(plan.binaryName).stem().string();
+            auto packed = detail::carrier_build(plan, { carried, plan.binaryName, stem, system, arch, true });
+            if (!packed) return std::unexpected(packed.error());
+            const auto suffix = system == "windows" ? std::string(".exe") : std::string();
+            const auto program = *packed / (stem + suffix);
+            if (!fs::is_regular_file(program, ec))
+                return std::unexpected(Error{std::format("the carrier built for {}-{} has no {}",
+                                                         system, arch, program.filename().string())});
+            const auto out = output_for(std::format("{}-{}", system, arch), suffix);
+            fs::create_directories(out.parent_path(), ec);
+            fs::copy_file(program, out, fs::copy_options::overwrite_existing, ec);
+            if (ec) return std::unexpected(Error{std::format("cannot write {}: {}", out.string(), ec.message())});
+            written.push_back(out);
+        }
+    } else {
+        // THE ENGINE'S LAUNCHER CARRYING THE TREE. The entry: the program a
+        // person runs from the unpacked tree -- a Windows program at the root,
+        // a self-contained Linux tree's wrapper at the root, `bin/<name>`
+        // otherwise.
+        std::string entry = "bin/" + plan.binaryName;
+        if (plan.targetIsPe) entry = plan.binaryName;
+        else if (plan.opts.mode == Mode::BundleAll && fs::is_regular_file(plan.stagingRoot / plan.binaryName, ec))
+            entry = plan.binaryName;
+        auto tree = d::tree_payload(plan.stagingRoot);
+        if (!tree) return std::unexpected(Error{tree.error()});
+        auto c = plan.opts.compression;
+        c.algorithm = mcpp::pack::compress::Algorithm::Zstd;   // `none` stores at level 1
+        if (plan.opts.compression.algorithm == mcpp::pack::compress::Algorithm::None) c.level = 1;
+        auto payload = mcpp::pack::compress::bytes(*tree, c);
+        if (!payload) return std::unexpected(Error{payload.error()});
+        const auto digest = d::sha256(*payload);
+        const auto stem = fs::path(plan.binaryName).stem().string();
+        const auto dir = plan.projectRoot / "target" / "single-file" / stem;
+        fs::create_directories(dir / "src", ec);
+        fs::remove(dir / "mcpp.lock", ec);
+        auto write = [&](const fs::path& p, std::string_view text) -> bool {
+            std::ofstream out(p, std::ios::binary | std::ios::trunc);
+            out.write(text.data(), static_cast<std::streamsize>(text.size()));
+            return bool(out);
+        };
+        auto t = mcpp::toolchain::triple::parse(plan.triple);
+        const std::string arch = t ? t->arch : std::string(mcpp::toolchain::platform::host_arch);
+        const std::string system = !t ? std::string(detail::host_system())
+                                 : t->os == "windows" ? std::string("windows")
+                                 : t->os == "macos" ? std::string("macos") : std::string("linux");
+        const auto row = detail::program_row(system, arch, true);
+        if (!write(dir / "payload.zst", *payload)
+            || !write(dir / "mcpp.toml", d::launcher_manifest(stem, plan.packageVersion) + detail::static_row_pin(row))
+            || !write(dir / "src" / "main.cpp", d::launcher_main())
+            || !write(dir / "src" / "carried.S",
+                      detail::carried_assembly(system, ".mcppsf", dir / "payload.zst", entry, digest)))
+            return std::unexpected(Error{std::format("cannot write the launcher's sources under {}", dir.string())});
+        mcpp::ui::info("Packing", std::format("{} into one file for {}-{} ({} payload, sha256 {})",
+                                              plan.binaryName, system, arch,
+                                              mcpp::pack::compress::name(c.algorithm), digest.substr(0, 12)));
+        auto packed = detail::pack_generated_program(dir, row);
+        if (!packed) return std::unexpected(packed.error());
+        const auto suffix = system == "windows" ? std::string(".exe") : std::string();
+        const auto program = *packed / (stem + suffix);
+        const auto out = output_for(t ? t->str() : plan.triple, suffix);
+        fs::create_directories(out.parent_path(), ec);
+        fs::copy_file(program, out, fs::copy_options::overwrite_existing, ec);
+        if (ec) return std::unexpected(Error{std::format("cannot write {}: {}", out.string(), ec.message())});
+        written.push_back(out);
+    }
+    // The signer signs the file a person runs, too.
+    if (!plan.opts.sign.empty())
+        for (auto const& f : written) {
+            std::vector<std::string> argv;
+            for (auto const& a : plan.opts.sign) argv.push_back(a == "{}" ? f.string() : a);
+            int spawnError = 0;
+            auto r = mcpp::run::capture_exec(argv, {}, {}, &spawnError);
+            if (spawnError != 0 || r.exit_code != 0)
+                return std::unexpected(Error{std::format("[pack] sign failed on {} (exit {}): {}\n{}",
+                                                         f.string(), r.exit_code,
+                                                         mcpp::build::command_line::display(argv),
+                                                         r.output)});
+        }
+    return written;
 }
 
 } // namespace mcpp::pack

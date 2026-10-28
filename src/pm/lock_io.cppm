@@ -32,6 +32,16 @@ struct LockedPackage {
     std::string version;
     std::string source;     // e.g. "index+mcpplibs@abc123def..."
     std::string hash;       // "sha256:..." or "fnv1a:..."
+    // Who put the package in the graph when the project did not (SPEC-013
+    // §8.3): "platform" for a package the target's platform added (the
+    // platform package itself, a layer's provider, a tool's package). Empty
+    // for a package the project declared or one reached through it; a lock
+    // written before the field reads as empty.
+    std::string origin;
+    // The configurations that resolve it, by target triple (sorted): a build
+    // for one target rewrites its own and keeps the others' (SPEC-013 §15.1).
+    // Empty in a lock written before the field.
+    std::vector<std::string> targets;
 };
 
 // Parsed form of a git source string as written to mcpp.lock.
@@ -137,6 +147,10 @@ std::expected<Lockfile, LockError> load(const std::filesystem::path& path) {
             if (auto it = tt.find("version");   it != tt.end() && it->second.is_string()) lp.version    = it->second.as_string();
             if (auto it = tt.find("source");    it != tt.end() && it->second.is_string()) lp.source     = it->second.as_string();
             if (auto it = tt.find("hash");      it != tt.end() && it->second.is_string()) lp.hash       = it->second.as_string();
+            if (auto it = tt.find("origin");    it != tt.end() && it->second.is_string()) lp.origin     = it->second.as_string();
+            if (auto it = tt.find("targets"); it != tt.end() && it->second.is_array())
+                for (auto const& e : it->second.as_array())
+                    if (e.is_string()) lp.targets.push_back(e.as_string());
 
             // v1 → v2 migration: default namespace to "mcpplibs".
             if (fileVersion < 2 && lp.namespace_.empty()) {
@@ -187,7 +201,14 @@ std::string serialize(const Lockfile& lock) {
         }
         out += std::format("version = {}\n", t::escape_string(p.version));
         out += std::format("source  = {}\n", t::escape_string(p.source));
-        out += std::format("hash    = {}\n\n", t::escape_string(p.hash));
+        out += std::format("hash    = {}\n", t::escape_string(p.hash));
+        if (!p.origin.empty()) out += std::format("origin  = {}\n", t::escape_string(p.origin));
+        if (!p.targets.empty()) {
+            std::string list;
+            for (auto const& t : p.targets) list += (list.empty() ? "" : ", ") + t::escape_string(t);
+            out += std::format("targets = [{}]\n", list);
+        }
+        out += "\n";
     }
     return out;
 }

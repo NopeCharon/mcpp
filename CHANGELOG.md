@@ -4,6 +4,178 @@
 > Each `## [<version>]` section is that release's notes. Entries are written in English
 > from 2026.9.28.3 on; earlier entries remain as written.
 
+## [2026.10.27.1] - 2026-10-27
+
+### Added
+
+- **Platforms: the configuration of a class of targets as one versioned package**
+  (SPEC-013; docs/35). A package's `[platform]` section states the targets it
+  serves, their toolchain and target base, the package for each target-side
+  layer (`[platform.layers]`, or `false`), the tools built for this machine
+  (`[platform.tools]`), the compile flags (`[platform.build]` and its
+  `cfg(...)` tables), the link (`[platform.link]`: `driver`, `flags`, `start`,
+  `script`, `inputs`, the names `exe` and `shared`, the `seal` steps), the
+  runner (`{ cmd, host = "same-arch" | "any", exclusive }`) and named runners,
+  the carrier of a self-contained program, a plugin run in the platform phase,
+  a version group (`[platform.versions]`) and the part a host triple takes
+  (`[platform.hosted]`). The engine selects a platform for the target graph
+  (`--platform`, `MCPP_TARGET_<T>_PLATFORM`, `[target.<selector>] platform`,
+  `config.toml`, the target table) and for the host graph (`--host-platform`,
+  `MCPP_HOST_PLATFORM`, `[host] platform`), merges the overrides a project and
+  this machine write under the same key names, adds the layers and tools the
+  graph lacks (a layer a package of the graph provides is left to it), links,
+  seals and names the artifact, runs it, and reports every value with its
+  source. `cfg(platform = "<name>")` selects by platform.
+- **`x86_64-openkal` and `aarch64-openkal` need no declaration.** The target
+  table selects `mcpplibs.openkal-platform` for both rows, and the platform
+  states what a project wrote by hand in 2026.10.26.2: `llvm@23.1.3`,
+  openkal-musl, openkal-llvm-runtime, `okld` and `okrun`, the image's flags,
+  its link and seal, `{name}.oke` and `lib{name}.okso`, the runner and the M3
+  carrier. A project that names only its sources builds, runs, tests and
+  packs an ok image. The engine holds no openkal code (`src/okimage` is
+  removed).
+- **The host graph's platform.** With `[host] platform` build programs and
+  their libraries are compiled as ok images of this machine's architecture,
+  with one toolchain on Linux, macOS and Windows, and run by the platform's
+  runner; a platform's own tools are always built natively. e2e 953; a
+  platform package unrelated to openkal is e2e 952.
+- **Protocol 17** (SPEC-007 R9.10): `link_driver`, `link_input`,
+  `link_input_from`, `artifact_name`, `seal` and `run_host`, stated by a
+  platform's plugin in the platform phase (`mcpp::phase()` is `"platform"`)
+  or by any build program in its build phase.
+- **One configuration, without a build.** `mcpp self env --target <triple>`
+  (`--host`, `--format json`) reports the toolchain, the platform with each
+  field's source, the tools, the runner and its program; `mcpp toolchain
+  install --target <triple>` fetches the target's platform and builds its
+  tools; `mcpp toolchain list` has a PLATFORM column.
+- **`mcpp test` builds the package's programs first** and gives each test
+  `MCPP_BIN_<NAME>`, the path of the program `<name>`. In a platform package
+  with no `--target`, it builds the tests for each of the platform's targets
+  and runs those of this machine's architecture.
+- **Packaging along three axes** (SPEC-014; docs/10): `--linkage
+  static|shared` (the program's dependency linkage; on Linux `static` is the
+  musl row), `--mode system|vendored|self-contained` (what the machine
+  provides; `--mode static` is `--linkage static --mode self-contained`),
+  `--pkg-format tar|zip|dir|single-file|<provided>` (what is delivered; a
+  format left unstated is a zip for a Windows program and a tar elsewhere) and
+  the legs (`--target`, repeatable). Impossible combinations are refused before
+  the build. `[pack] linkage`, `format`, `compress`, `sign` and `universal` are
+  the project's defaults. e2e 954.
+- **Universal packages.** A platform with `universal = true` (openkal-platform)
+  packs every one of its targets into one package, `<name>-<version>-<platform>`,
+  with `lib/<arch>/` per leg and generated launchers (`bin/<name>`,
+  `bin/<name>.cmd`) that pick the machine's architecture and start the
+  platform's runner; `--mode self-contained` adds the runner of each system of
+  `--systems` and each architecture under `libexec/`, built over the platform's
+  hosted arrangement on any machine (a macOS or Windows runner is packed on
+  Linux with no SDK and no C run-time of that system); `--no-universal` packs
+  the selected target alone. e2e 955.
+- **Single files.** `--pkg-format single-file` writes one executable: for a
+  native program the engine's launcher carrying the staged tree as a zstd
+  frame, extracted once into the user's cache under the payload's sha256 and
+  run from there; for an ok image the platform's carrier running the image
+  from memory, one file per system of `--systems`. e2e 956.
+- **Compression in mcpp's own codecs.** `--compress gzip|zstd|xz|none[:level]`
+  (`.tar.gz`, `.tar.zst`, `.tar.xz`, `.tar`) with zlib, zstd and liblzma as
+  dependencies of mcpp: no compressor is looked for on `PATH`, and an archive
+  is the same bytes on every host. A zip's entries are deflated (`gzip`) or
+  stored (`none`).
+- **`mcpp-package.json` and what reads it.** Every staged tree describes its
+  package: platform, the three choices, legs, systems, how it starts, and each
+  file with its role, leg and sha256. `mcpp pack --merge a --merge b` joins
+  packages written on several machines (legs and systems united, one digest
+  per path); `mcpp emit xpkg --package <archive> --url <prefix>` writes the
+  xim-pkgindex entry, one asset for every system for a universal package with
+  its runner as a dependency. `[pack] sign = [argv]` signs each program, image,
+  library and loader before the container, and each single file. e2e 957.
+- The `mcpp.pack` envelope gains `linkage`, `mode`, `pkgFormat`, `legs`,
+  `systems` and each file artifact's `sha256`. A platform's plugin may provide
+  package formats (`pack-format`, `artifact` actions) in the platform phase.
+- `mcpp.lock` records the packages a platform added, and those only they
+  reach, with `origin = "platform"`, and names each entry's configurations in
+  `targets` (absent for an entry of this machine's native configuration alone,
+  so a lock of a natively built project is unchanged): a build for this machine
+  and a build or pack for an ok image leave each other's entries as they were.
+  The `plan` event and `result.json` carry `configuration.platform` and
+  `hostPlatform`.
+
+### Changed
+
+- **`--pkg-format` is the package format of `mcpp pack` and `mcpp run`.**
+  `--format` there is the earlier spelling and prints a warning; on every other
+  command `--format` is the output encoding.
+- The reason `image-tool-absent` is `platform-tool-absent`; new reasons
+  `platform-not-a-platform`, `platform-target-unserved`,
+  `platform-version-group` and `platform-phase-directive`.
+- A layer the target's platform added is reported `platform`, and the
+  platform follows on a `Platform` line (`Host platform` for the host graph).
+- A version of a dependency the index does not have is stated by mcpp: which
+  index, its revision and age, and whether it was refreshed now and why not;
+  the provider's own report is printed under `-v`.
+- A package shared by several configurations of one command is announced once.
+- **With `trim_paths`, clang is given `-ffile-reproducible`** (clang 17 and
+  later): `__FILE__` takes the target's separator where clang applies it. An ok
+  image built on Linux and one built on macOS are the same bytes; one built on
+  a Windows host is not, because clang keeps the `\` it joined an included
+  path with for a POSIX target (#850, upstream), and `mcpp pack --merge`
+  refuses its images beside the others.
+- **`--pkg-format tar` writes `.tar.gz` on every host, Windows included**, with
+  mcpp's own zlib, for a program's package and a library's alike; no `tar` or
+  `gzip` program is run. `--compress none` writes `.tar`.
+- `x86_64-openkal` and `aarch64-openkal` select openkal-platform 0.17.3
+  (openkal-musl 0.22.6, openkal-llvm-runtime 0.16.6): the C library takes a
+  program's arguments when it is entered, which a hosted program on macOS did
+  not receive.
+- A platform's link with `ld.lld` itself finds the linker as `ld.lld`, `lld`
+  or `lld-link` beside the compiler (a Windows payload ships `lld-link`, run
+  with `-flavor gnu`); `mcpp explain <reason>` explains each `platform-*`
+  reason. A build program's cached run is replayed only while what it named
+  below its output directory is there (e2e 958).
+
+### Fixed
+
+- **A version the local index lacks is refreshed for when its install is
+  refused.** The walk refreshes the index when a descriptor is missing, and not
+  when a descriptor is present without the version asked for (version tables
+  are per system, so that absence is not proof). The provider's "not found" for
+  the version is, and it now reaches the refresh policy (offline,
+  `[index] auto_refresh`, the debounce, one sync per run); after a refresh the
+  install is asked once more. A dependency on a version published after the
+  index was last synced (`openkal-llvm-runtime = "0.16.3"`) was refused until
+  `mcpp index update`. e2e 949.
+- **A kernel-abi package over the system's C library is placed into the shared
+  image that reaches it.** Every package providing an `mcpp:` layer was a
+  boundary of static placement and went into programs only, which is right for
+  a C library or a C++ runtime. On a hosted target openkal-linux (-macos,
+  -windows) sits on the system's C library and is an ordinary static library
+  under `mcpplibs.os`; a shared image reaching it was left with `kal_*`
+  undefined, and CPython could not load an extension built on `mcpplibs.os`
+  (`undefined symbol: kal_process_close`). A `kernel-abi` provider is now a
+  boundary only when a C library of the graph sits on it. e2e 950.
+- **A kernel-abi package over the system's C library leaves a hosted row's
+  toolchain in place.** The musl and windows-gnu rows name the payload that
+  supplies the target's C library, and a graph that supplies a C library
+  replaces it; a kernel-abi package counted as one. On linux-aarch64 a project
+  reaching openkal-linux through `mcpplibs.os` then compiled `--linkage
+  static` (the musl row) with the machine's llvm against glibc's headers. A
+  kernel-abi package now supplies the system only on a target that has none of
+  its own (a freestanding or a loader-supplied row). e2e 292.
+- **A package whose descriptor was read is the only one asked for.** A refused
+  install of a namespace-omitted dependency was tried again as
+  `compat:<name>` and `compat.<name>`, shown as downloading, and reported with
+  three addresses, although the descriptor had named the package in
+  `mcpplibs`. The compat spellings are tried only when no descriptor could be
+  read.
+- **Two versions of a package that exports a header directory or provides a
+  target-side layer are refused**, naming both requests. A renamed copy kept
+  its C names and link symbols, and the two met in one link or one include
+  path at a place that named neither.
+- **A version group is checked before the platform completes the graph.** A
+  family package the project pinned outside the group is refused as the
+  group's conflict, with both remedies.
+- **The std module of a macOS build whose C library is the graph's takes the
+  deployment floor** every unit takes; it took the running system's version.
+
 ## [2026.10.26.2] - 2026-10-26
 
 ### Added

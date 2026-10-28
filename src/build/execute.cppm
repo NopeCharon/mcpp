@@ -21,7 +21,8 @@ import mcpp.diag;
 import mcpp.build.plan;
 import mcpp.toolchain.triple;
 import mcpp.freestanding.runner;
-import mcpp.okimage;
+import mcpp.platform;
+import mcpp.libs.json;   // the plan event's platform objects
 import mcpp.build.runner_lookup;    // #544: where the runner's program is
 import mcpp.home;                   // config.toml, for the machine's default toolchain
 import mcpp.libs.toml;
@@ -50,6 +51,7 @@ import mcpp.provider.select;
 import mcpp.runtime.binding;
 import mcpp.log;
 import mcpplibs.os.platform;
+import mcpp.toolchain.platform;
 import mcpp.invocation;
 import mcpp.effects;
 import mcpp.runtime.launch_env;
@@ -158,7 +160,8 @@ std::string toolchain_request_identity() {
     const auto configFile = mcpp::home::root() / "config.toml";
     auto target_table = [&](const std::filesystem::path& file) {
         auto doc = mcpp::libs::toml::parse_file(file);
-        if (!doc || !doc->get_table("target")) return;
+        // `[host]` too: the host graph's platform (SPEC-013 §6.1).
+        if (!doc || (!doc->get_table("target") && !doc->get_table("host"))) return;
         std::ifstream is(file, std::ios::binary);
         std::string text((std::istreambuf_iterator<char>(is)), std::istreambuf_iterator<char>());
         std::uint64_t h = 1469598103934665603ull;
@@ -174,9 +177,14 @@ std::string toolchain_request_identity() {
         target_table(mcpp::home::system_config_file());
     std::string overrides;
     for (auto const& e : mcpp::invocation::with_prefix("MCPP_TARGET_"))
-        if (e.find("_SYSROOT=") != std::string::npos || e.find("_RUN_UNDER=") != std::string::npos)
+        if (e.find("_SYSROOT=") != std::string::npos || e.find("_RUN_UNDER=") != std::string::npos
+            || e.find("_PLATFORM=") != std::string::npos || e.find("_RUNNER=") != std::string::npos)
             overrides += e + ";";
     if (auto s = mcpp::invocation::get("MCPP_SYSROOT")) overrides += std::format("MCPP_SYSROOT={};", *s);
+    // The platforms a flag or the environment selects (SPEC-013 §5.1, §6.1).
+    if (auto s = mcpp::invocation::get("MCPP_PLATFORM")) overrides += std::format("MCPP_PLATFORM={};", *s);
+    if (auto s = mcpp::invocation::get("MCPP_HOST_PLATFORM"))
+        overrides += std::format("MCPP_HOST_PLATFORM={};", *s);
     if (overrides.empty() && targets.empty())
         return std::format("cli={};default={}", cli, machineDefault);
     return std::format("cli={};default={};base={}{}", cli, machineDefault, overrides, targets);
@@ -1065,6 +1073,16 @@ struct ExecutionHost {
     std::string              error;
 };
 
+// The platform's own tool by the name a runner gives it (SPEC-013 §10): the
+// program the build located for it, before any search.
+std::optional<std::filesystem::path> platform_tool(const mcpp::build::BuildContext& ctx,
+                                                   std::string_view name) {
+    auto const& tools = ctx.plan.platform.tools;
+    if (auto it = tools.find(std::string(name)); it != tools.end() && !it->second.empty())
+        return std::filesystem::path(it->second);
+    return std::nullopt;
+}
+
 ExecutionHost locate_run_under(const mcpp::build::BuildContext& ctx, std::string_view tripleKey) {
     ExecutionHost h;
     if (ctx.runUnder.empty()) return h;
@@ -1098,8 +1116,24 @@ ExecutionHost locate_run_under(const mcpp::build::BuildContext& ctx, std::string
 // here, and is believed.
 std::optional<std::string> unreachable_execution(const mcpp::build::BuildContext& ctx,
                                                  std::string_view tripleKey, bool noRunner) {
-    if (noRunner || !ctx.runUnder.empty() || mcpplibs::os::is_macos) return std::nullopt;
+    if (noRunner || !ctx.runUnder.empty()) return std::nullopt;
     auto t = mcpp::toolchain::triple::parse(tripleKey);
+    // A RUNNER THAT RUNS THE ARTIFACT ON A MACHINE OF ITS ARCHITECTURE
+    // (`runner = { ..., host = "same-arch" }`, SPEC-013): an ok image's loader
+    // is a program of this machine, and an image of another architecture is
+    // not one it can map.
+    if (auto const& r = ctx.plan.platform.fields.runner; t && r.set && r.host == "same-arch"
+        && t->arch != mcpp::toolchain::platform::host_arch)
+        return std::format(
+            "cannot run {} artifacts on this {} host: the runner `{}` ({}) runs an artifact on a "
+            "machine of its architecture.\n"
+            "       Name an execution host of that architecture: [target.{}] run_under = "
+            "[\"remote-run\", \"<host>\", \"--\"]\n"
+            "       (in mcpp.toml for the team, or ~/.mcpp/config.toml for this machine).",
+            tripleKey, mcpp::toolchain::platform::host_arch,
+            r.cmd.empty() ? std::string() : r.cmd.front(),
+            mcpp::platform::origin_text(r.origin), tripleKey);
+    if (mcpplibs::os::is_macos) return std::nullopt;
     if (!t || !t->is_apple()) return std::nullopt;
     return std::format(
         "cannot run {} artifacts on this host: {} runs only on macOS.\n"
@@ -1175,50 +1209,34 @@ RunnerChoice choose_device_action(const BuildContext& ctx,
     const auto ft = mcpp::toolchain::triple::parse(ctx.tc.targetTriple);
     if (ft) c.freestanding = ft->is_freestanding();
     c.tripleKey = ft ? ft->str() : ctx.tc.targetTriple;
-    // The graph's answer: the default runner, or a named one a package supplied.
-    if (isDefault) {
-        c.tmpl = ctx.manifest.buildConfig.runner;
-    } else if (auto it = ctx.manifest.buildConfig.namedRunners.find(std::string(which));
-               it != ctx.manifest.buildConfig.namedRunners.end()) {
-        c.tmpl      = it->second.argv;
-        c.longLived = it->second.longLived;
-    }
-    // The row is found as every other `[target.<triple>]` reader finds it
-    // (`find_target_entry`), whichever spelling the section and the toolchain
-    // use. The toolchain's own `targetTriple` is what the driver reported,
-    // which on macOS is `arm64-apple-darwin24.6.0`; an exact lookup of it
-    // matched on Linux and never on macOS (measured on CI, 2026-09-02), and an
-    // exact lookup of the canonical spelling missed a section written
-    // `[target.x86-windows-msvc]`. The raw form is kept as a fallback for a
-    // triple the parser does not know.
-    auto with_slot = [&](const mcpp::manifest::TargetEntry* e) {
-        const mcpp::manifest::TargetEntry* none = nullptr;
-        if (!e) return none;
-        if (isDefault) return e->runner.empty() ? none : e;
-        auto nr = e->namedRunners.find(std::string(which));
-        return (nr != e->namedRunners.end() && !nr->second.empty()) ? e : none;
+    // THE STATEMENT PREPARE MERGED (SPEC-013 §4.5): the platform's runner, a
+    // build program's (`mcpp::runner`), this machine's, the project's
+    // `[target.<selector>]` (a cfg selector as well as a triple, whichever
+    // spelling), the environment's -- the later replacing the earlier. The
+    // project overriding what a dependency supplied is reported.
+    auto const& pf = ctx.plan.platform.fields;
+    auto overrides_program = [&](const mcpp::manifest::platform::Origin& o, bool programHad) {
+        using T = mcpp::manifest::platform::Tier;
+        return programHad && (o.tier == T::Manifest || o.tier == T::Config || o.tier == T::Env);
     };
-    const mcpp::manifest::TargetEntry* entry = nullptr;
-    if (ft) {
-        entry = with_slot(mcpp::build::find_target_entry(ctx.manifest, *ft));
-    } else if (auto it = ctx.manifest.targetOverrides.find(ctx.tc.targetTriple);
-               it != ctx.manifest.targetOverrides.end()) {
-        entry = with_slot(&it->second);
-    }
-    if (entry) {
-        if (isDefault) {
-            c.fromManifest = !ctx.manifest.buildConfig.runner.empty();
-            c.tmpl = entry->runner;
-        } else {
-            c.fromManifest = ctx.manifest.buildConfig.namedRunners.contains(
-                std::string(which));
-            c.tmpl = entry->namedRunners.at(std::string(which));
+    if (isDefault) {
+        if (pf.runner.set) {
+            c.tmpl = pf.runner.cmd;
+            c.fromManifest = overrides_program(pf.runner.origin,
+                                               !ctx.manifest.buildConfig.runner.empty());
         }
+    } else if (auto it = pf.runners.find(std::string(which)); it != pf.runners.end()) {
+        c.tmpl = it->second.value;
+        auto nr = ctx.manifest.buildConfig.namedRunners.find(std::string(which));
+        c.fromManifest = overrides_program(it->second.origin,
+                                           nr != ctx.manifest.buildConfig.namedRunners.end());
+        if (nr != ctx.manifest.buildConfig.namedRunners.end() && !c.fromManifest)
+            c.longLived = nr->second.longLived;
     }
-    // AND THE TOOLCHAIN'S OWN ANSWER, WHEN THE PROJECT AND ITS GRAPH GAVE NONE.
+    // AND THE TOOLCHAIN'S OWN ANSWER, WHEN NOTHING ABOVE GAVE ONE.
     //
-    // The third source and the last. A project's `[target.<triple>] runner`
-    // and a package's `mcpp::runner(...)` both outrank it, because they are
+    // The last source. A project's `[target.<selector>] runner`, a platform's
+    // and a package's `mcpp::runner(...)` all outrank it, because they are
     // statements about THIS program; the payload's is a statement about
     // everything its compiler produces. Measured 2026-09-12 in a sandbox with
     // no `node` on PATH: an Emscripten artefact built correctly and then
@@ -1231,12 +1249,6 @@ RunnerChoice choose_device_action(const BuildContext& ctx,
         c.tmpl = mcpp::toolchain::payload_default_runner(ctx.tc.binaryPath);
         c.fromPayload = !c.tmpl.empty();
     }
-    // AND THE TARGET'S OWN, FOR AN OK IMAGE: the loader is what runs one, on
-    // every system (SPEC 12). `okrun` is found as any runner's program is --
-    // first among the programs the graph built for this machine
-    // (`openkal-tools`), then in declared payloads, then on PATH.
-    if (isDefault && c.tmpl.empty() && ft && ft->is_openkal())
-        c.tmpl = { std::string(mcpp::okimage::kRunner) };
     // `--no-runner` is the operator on THIS host stating a host fact the
     // manifest cannot carry: the triple is native here. On a freestanding
     // target that leaves nothing to execute, and the caller's existing
@@ -1342,10 +1354,14 @@ mcpp::build::result::Record start_record(const BuildContext& ctx) {
     r.pid = mcpp::build::dirlock::process_id();
     r.triple = ctx.tc.targetTriple;
     r.profile = ctx.profile;
+    r.platform = mcpp::platform::to_json(ctx.plan.platform);
+    r.hostPlatform = mcpp::platform::to_json(ctx.hostPlatform);
     mcpp::build::result::write(r);
     mcpp::build::result::emit("plan", {{"configuration", {
         {"triple", r.triple}, {"profile", r.profile}, {"fingerprint", r.fingerprint},
-        {"outputDir", r.outputDir.generic_string()}}}});
+        {"outputDir", r.outputDir.generic_string()},
+        {"platform", nlohmann::json::parse(r.platform, nullptr, false)},
+        {"hostPlatform", nlohmann::json::parse(r.hostPlatform, nullptr, false)}}}});
     return r;
 }
 
@@ -1386,12 +1402,16 @@ FastRecord fast_path_begin(const std::filesystem::path& projectRoot,
     if (previous) {
         f.record.triple = previous->triple;
         f.record.profile = previous->profile;
+        f.record.platform = previous->platform;
+        f.record.hostPlatform = previous->hostPlatform;
         f.artifacts = std::move(previous->artifacts);
     }
     res::write(f.record);
     res::emit("plan", {{"configuration", {
         {"triple", f.record.triple}, {"profile", f.record.profile},
-        {"fingerprint", f.record.fingerprint}, {"outputDir", f.record.outputDir.generic_string()}}}});
+        {"fingerprint", f.record.fingerprint}, {"outputDir", f.record.outputDir.generic_string()},
+        {"platform", nlohmann::json::parse(f.record.platform, nullptr, false)},
+        {"hostPlatform", nlohmann::json::parse(f.record.hostPlatform, nullptr, false)}}}});
     return f;
 }
 void fast_path_end(FastRecord& f, bool ok) {
@@ -2027,22 +2047,28 @@ export int list_runners(const std::string& package_filter,
     if (!ctx) { mcpp::ui::error(ctx.error()); return 2; }
 
     const auto& bc = ctx->manifest.buildConfig;
+    // The runners prepare merged: the platform's, a build program's, this
+    // machine's and the project's, each with where it was stated.
+    const auto& pf = ctx->plan.platform.fields;
     const auto ft  = mcpp::toolchain::triple::parse(ctx->tc.targetTriple);
     const std::string key = ft ? ft->str() : ctx->tc.targetTriple;
     std::println("Target {}", key);
 
-    if (bc.runner.empty() && bc.namedRunners.empty()) {
+    if (!pf.runner.set && pf.runners.empty()) {
         std::println("  (none — this project reaches its artifact by executing it)");
         return 0;
     }
-    if (!bc.runner.empty())
-        std::println("  {:<12} {}", "(default)", bc.runner.front());
-    for (auto const& [name, nr] : bc.namedRunners) {
-        std::println("  {:<12} {}{}", name,
-                     nr.argv.empty() ? std::string("(no argv)") : nr.argv.front(),
-                     nr.longLived ? "   [long-lived]" : "");
+    if (pf.runner.set)
+        std::println("  {:<12} {}   ({})", "(default)", pf.runner.cmd.front(),
+                     mcpp::platform::origin_text(pf.runner.origin));
+    for (auto const& [name, w] : pf.runners) {
+        auto nr = bc.namedRunners.find(name);
+        const bool longLived = nr != bc.namedRunners.end() && nr->second.longLived;
+        std::println("  {:<12} {}   ({}){}", name,
+                     w.value.empty() ? std::string("(no argv)") : w.value.front(),
+                     mcpp::platform::origin_text(w.origin), longLived ? "   [long-lived]" : "");
     }
-    if (bc.runExclusive)
+    if (bc.runExclusive || pf.runner.exclusive)
         std::println("  note: this target's runs cannot overlap; `mcpp test` "
                      "serialises them");
     return 0;
@@ -2807,7 +2833,7 @@ int run_artifact_via_runner(mcpp::build::BuildContext& ctx,
     if (!format_name.empty() && choice.tmpl.empty()
         && std::filesystem::is_directory(exe, dirEc)) {
         std::println(stderr,
-            "error: --format {} produced a directory, '{}', and no runner reaches it.\n"
+            "error: --pkg-format {} produced a directory, '{}', and no runner reaches it.\n"
             "       A directory is not executed directly: a runner named '{}' runs\n"
             "       it. A package supplies one with `mcpp::runner(\"{}\", …)`, or the\n"
             "       project declares it:\n"
@@ -2847,6 +2873,7 @@ int run_artifact_via_runner(mcpp::build::BuildContext& ctx,
         auto tmpl = choice.tmpl;
         auto found = mcpp::build::runner_lookup::locate(
             tmpl.front(), ctx.xlingsDepBinDirs, mcpp::invocation::get("PATH").value_or(""));
+        if (auto tool = platform_tool(ctx, tmpl.front())) found.program = *tool;
         if (!found.program) {
             std::println(stderr, "error: {}",
                 mcpp::build::runner_lookup::not_found_message(
@@ -3007,7 +3034,7 @@ export int build_run_target(const std::optional<std::string>& targetName,
     // no reading for a file this host was never going to execute on its own.
     if (!format.empty() && no_runner) {
         std::println(stderr,
-            "error: --format and --no-runner cannot be combined: a "
+            "error: --pkg-format and --no-runner cannot be combined: a "
             "distributable is not something this host executes directly.");
         return 2;
     }
@@ -3083,7 +3110,7 @@ export int build_run_target(const std::optional<std::string>& targetName,
             // shape that reports zero artifacts fails LOUDLY here instead of
             // dereferencing past the end of an empty vector below.
             std::println(stderr,
-                "error: --format {} reported success and named no artifact to run", format);
+                "error: --pkg-format {} reported success and named no artifact to run", format);
             return 1;
         }
         // THE RUNNER RESOLUTION NEEDS A BuildContext, AND build_and_pack's OWN
@@ -3116,7 +3143,7 @@ export int build_run_target(const std::optional<std::string>& targetName,
                 names += a.string();
             }
             std::println(stderr,
-                "error: --format {} produced {} distributables ({}); mcpp run needs "
+                "error: --pkg-format {} produced {} distributables ({}); mcpp run needs "
                 "exactly one to hand to the runner", format, outcome.artifacts.size(), names);
             return 1;
         }
@@ -3212,7 +3239,7 @@ export int build_run_target(const std::optional<std::string>& targetName,
             std::println(stderr,
                 "error: '{}' is an application, and on {} an application is "
                 "a shared library that a package installs. Run it through a "
-                "distributable: mcpp run --format <name>, where <name> is "
+                "distributable: mcpp run --pkg-format <name>, where <name> is "
                 "one of: {}",
                 t.name, ctx->tc.targetTriple,
                 formats.empty() ? std::string("none declared") : formats);
@@ -3457,6 +3484,9 @@ struct TestBuild {
     bool                                     bulkBuiltEverything = false;
     std::filesystem::path                    ninjaLog;
     std::uintmax_t                           logFrom = 0;
+    // MCPP_BIN_<NAME> for each program of the package, built before the
+    // tests (L5).
+    std::vector<std::pair<std::string, std::string>> programEnv;
 
     // How the test binaries are executed, resolved once for the build
     // (#544): every test of one build shares a target.
@@ -3683,6 +3713,7 @@ static void test_resolve_runner(TestBuild& tb, const TestOptions& testOpts, bool
     if (!runnerTmpl.empty()) {
         auto found = mcpp::build::runner_lookup::locate(
             runnerTmpl.front(), ctx->xlingsDepBinDirs, mcpp::invocation::get("PATH").value_or(""));
+        if (auto tool = platform_tool(*ctx, runnerTmpl.front())) found.program = *tool;
         if (found.program) runnerTmpl.front() = found.program->string();
         else tb.invocationNotRunReason = mcpp::build::runner_lookup::not_found_message(
             runnerChoice.tripleKey, runnerTmpl.front(), found.searched);
@@ -3819,7 +3850,8 @@ static int test_run_member(TestBuild& tb, const TestOptions& testOpts,
         // Clamped rather than made an error: an exclusive target with one test
         // is an ordinary run, and refusing it would turn a correct
         // configuration into a failure.
-        const bool exclusiveDevice = ctx->manifest.buildConfig.runExclusive
+        const bool exclusiveDevice = (ctx->manifest.buildConfig.runExclusive
+                                      || ctx->plan.platform.fields.runner.exclusive)
                                   && !runnerChoice.tmpl.empty();
         const int runJobsHere = exclusiveDevice ? 1 : runJobs;
         if (exclusiveDevice && runJobs > 1 && list.size() > 1) {
@@ -4039,6 +4071,8 @@ static int test_run_member(TestBuild& tb, const TestOptions& testOpts,
         // A GL test that cannot find a driver fails the same way a GL program
         // does, so it must be told the same things.
         for (auto& kv : subosEnv) childEnv.push_back(kv);
+        // ...and where the package's own programs are (L5).
+        for (auto& kv : tb.programEnv) childEnv.push_back(kv);
         // ...and, through a runner, the files the test carries with it, as
         // `mcpp run` hands them over (see `runtime_files_for`). Written here,
         // in the single-threaded pass, one list per test program.
@@ -4258,6 +4292,45 @@ export int run_tests(std::span<const std::string> passthrough,
         }
         return 0;
     }
+    // THE PACKAGE'S PROGRAMS, BUILT BEFORE ITS TESTS AND NAMED TO THEM (L5).
+    // A test that runs the program it tests finds it as MCPP_BIN_<NAME> (the
+    // target's name, upper-cased, every other character `_`), the way a Cargo
+    // integration test finds CARGO_BIN_EXE_<name>. Built by the pass `mcpp
+    // build` runs -- its fast path when nothing changed -- so a program is
+    // never linked against the tests' dev-dependencies. Before this a package
+    // whose tests ran its own executable had to be built first by hand.
+    std::vector<std::pair<std::string, std::string>> programEnv;
+    {
+        bool hasPrograms = false;
+        if (auto m = mcpp::manifest::load(testRoot / "mcpp.toml")) {
+            hasPrograms = std::ranges::any_of(m->targets, [](auto const& t) {
+                return t.kind == mcpp::manifest::Target::Binary
+                    || t.kind == mcpp::manifest::Target::Application;
+            });
+            std::error_code ec;
+            if (m->targets.empty() && std::filesystem::exists(testRoot / "src" / "main.cpp", ec))
+                hasPrograms = true;
+        }
+        if (hasPrograms) {
+            auto binCtx = prepare_build(/*print_fp=*/false, /*includeDevDeps=*/false, {}, overrides);
+            if (!binCtx) { mcpp::ui::error(binCtx.error()); return 2; }
+            if (std::ranges::any_of(binCtx->plan.linkUnits,
+                                    [](auto const& lu) { return lu.kind == LinkUnit::Binary; })) {
+                if (int rc = run_build_plan(*binCtx, mcpp::log::is_verbose(), false); rc != 0)
+                    return rc;
+                for (auto const& lu : binCtx->plan.linkUnits) {
+                    if (lu.kind != LinkUnit::Binary) continue;
+                    std::string key = "MCPP_BIN_";
+                    for (char c : lu.targetName)
+                        key += (c >= 'a' && c <= 'z') ? char(c - 'a' + 'A')
+                             : ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) ? c : '_';
+                    programEnv.emplace_back(std::move(key),
+                                            (binCtx->outputDir / lu.output).lexically_normal().string());
+                }
+            }
+        }
+    }
+
     // 3. prepare_build with dev-deps enabled + synthetic targets.
     // A test binary is executed, so the run tier applies here exactly as it
     // does to `mcpp run` — `[xlings.workspace]` has no separate `test` tier
@@ -4269,6 +4342,7 @@ export int run_tests(std::span<const std::string> passthrough,
                                   std::move(overrides));
     if (!prepared) { mcpp::ui::error(prepared.error()); return 2; }
     TestBuild tb;
+    tb.programEnv = std::move(programEnv);
     tb.ctx.emplace(std::move(*prepared));
     tb.backend = mcpp::build::make_ninja_backend();
     tb.ninjaLog = tb.ctx->outputDir / ".ninja_log";

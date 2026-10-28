@@ -9,6 +9,10 @@ module;
 export module mcpp.cli.cmd_build;
 
 import std;
+import mcpp.platform;
+import mcpp.toolchain.platform;
+import mcpp.toolchain.triple;
+import mcpp.build.runner_lookup;
 import mcpplibs.cmdline;
 import mcpp.build.prepare;
 import mcpp.build.execute;
@@ -36,6 +40,7 @@ import mcpp.hooks;
 import mcpp.libs.json;
 import mcpp.log;
 import mcpplibs.os.fs;
+import mcpplibs.os.process;   // platform-step: a program's output alone
 import mcpp.invocation;
 import mcpp.effects;
 import mcpp.run;
@@ -974,7 +979,12 @@ export int cmd_run(const mcpplibs::cmdline::ParsedArgs& parsed,
     // pack --format`; `run` only adds the pairing with `--no-runner`, checked
     // in build_run_target where the runner is actually chosen.
     std::string format;
-    if (auto f = parsed.value("format")) format = *f;
+    if (auto f = parsed.value("pkg-format")) format = *f;
+    else if (auto f = parsed.value("format")) {
+        // The earlier spelling (`mcpp pack --pkg-format`'s note says why).
+        mcpp::ui::warning("`mcpp run --format` is the earlier spelling of --pkg-format");
+        format = *f;
+    }
     if (parsed.is_flag_set("list-runners"))
         return mcpp::build::list_runners(package_filter, cache_mode, no_cache,
                                          target_triple, features, profile, accel);
@@ -1284,6 +1294,34 @@ export int cmd_test(const mcpplibs::cmdline::ParsedArgs& parsed,
             mcpp::ui::plain(std::format("    slowest: {}", slowest));
         return rc;
     }
+    // A PLATFORM PACKAGE IS TESTED ON THE TARGETS IT SERVES (SPEC-013 §2):
+    // with no --target, its tests are built for each of its `targets` with the
+    // package itself as the platform, and run where its runner can run them
+    // (`host = "same-arch"`: the target of this machine's architecture); the
+    // others are built and reported as not run.
+    if (ov.target_triple.empty() && ov.package_filter.empty()) {
+        std::error_code ec;
+        auto root = mcpp::project::find_manifest_root(std::filesystem::current_path(ec));
+        auto m = root ? mcpp::manifest::load(*root / "mcpp.toml")
+                      : std::expected<mcpp::manifest::Manifest, mcpp::manifest::ManifestError>(
+                            std::unexpected(mcpp::manifest::ManifestError{}));
+        if (m && m->platformDeclared && !m->platform.targets.value.empty()) {
+            mcpp::invocation::set("MCPP_PLATFORM", "path:" + root->generic_string());
+            int rc = 0;
+            for (auto const& t : m->platform.targets.value) {
+                auto tov = ov;
+                tov.target_triple = t;
+                auto tto = to;
+                auto tt = mcpp::toolchain::triple::parse(t);
+                const bool here = tt && tt->arch == mcpp::toolchain::platform::host_arch;
+                if (!here && m->platform.runner.host == "same-arch") tto.noRun = true;
+                mcpp::ui::info("Testing", std::format("platform {} on {}{}", m->package.name, t,
+                                                      tto.noRun ? " (built, not run here)" : ""));
+                if (int r = mcpp::build::run_tests(passthrough, tov, tto); r != 0 && rc == 0) rc = r;
+            }
+            return rc;
+        }
+    }
     return mcpp::build::run_tests(passthrough, ov, to);
 }
 
@@ -1476,58 +1514,246 @@ export int cmd_link_output(const mcpplibs::cmdline::ParsedArgs& parsed,
     return mcpp::run::run_exec(std::vector<std::string>(command.begin(), command.end()));
 }
 
-// `mcpp okimage-finish --okld <okld> -- <linked> <image> [<needed.okso>…]`
-// (internal: invoked by build.ninja for the target `<arch>-openkal`; design
-// 2026-10-26 part 2, §8.5).
+// `mcpp platform-step capture --out <file> -- <argv…>`
+// `mcpp platform-step seal --steps <file> --digest <hex> -- <linked> <artifact> [<needed>…]`
+// (internal: invoked by build.ninja for a platform's link; SPEC-013 §4, §4.6).
 //
-// AN IMAGE IS PUBLISHED ONLY ONCE IT MEETS THE CONVENTION. The linked file is
-// copied beside the image's name, `okld note` writes its requirements note from
-// its strong imports, `okld check` checks every clause of SPEC 12.2 against it
-// and the images it needs, and only then does the copy take the name. A check
-// that fails leaves no image behind, and the edge runs again next time.
-export int cmd_okimage_finish(const mcpplibs::cmdline::ParsedArgs& parsed,
-                              std::span<const std::string> rest) {
+// CAPTURE saves a program's standard output as a link input (an ok image's
+// notes, from `okld note-source`), written beside its name and renamed, so an
+// interrupted run leaves no half file.
+//
+// SEAL PUBLISHES AN ARTIFACT ONLY ONCE EVERY STEP ACCEPTED IT. The linked file
+// is copied beside the artifact's name; each step runs on the copy, `{}` being
+// the copy and `{needed}` the shared artifacts it needs (an option before it
+// repeated for each); only then does the copy take the name. A step that fails
+// leaves the previous artifact in place and no copy behind, names the step
+// and prints what it said; the edge runs again next time.
+export int cmd_platform_step(const mcpplibs::cmdline::ParsedArgs& parsed,
+                             std::span<const std::string> rest) {
     namespace fs = std::filesystem;
-    const std::string okld = parsed.option_or_empty("okld").value();
-    if (okld.empty() || rest.size() < 2) {
-        std::println(stderr, "error: okimage-finish needs --okld <okld> -- <linked> <image> [needed…]");
-        return 2;
-    }
-    const fs::path linked = rest[0], image = rest[1];
-    auto tmp = image; tmp += ".tmp";
-    std::error_code ec;
-    fs::copy_file(linked, tmp, fs::copy_options::overwrite_existing, ec);
-    if (ec) {
-        std::println(stderr, "error: cannot copy {} to {}: {}", linked.string(), tmp.string(), ec.message());
-        return 1;
-    }
-    auto run = [&](std::vector<std::string> argv) {
-        int spawnError = 0;
-        auto r = mcpp::run::capture_exec(argv, {}, {}, &spawnError);
-        if (spawnError != 0) {
-            std::println(stderr, "error: cannot start {}: {}", okld,
-                         std::generic_category().message(spawnError));
+    const std::string mode = parsed.positional_count() > 0 ? parsed.positional(0) : std::string();
+    // The program's standard output, kept apart: its standard error is the
+    // build's, passed on (a warning it writes there is not part of what it
+    // produces, which `capture` saves as a source file).
+    auto run = [&](const std::vector<std::string>& argv, std::string* out) {
+        namespace proc = mcpplibs::os::process;
+        proc::spawn_options o;
+        o.program = argv.front();
+        o.args.assign(argv.begin() + 1, argv.end());
+        std::string shown;
+        for (auto const& a : argv) shown += (shown.empty() ? "" : " ") + a;
+        auto r = proc::run(std::move(o));
+        if (!r) {
+            std::println(stderr, "error: cannot start {}", shown);
             return false;
         }
-        if (r.exit_code != 0) {
-            std::print(stderr, "{}", r.output);
+        std::print(stderr, "{}", r->err);
+        if (!r->status.success()) {
+            // What a refusing step wrote is its reason (`okld check` names the
+            // import it refused), on either stream.
+            std::print(stderr, "{}", r->out);
+            std::println(stderr, "error: `{}` exited {}", shown, r->status.shell_code());
             return false;
         }
+        if (out) *out = std::move(r->out);
         return true;
     };
-    std::vector<std::string> check{ okld, "check", tmp.string() };
-    for (std::size_t i = 2; i < rest.size(); ++i) { check.push_back("--with"); check.push_back(rest[i]); }
-    if (!run({ okld, "note", tmp.string() }) || !run(check)) {
-        fs::remove(tmp, ec);
-        std::println(stderr, "error: {} does not meet the ok-image convention (openkal SPEC 12)",
-                     image.filename().string());
+    std::error_code ec;
+    if (mode == "capture") {
+        const std::string out = parsed.option_or_empty("out").value();
+        if (out.empty() || rest.empty()) {
+            std::println(stderr, "error: platform-step capture needs --out <file> -- <argv…>");
+            return 2;
+        }
+        std::string text;
+        if (!run(std::vector<std::string>(rest.begin(), rest.end()), &text)) return 1;
+        fs::create_directories(fs::path(out).parent_path(), ec);
+        auto tmp = fs::path(out);
+        tmp += ".tmp";
+        {
+            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            f << text;
+            if (!f) { std::println(stderr, "error: cannot write {}", tmp.string()); return 1; }
+        }
+        fs::rename(tmp, out, ec);
+        if (ec) { std::println(stderr, "error: cannot publish {}: {}", out, ec.message()); return 1; }
+        return 0;
+    }
+    if (mode == "seal") {
+        const std::string hex = parsed.option_or_empty("steps-hex").value();
+        if (hex.empty() || hex.size() % 2 != 0 || rest.size() < 2) {
+            std::println(stderr, "error: platform-step seal needs --steps-hex <steps> -- <linked> <artifact> [needed…]");
+            return 2;
+        }
+        std::string text;
+        for (std::size_t i = 0; i < hex.size(); i += 2) {
+            unsigned v = 0;
+            auto [p, e] = std::from_chars(hex.data() + i, hex.data() + i + 2, v, 16);
+            if (e != std::errc{} || p != hex.data() + i + 2) {
+                std::println(stderr, "error: platform-step seal: the steps are not hexadecimal");
+                return 2;
+            }
+            text.push_back(static_cast<char>(v));
+        }
+        std::vector<std::vector<std::string>> steps;
+        {
+            std::istringstream in(text);
+            std::string line;
+            while (std::getline(in, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.empty()) continue;
+                std::vector<std::string> step;
+                std::size_t from = 0;
+                for (;;) {
+                    auto tab = line.find('\t', from);
+                    step.push_back(line.substr(from, tab == std::string::npos ? std::string::npos : tab - from));
+                    if (tab == std::string::npos) break;
+                    from = tab + 1;
+                }
+                steps.push_back(std::move(step));
+            }
+        }
+        // A seal with no step would publish what it was asked to seal.
+        if (steps.empty()) {
+            std::println(stderr, "error: platform-step seal was given no step");
+            return 2;
+        }
+        const fs::path linked = rest[0], artifact = rest[1];
+        const std::vector<std::string> needed(rest.begin() + 2, rest.end());
+        auto tmp = artifact;
+        tmp += ".tmp";
+        fs::copy_file(linked, tmp, fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            std::println(stderr, "error: cannot copy {} to {}: {}", linked.string(), tmp.string(), ec.message());
+            return 1;
+        }
+        for (auto const& step : steps) {
+            if (!run(mcpp::platform::expand_step(step, tmp.string(), needed), nullptr)) {
+                fs::remove(tmp, ec);
+                std::println(stderr, "error: {} was not sealed: a step of its platform's "
+                             "[platform.link] seal refused it", artifact.filename().string());
+                return 1;
+            }
+        }
+        fs::rename(tmp, artifact, ec);
+        if (ec) {
+            std::println(stderr, "error: cannot publish {}: {}", artifact.string(), ec.message());
+            return 1;
+        }
+        return 0;
+    }
+    std::println(stderr, "error: platform-step takes `capture` or `seal`");
+    return 2;
+}
+
+// `mcpp self env --target <t>` / `--host` (SPEC-013 §9): one configuration,
+// prepared and not built -- the toolchain, the platform and its source, the
+// tools it builds for this machine, the runner and where its program is.
+export int cmd_env_configuration(const mcpplibs::cmdline::ParsedArgs& parsed) {
+    bool json = false;
+    if (auto f = parsed.value("format")) {
+        if (!mcpp::wire::parse_format(*f)) {
+            std::println(stderr, "error: {}", mcpp::wire::unsupported_format(*f));
+            return 2;
+        }
+        json = true;
+    }
+    const std::string target = parsed.value("target").value_or("");
+    const bool host = parsed.is_flag_set("host");
+    const bool wasQuiet = mcpp::ui::is_quiet();
+    if (json) mcpp::ui::set_quiet(true);
+    auto ctx = mcpp::build::prepare_configuration(host ? std::string_view{} : std::string_view(target));
+    mcpp::ui::set_quiet(wasQuiet);
+    if (!ctx) {
+        if (json) {
+            mcpp::wire::Envelope env{.kind = "mcpp.env", .effects = {}};
+            env.data = nullptr;
+            env.diagnostics.push_back({"MCPP_CONFIGURATION_FAILED", mcpp::wire::Severity::Error,
+                                       ctx.error()});
+            std::println("{}", mcpp::wire::to_json(env).dump());
+        } else {
+            mcpp::ui::error(ctx.error());
+        }
         return 1;
     }
-    fs::rename(tmp, image, ec);
-    if (ec) {
-        std::println(stderr, "error: cannot publish {}: {}", image.string(), ec.message());
-        return 1;
+    auto const& P = host ? ctx->hostPlatform : ctx->plan.platform;
+    // The graph reported: the host graph's triple and compiler with --host.
+    const std::string triple = host ? ctx->hostTriple : ctx->tc.targetTriple;
+    const std::string compiler = host ? ctx->hostCompiler : ctx->tc.binaryPath.generic_string();
+    const std::string compilerOrigin = host ? ctx->hostCompilerOrigin : ctx->compilerChoice.origin;
+    auto const& runner = P.fields.runner;
+    std::string runnerProgram;
+    if (runner.set && !runner.cmd.empty()) {
+        // The platform's own tool when it is one (located by the build that
+        // used it), else the program the runner names on this machine.
+        if (auto it = P.tools.find(runner.cmd.front()); it != P.tools.end()) {
+            runnerProgram = it->second;
+        } else {
+            auto found = mcpp::build::runner_lookup::locate(
+                runner.cmd.front(), ctx->xlingsDepBinDirs,
+                mcpp::invocation::get("PATH").value_or(""));
+            if (found.program) runnerProgram = found.program->generic_string();
+        }
     }
+    if (json) {
+        nlohmann::json tools = nlohmann::json::object();
+        for (auto const& [name, path] : P.tools) tools[name] = path;
+        nlohmann::json data{
+            {"triple", triple},
+            {"graph", host ? "host" : "target"},
+            {"toolchain", {{"compiler", compiler}, {"origin", compilerOrigin}}},
+            {"platform", nlohmann::json::parse(mcpp::platform::to_json(P), nullptr, false)},
+            {"tools", std::move(tools)},
+            {"runner", !runner.set ? nlohmann::json(nullptr) : nlohmann::json{
+                {"argv", runner.cmd}, {"host", runner.host}, {"exclusive", runner.exclusive},
+                {"program", runnerProgram.empty() ? nlohmann::json(nullptr) : nlohmann::json(runnerProgram)},
+                {"source", mcpp::platform::origin_text(runner.origin)}}},
+            {"runUnder", ctx->runUnder},
+        };
+        mcpp::wire::Envelope env{.kind = "mcpp.env", .effects = {}};
+        env.data = std::move(data);
+        for (auto const& n : ctx->planNotes)
+            env.diagnostics.push_back({n.code, n.severity, n.message});
+        mcpp::wire::emit(env);
+        return 0;
+    }
+    for (auto const& n : ctx->planNotes) mcpp::ui::warning(n.message);
+    std::println("{:<10} {}", host ? "host" : "target", triple);
+    std::println("{:<10} {} ({})", "compiler", compiler, compilerOrigin);
+    std::println("{:<10} {}{}", "platform", P.display(),
+                 P.active ? std::format(" ({})", mcpp::platform::origin_text(P.selection.origin))
+                          : std::string());
+    for (auto const& [label, value] : mcpp::platform::report_rows(P))
+        std::println("{:<10} {:<17} {}", "", label, value);
+    for (auto const& [name, path] : P.tools)
+        std::println("{:<10} {:<17} {}", "tool", name, path);
+    if (runner.set) {
+        std::string argv;
+        for (auto const& a : runner.cmd) argv += (argv.empty() ? "" : " ") + a;
+        std::println("{:<10} {}  ({}){}", "runner", argv, mcpp::platform::origin_text(runner.origin),
+                     runnerProgram.empty() ? std::string("  -- not found on this machine")
+                                           : "  -> " + runnerProgram);
+    }
+    if (!ctx->runUnder.empty()) {
+        std::string argv;
+        for (auto const& a : ctx->runUnder) argv += (argv.empty() ? "" : " ") + a;
+        std::println("{:<10} {}  ({})", "run_under", argv, ctx->runUnderOrigin);
+    }
+    return 0;
+}
+
+
+// `mcpp toolchain install --target <t>` with no compiler named installs THE
+// CONFIGURATION (SPEC-013 §7): the toolchain (already installed by the
+// caller), then the platform package, the packages the platform adds and the
+// tools it builds for this machine, so a build of the target works with
+// `--offline` afterwards.
+export int cmd_install_configuration(std::string_view target) {
+    auto ctx = mcpp::build::prepare_configuration(target);
+    if (!ctx) { mcpp::ui::error(ctx.error()); return 1; }
+    if (ctx->plan.platform.active)
+        mcpp::ui::info("Installed", std::format("{} for {}: {} tool(s) built for this machine",
+            ctx->plan.platform.display(), target, ctx->plan.platform.tools.size()));
     return 0;
 }
 

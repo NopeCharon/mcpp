@@ -90,7 +90,14 @@ prepare_build(bool print_fingerprint,
         return prepare_build_pass(print_fingerprint, includeDevDeps,
                                   std::move(extraTargets), std::move(overrides));
     auto first = prepare_build_pass(print_fingerprint, includeDevDeps, extraTargets, overrides);
-    if (first) { (void)take_toolchain_restart(); return first; }
+    if (first) { (void)take_toolchain_restart(); (void)take_platform_restart(); return first; }
+    // A platform that states a target base, fetched by this pass: the next
+    // reads its `[platform]` before the base is decided (SPEC-013 §7).
+    if (auto root = take_platform_restart(); root && overrides.platform_root.empty()) {
+        overrides.platform_root = std::move(*root);
+        return prepare_build(print_fingerprint, includeDevDeps, std::move(extraTargets),
+                             std::move(overrides));
+    }
     auto restart = take_toolchain_restart();
     if (!restart) return first;
     overrides.toolchain_statement = std::move(restart->first);
@@ -122,6 +129,13 @@ void read_build_programs_marker(BuildOverrides& ov) {
         if (eq == std::string::npos) continue;
         const auto key = line.substr(0, eq), value = line.substr(eq + 1);
         if (key == "toolchain" && ov.toolchain.empty()) ov.toolchain = value;
+        // A host graph with a platform (SPEC-013 §6): the programs are built
+        // for its target, by its choice.
+        else if (key == "platform" && ov.platform_choice.empty()) ov.platform_choice = value;
+        else if (key == "target" && ov.target_triple.empty()) {
+            ov.target_triple = value;
+            ov.host_target = false;
+        }
         else if (key == "profile" && ov.profile.empty()) ov.profile = value;
         else if (key == "index-store" && ov.project_index_root.empty()) ov.project_index_root = value;
         else if (key == "pin")
@@ -136,8 +150,14 @@ prepare_build_pass(bool print_fingerprint,
                    std::vector<mcpp::manifest::Target> extraTargets,
                    BuildOverrides overrides) {
     read_build_programs_marker(overrides);
-    PrepareState state(print_fingerprint, includeDevDeps,
-                        std::move(extraTargets), std::move(overrides));
+    // ON THE HEAP. The state is over 100 KiB, and a prepare nests: a host
+    // tool's sub-build, then its build programs' graph, each its own prepare.
+    // Three of them on a Windows main thread's 1 MiB stack overflowed it
+    // (measured: openkal-platform's tests on windows-2022 ended with exit 127
+    // and no word, in the host graph of `okld`'s build).
+    auto statePtr = std::make_unique<PrepareState>(print_fingerprint, includeDevDeps,
+                                                   std::move(extraTargets), std::move(overrides));
+    PrepareState& state = *statePtr;
     pending_flag_words_notes().clear();
     g_notesOnFailure.clear();
 

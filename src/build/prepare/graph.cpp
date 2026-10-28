@@ -988,6 +988,36 @@ step4b_identity_version_merge(PrepareState& state, WorklistItemCtx& ctx,
                             spec.version));
                     }
 
+                    // THE RENAME'S BOUNDARY (design 2026-10-28 §8.2): it renames
+                    // C++ modules and nothing else, so it separates two versions
+                    // only when their whole interface is named modules. A package
+                    // that exports a header directory, or provides a target-side
+                    // layer, has C names and link symbols the rename cannot touch:
+                    // two of them meet in one link, or in one include path, at a
+                    // place that names neither (measured with two openkal
+                    // releases in one graph). Refused here, naming both requests.
+                    {
+                        const bool headers = !secondaryManifest.buildConfig.includeDirs.empty();
+                        const bool layer = std::ranges::any_of(secondaryManifest.provides,
+                            [](const std::string& c) { return c.starts_with("mcpp:"); });
+                        if (headers || layer)
+                            return std::unexpected(std::format(
+                                "dependency '{}{}{}' has irreconcilable versions:\n"
+                                "  '{}' requested by '{}'\n"
+                                "  '{}' requested by '{}'\n"
+                                "Two versions cannot share one build: the package {}, and a "
+                                "renamed copy keeps those names, so they would collide in the "
+                                "link or in the include path. Align the requests on one version "
+                                "(pin it in your mcpp.toml){}.",
+                                key.ns, key.ns.empty() ? "" : ".", key.shortName,
+                                it->second.version, it->second.requestedBy,
+                                spec.version, item.requestedBy,
+                                layer ? "provides a target-side layer" : "exports a header directory",
+                                state.platform.active
+                                    ? std::format(", or select the release of {} that carries the "
+                                                  "version you need", state.platform.display())
+                                    : std::string()));
+                    }
                     // Module names are authored API and are not required to
                     // mirror package identity. Discover every provided module
                     // root from the secondary's source text, then rewrite the
@@ -2364,6 +2394,10 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
                 childSpec.features.push_back(depFeat);
     };
 
+    // The platform package first: its `[platform]` decides what the graph
+    // is completed with once the root's own requests are walked (SPEC-013).
+    step4b_seed_platform(state);
+
     // Seed the worklist from the main manifest. Dev-deps only when the
     // caller wants them; they're never propagated transitively.
     const std::string mainPkgLabel = state.m->package.name;
@@ -2398,25 +2432,46 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
     }
 
 
-    while (!state.worklist.empty()) {
-        WorklistItemCtx ctx;
-        ctx.item = std::move(state.worklist.front());
-        state.worklist.pop_front();
+    auto drain = [&]() -> std::expected<void, std::string> {
+        while (!state.worklist.empty()) {
+            WorklistItemCtx ctx;
+            ctx.item = std::move(state.worklist.front());
+            state.worklist.pop_front();
 
-        if (auto r = step4b_resolve_identity(state, ctx); !r)
-            return std::unexpected(r.error());
-
-        if (auto it = state.resolved.find(ctx.key); it != state.resolved.end()) {
-            if (auto r = step4b_handle_already_resolved(state, ctx, it); !r)
+            if (auto r = step4b_resolve_identity(state, ctx); !r)
                 return std::unexpected(r.error());
-            continue;
-        }
 
-        if (auto r = step4b_acquire_dependency_source(state, ctx); !r)
-            return std::unexpected(r.error());
-        if (auto r = step4b_finalize_dependency(state, ctx); !r)
-            return std::unexpected(r.error());
+            if (auto it = state.resolved.find(ctx.key); it != state.resolved.end()) {
+                if (auto r = step4b_handle_already_resolved(state, ctx, it); !r)
+                    return std::unexpected(r.error());
+                continue;
+            }
+
+            if (auto r = step4b_acquire_dependency_source(state, ctx); !r)
+                return std::unexpected(r.error());
+            if (auto r = step4b_finalize_dependency(state, ctx); !r)
+                return std::unexpected(r.error());
+        }
+        return {};
+    };
+    if (auto r = drain(); !r) return r;
+    // THE PLATFORM COMPLETES THE GRAPH (SPEC-013 §4.3, §4.4): the layers no
+    // package of the graph provides and the tools it does not build are added
+    // as the platform's, and walked like any request. A few rounds at most: the
+    // packages one round adds may provide a layer the next then leaves.
+    // The version group is checked before each round's walk as well as after
+    // the last: a package of the family the project pinned outside the group
+    // is refused as such, before the platform's own packages would meet it as
+    // a second version of themselves.
+    for (int round = 0; round < 3; ++round) {
+        auto pushed = step4b_apply_platform(state);
+        if (!pushed) return std::unexpected(pushed.error());
+        if (auto r = step4b_check_platform_versions(state); !r) return r;
+        if (!*pushed) break;
+        if (auto r = drain(); !r) return r;
     }
+    if (auto r = step4b_check_platform_versions(state); !r) return r;
+    step4b_platform_member_edges(state);
 
     if (auto r = step4b_cycle_check(state); !r) return std::unexpected(r.error());
 

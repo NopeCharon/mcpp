@@ -34,6 +34,9 @@ import mcpp.log;
 import mcpp.ui;
 import mcpp.provider;
 import mcpp.provider.select;
+import mcpp.toolchain.platform;   // host_arch: the static row
+import mcpp.pack.distribution;    // the package's metadata, for a dispatched format
+import mcpp.platform;             // serves: a leg the platform states
 
 namespace mcpp::pack {
 
@@ -61,6 +64,11 @@ export struct PackOutcome {
     std::filesystem::path               stageDir;
     std::filesystem::path               stageManifest;
     std::string                         closure;
+    // The axes the package was made with (SPEC-014 §9): `linkage`, `mode`,
+    // and the systems whose loaders it carries.
+    std::string                         linkage;
+    std::string                         mode;
+    std::vector<std::string>            systems;
     // Whether a build program ran in this pack, for the envelope's `effects`.
     bool                                ranBuildPrograms = false;
     // What one packed member answered (member selection design 2026-09-30,
@@ -77,6 +85,9 @@ export struct PackOutcome {
         std::filesystem::path               stageDir;
         std::filesystem::path               stageManifest;
         std::string                         closure;
+        std::string                         linkage;
+        std::string                         mode;
+        std::vector<std::string>            systems;
     };
     std::vector<Member>                 members;
 };
@@ -393,6 +404,42 @@ bool member_carries(const mcpp::build::BuildContext& ctx, const MemberJob& m,
 //
 // Called inside the member's view (`with_member`): `ctx.manifest`,
 // `ctx.projectRoot` and the plan's link group are the member's.
+// Whether a pack of `ctx`'s target is a universal package (SPEC-014 §3): an
+// image of a platform that states `universal = true`, not refused by the
+// command or `[pack] universal`, in a format other than a single file.
+bool packs_universal(const mcpp::build::BuildContext& ctx, const Options& opts) {
+    auto t = mcpp::toolchain::triple::parse(ctx.tc.targetTriple);
+    auto const& P = ctx.plan.platform;
+    return t && t->loader_supplies_os() && P.active && P.fields.universal.set
+        && P.fields.universal.value && opts.universal.value_or(true)
+        && opts.format != mcpp::pack::Format::SingleFile;
+}
+
+// The combinations of a member's pack refused before anything is built
+// (SPEC-014 §1.5): what its options and the plan's platform already decide.
+std::optional<std::string> refused_combination(const mcpp::build::BuildContext& ctx, const Options& opts) {
+    // A single file carries what it runs, whichever source stated the mode.
+    if (opts.format == mcpp::pack::Format::SingleFile && opts.mode == mcpp::pack::Mode::None)
+        return std::string("--pkg-format single-file carries what the program runs, and the mode is "
+                           "system ([pack] default_mode).\n  use: --mode vendored | self-contained");
+    if (!opts.legTargets.empty() && !packs_universal(ctx, opts))
+        return std::string("several --target name one package's legs only where the target's platform "
+                           "packs them into one universal package (`[platform] universal = true`).\n"
+                           "  use: one pack per target");
+    if (!packs_universal(ctx, opts)) return std::nullopt;
+    auto const& P = ctx.plan.platform;
+    if (!P.fields.runner.set || P.fields.runner.cmd.empty())
+        return std::format("a universal package starts its images through the platform's runner, and "
+                           "{} states none.\n  use: --no-universal", P.display());
+    auto t = mcpp::toolchain::triple::parse(ctx.tc.targetTriple);
+    for (auto const& target : opts.legTargets) {
+        auto lt = mcpp::toolchain::triple::parse(target);
+        if (lt && t && lt->str() != t->str() && !mcpp::platform::serves(P.fields, P.package, *lt))
+            return std::format("--target {} is not a target of {}", lt->str(), P.display());
+    }
+    return std::nullopt;
+}
+
 std::optional<Refusal> member_plan(PackRun& run, GroupJob& g, MemberJob& m) {
     auto& ctx = *g.ctx;
     const bool sharedPlan = ctx.workspaceMembers.size() > 1;
@@ -559,6 +606,64 @@ std::optional<Refusal> member_plan(PackRun& run, GroupJob& g, MemberJob& m) {
         }
     }
 
+    // ─── A loaded artifact: the static row, and the universal package ──
+    //
+    // `--mode static` of an image is `--linkage static --mode self-contained`
+    // (SPEC-014 §1.2): one `.oke`, carried. A platform that states `universal
+    // = true` packs every one of its targets into one package unless the
+    // command or `[pack] universal` says otherwise (§3); a single file is one
+    // system's and one architecture's, so it is never universal.
+    std::vector<mcpp::pack::LoadedLeg> loadedLegs;
+    {
+        auto t = mcpp::toolchain::triple::parse(ctx.tc.targetTriple);
+        const bool loaded = t && t->loader_supplies_os();
+        if (loaded && opts.mode == mcpp::pack::Mode::Static) opts.mode = mcpp::pack::Mode::BundleAll;
+        auto const& P = ctx.plan.platform;
+        if (auto why = refused_combination(ctx, opts)) return Refusal{2, about(run, m, *why)};
+        if (packs_universal(ctx, opts)) {
+            opts.universalName = mcpp::manifest::platform::platform_name(
+                P.package.substr(P.package.find('.') + 1));
+            // The legs: those the command named, else every target of the
+            // platform.
+            auto const& legs = opts.legTargets.empty() ? P.fields.targets.value : opts.legTargets;
+            for (auto const& target : legs) {
+                auto lt = mcpp::toolchain::triple::parse(target);
+                if (!lt || lt->str() == t->str()) continue;
+                mcpp::build::BuildOverrides ov = g.ov;
+                ov.target_triple = lt->str();
+                // The member's own plan, in a workspace; the project's otherwise.
+                ov.workspace_members.clear();
+                ov.workspace_request.clear();
+                if (m.inWorkspace && !m.path.empty()) {
+                    ov.workspace_members = { m.path };
+                    ov.workspace_request = { m.path };
+                }
+                auto legCtx = mcpp::build::prepare_build(false, false, {}, ov);
+                if (!legCtx) return Refusal{1, about(run, m, std::format(
+                    "the {} leg of the universal package: {}", lt->str(), legCtx.error()))};
+                auto be = mcpp::build::make_ninja_backend();
+                mcpp::build::BuildOptions bo;
+                if (auto br = be->build(legCtx->plan, bo); !br) {
+                    mcpp::build::report_failed_drive(br.error());
+                    return Refusal{1, about(run, m, std::format("the {} leg did not build", lt->str()))};
+                }
+                mcpp::build::populate_dependency_cache(*legCtx);
+                std::filesystem::path artifact;
+                for (auto const& lu : legCtx->plan.linkUnits)
+                    if (lu.targetName == chosenLu->targetName && lu.kind == chosenLu->kind
+                        && !lu.dependencyOwned
+                        && (legCtx->workspaceMembers.size() < 2 || lu.memberOf == m.name)) {
+                        artifact = legCtx->outputDir / lu.output;
+                        break;
+                    }
+                if (artifact.empty()) return Refusal{1, about(run, m, std::format(
+                    "the {} leg of the universal package built no '{}'", lt->str(), chosenLu->targetName))};
+                mcpp::ui::status("Packed leg", lt->str());
+                loadedLegs.push_back({ lt->str(), lt->arch, artifact });
+            }
+        }
+    }
+
     // ─── Build the plan ──────────────────────────────────────────────
     opts.baseStated = ctx.tc.base.stated();
     auto plan = mcpp::pack::make_plan(ctx.manifest, *run.cfg, opts,
@@ -568,6 +673,13 @@ std::optional<Refusal> member_plan(PackRun& run, GroupJob& g, MemberJob& m) {
         // which appears in the project's own manifest.
         ctx.plan.runtimeRequirements, programIsSharedObject);
     if (!plan) return Refusal{1, about(run, m, plan.error().message)};
+    plan->platform = ctx.plan.platform;
+    plan->loadedLegs = std::move(loadedLegs);
+    plan->linkageName = opts.linkage == mcpp::pack::Linkage::Static ? "static"
+                      : opts.linkage == mcpp::pack::Linkage::Shared ? "shared"
+                      : opts.mode == mcpp::pack::Mode::Static ? "static"
+                      : ctx.plan.manifest.buildConfig.dependencyLinkage.empty()
+                          ? "declared" : ctx.plan.manifest.buildConfig.dependencyLinkage;
     // `--output <dir>` with several members: each member's archive, or its tree
     // for `--format dir`, is written below the directory under the name it would
     // have by default. The staging tree of an archive, and of a dispatched
@@ -679,7 +791,7 @@ std::optional<Refusal> prepare_group(PackRun& run, GroupJob& g) {
         // prepare with the same overrides plus two fields -- and a second
         // overrides object left behind here would make that pass differ from
         // this build in a way nothing states.
-        g.ov.target_triple = "x86_64-linux-musl";
+        g.ov.target_triple = std::format("{}-linux-musl", mcpp::toolchain::platform::host_arch);
         // Quiet on the same grounds as the first prepare: this one also runs
         // before `--format` has been validated.
         auto ctx2 = prepare();
@@ -694,6 +806,61 @@ std::optional<Refusal> prepare_group(PackRun& run, GroupJob& g) {
 std::optional<Refusal> check_format(PackRun& run, GroupJob& g) {
     auto const& ctx = *g.ctx;
     const auto& formatName = run.opts.formatName;
+    // What each member's options and the platform decide.
+    for (auto const& m : g.members) {
+        std::optional<std::string> why;
+        mcpp::build::with_member(*g.ctx, m.inWorkspace ? m.name : std::string_view{}, [&] {
+            why = refused_combination(ctx, m.request);
+        });
+        if (why) return Refusal{2, about(run, m, *why)};
+    }
+    // ─── `--systems` names the loaders a package carries ─────────────
+    //
+    // A self-contained universal package carries a loader per system, and a
+    // single file of an image is made per system; nothing else is made per
+    // system. Refused here, before the build (SPEC-014 §1.5).
+    if (!run.opts.systems.empty()) {
+        auto t = mcpp::toolchain::triple::parse(ctx.tc.targetTriple);
+        const bool loaded = t && t->loader_supplies_os();
+        const bool universal = packs_universal(ctx, run.opts);
+        const bool selfContained = run.opts.mode == mcpp::pack::Mode::BundleAll
+                                || run.opts.mode == mcpp::pack::Mode::Static;
+        if (!(universal && selfContained) && !(loaded && run.opts.format == mcpp::pack::Format::SingleFile))
+            return Refusal{2, universal
+                ? std::format("--systems names the systems whose loaders a self-contained package "
+                              "carries, and --mode {} carries none.\n  use: --mode self-contained",
+                              mcpp::pack::mode_cli_name(run.opts.mode))
+                : std::string("--systems names the systems whose loaders a self-contained universal "
+                              "package carries, or for which a single file of an image is made; this "
+                              "pack is neither.\n  use: --mode self-contained over a platform that "
+                              "states universal = true, or --pkg-format single-file")};
+        // A single file is made per system, and `-o` names one file.
+        if (run.opts.format == mcpp::pack::Format::SingleFile && run.opts.systems.size() > 1
+            && !run.opts.output.empty())
+            return Refusal{2, std::format(
+                "--output names one file, and --systems makes one single file per system ({}).\n"
+                "  use: leave --output out; each file is named <name>-<version>-<os>-<arch>",
+                run.opts.systems.size())};
+        // A single file of an image is made for each system on this mcpp's
+        // row of it; a row it builds no program for is refused before the build.
+        if (loaded && run.opts.format == mcpp::pack::Format::SingleFile) {
+            std::vector<std::string> unbuilt, built;
+            for (auto const& system : run.opts.systems) {
+                auto row = mcpp::pack::unbuilt_row(system, t->arch);
+                (row.empty() ? built : unbuilt).push_back(row.empty() ? system : std::format("{} ({})", system, row));
+            }
+            if (!unbuilt.empty()) {
+                std::string say, use;
+                for (auto const& u : unbuilt) say += (say.empty() ? "" : ", ") + u;
+                for (auto const& b : built) use += (use.empty() ? "" : ",") + b;
+                return Refusal{2, std::format(
+                    "--systems: this mcpp builds no program for {}, so no single file of the {} "
+                    "image is made there.\n  use: {}", say, t->str(),
+                    use.empty() ? std::string("--systems naming a system this mcpp builds for")
+                                : "--systems " + use)};
+            }
+        }
+    }
     // ─── Is the requested format one anything provides? ──────────────
     //
     // BEFORE THE BUILD, because a refusal that arrives after a full compile is
@@ -715,9 +882,9 @@ std::optional<Refusal> check_format(PackRun& run, GroupJob& g) {
                 avail += ", " + f;
             }
             return Refusal{2, std::format(
-                "unknown --format '{}'.\n"
+                "unknown --pkg-format '{}'.\n"
                 "  available in this build: {}\n"
-                "  A format past `tar` and `dir` comes from a package in the "
+                "  A format past the built-in ones comes from a package in the "
                 "resolved graph, which declares\n"
                 "  it with `mcpp::provides_pack_format(\"<name>\")` in its build "
                 "program. Add the package\n"
@@ -757,7 +924,7 @@ std::optional<Refusal> check_format(PackRun& run, GroupJob& g) {
             }
             if (!missing.empty())
                 return Refusal{2, std::format(
-                    "--format '{}' is not provided for every packed member.{}\n"
+                    "--pkg-format '{}' is not provided for every packed member.{}\n"
                     "  A member is packed into its own staged tree by a provider in its own build "
                     "program, or in a\n"
                     "  package that only that member reaches.{}",
@@ -783,7 +950,7 @@ std::optional<Refusal> check_format(PackRun& run, GroupJob& g) {
         if (mcpp::pack::is_builtin_pack_format(f))
             mcpp::ui::warning(std::format(
                 "a package in this graph declares `mcpp:pack-format={}`, which "
-                "is one of the archive shapes `mcpp pack` owns; `--format {}` "
+                "is one of the archive shapes `mcpp pack` owns; `--pkg-format {}` "
                 "will always select the built-in and never that package", f, f));
     return std::nullopt;
 }
@@ -879,7 +1046,7 @@ std::optional<Refusal> stage_member(PackRun& run, GroupJob& g, MemberJob& m) {
             return Refusal{1, about(run, m, r.error().message)};
         m.stageFailure = r.error().message;
         mcpp::ui::warning(about(run, m, std::format(
-            "no staged tree for --format {}: {}\n"
+            "no staged tree for --pkg-format {}: {}\n"
             "  A format that consumes ${{mcpp.stage_dir}} cannot be produced "
             "here; one that names a\n"
             "  built file with ${{mcpp.target_file:<name>}} is unaffected.",
@@ -907,14 +1074,27 @@ std::optional<Refusal> stage_member(PackRun& run, GroupJob& g, MemberJob& m) {
     // closure was walked. Best-effort: see write_stage_manifest. Skipped when
     // no tree exists, so no manifest describes a tree that is not there.
     if (m.stageFailure.empty()) mcpp::pack::write_stage_manifest(plan->stagingRoot, m.closure);
+    // A tree a dispatched format reads holds `mcpp-package.json` whether or
+    // not its closure was walked (SPEC-014 §6).
+    if (m.stageFailure.empty() && opts.format == mcpp::pack::Format::Dispatched) {
+        std::error_code jec;
+        if (!std::filesystem::exists(plan->stagingRoot / mcpp::pack::distribution::kFileName, jec))
+            if (auto r = mcpp::pack::finalize_staged(*plan); !r)
+                return Refusal{1, about(run, m, r.error().message)};
+    }
 
     // #649 E9: the outcome a machine reader receives, from values this pass
     // has already answered. Every return goes through it.
     auto& out = m.result;
     out.name = m.name;
-    out.format = opts.format == mcpp::pack::Format::Tar ? std::string("tar")
+    out.format = opts.format == mcpp::pack::Format::Tar
+                   ? (plan->archive == mcpp::pack::ArchiveKind::Zip ? std::string("zip") : std::string("tar"))
                : opts.format == mcpp::pack::Format::Dir ? std::string("dir")
+               : opts.format == mcpp::pack::Format::Zip ? std::string("zip")
+               : opts.format == mcpp::pack::Format::SingleFile ? std::string("single-file")
                : opts.formatName;
+    out.linkage = plan->linkageName;
+    out.mode = std::string(mcpp::pack::mode_cli_name(opts.mode));
     const auto canonical = [](std::string const& t) {
         if (t.empty()) return mcpp::toolchain::triple::host_triple().str();
         auto parsed = mcpp::toolchain::triple::parse(t);
@@ -922,6 +1102,8 @@ std::optional<Refusal> stage_member(PackRun& run, GroupJob& g, MemberJob& m) {
     };
     out.targets.push_back(canonical(plan->triple));
     for (auto const& leg : plan->extraSharedLegs) out.targets.push_back(leg.triple);
+    for (auto const& leg : plan->loadedLegs) out.targets.push_back(leg.triple);
+    out.systems = mcpp::pack::distribution::loader_systems(plan->stagingRoot);
     if (m.stageFailure.empty()) {
         out.stageDir      = plan->stagingRoot;
         out.stageManifest = mcpp::pack::stage_manifest_path(plan->stagingRoot);
@@ -937,8 +1119,15 @@ std::optional<Refusal> stage_member(PackRun& run, GroupJob& g, MemberJob& m) {
     m.pathCtx = mcpp::fetcher::make_path_ctx(
         &cfg, run.selection ? run.selection->root : ctx.projectRoot);
 
-    if (opts.format != mcpp::pack::Format::Dispatched) {
-        auto outPath = (opts.format == mcpp::pack::Format::Tar)
+    if (opts.format == mcpp::pack::Format::SingleFile) {
+        auto files = mcpp::pack::single_file(*plan);
+        if (!files) return Refusal{1, about(run, m, files.error().message)};
+        for (auto& f : *files) {
+            mcpp::ui::status("Packed", mcpp::ui::shorten_path(f, m.pathCtx));
+            out.artifacts.push_back(std::move(f));
+        }
+    } else if (opts.format != mcpp::pack::Format::Dispatched) {
+        auto outPath = plan->archive != mcpp::pack::ArchiveKind::None
             ? plan->archivePath : plan->stagingRoot;
         mcpp::ui::status("Packed", mcpp::ui::shorten_path(outPath, m.pathCtx));
         out.artifacts.push_back(std::move(outPath));
@@ -1022,7 +1211,7 @@ std::optional<Refusal> dispatch_group(PackRun& run, GroupJob& g, mcpp::build::Ba
         for (auto& m : g.members) {
             if (m.result.rc != 0 || m.stageFailure.empty()) continue;
             mcpp::ui::error(about(run, m, std::format(
-                "no staged tree for --format {}: {}", run.opts.formatName, m.stageFailure)));
+                "no staged tree for --pkg-format {}: {}", run.opts.formatName, m.stageFailure)));
             m.result.rc = 1;
         }
         if (std::ranges::none_of(g.members, [](const MemberJob& m) { return m.result.rc == 0; }))
@@ -1102,7 +1291,7 @@ std::optional<Refusal> dispatch_group(PackRun& run, GroupJob& g, mcpp::build::Ba
                 auto [at, fresh] = writer.try_emplace(absolute_of(o), m.name);
                 if (!fresh && at->second != m.name)
                     return Refusal{1, std::format(
-                        "members '{}' and '{}' would both write {} for --format '{}'.\n"
+                        "members '{}' and '{}' would both write {} for --pkg-format '{}'.\n"
                         "  A file has one producer: write each member's output below a "
                         "directory of its own,\n"
                         "  for example under `mcpp::out_dir()`, which is the member's.",
@@ -1124,7 +1313,7 @@ std::optional<Refusal> dispatch_group(PackRun& run, GroupJob& g, mcpp::build::Ba
         auto it = submitted.find(m.name);
         if (it != submitted.end() && !it->second.outputs.empty()) { any = true; continue; }
         mcpp::ui::error(about(run, m, std::format(
-            "no action claimed --format '{}'.\n"
+            "no action claimed --pkg-format '{}'.\n"
             "  A package declared it provides this format, and no build "
             "program submitted a new\n"
             "  `role = \"artifact\"` action when it was asked for.\n"
@@ -1141,7 +1330,7 @@ std::optional<Refusal> dispatch_group(PackRun& run, GroupJob& g, mcpp::build::Ba
 
     for (auto const& m : g.members)
         if (m.result.rc == 0)
-            mcpp::ui::info("Distributing", std::format("{} v{} (--format {})",
+            mcpp::ui::info("Distributing", std::format("{} v{} (--pkg-format {})",
                 m.plan->packageName, m.plan->packageVersion, run.opts.formatName));
 
     // NO EXPLICIT GOALS. Everything but the dist edges is already up to
@@ -1195,9 +1384,9 @@ std::optional<Refusal> dispatch_group(PackRun& run, GroupJob& g, mcpp::build::Ba
                 // A drive that failed says why above; its missing file is
                 // the member's failure, not a success that carried nothing.
                 mcpp::ui::error(about(run, m, driveFailed
-                    ? std::format("--format {} did not produce {}: its step failed",
+                    ? std::format("--pkg-format {} did not produce {}: its step failed",
                                   run.opts.formatName, abs.string())
-                    : std::format("--format {} reported success and produced nothing at {}",
+                    : std::format("--pkg-format {} reported success and produced nothing at {}",
                                   run.opts.formatName, abs.string())));
                 m.result.rc = 1;
                 produced = false;
@@ -1233,7 +1422,7 @@ std::optional<Refusal> check_destinations(PackRun& run, std::vector<GroupJob>& g
             // archive for `tar`; a dispatched format's products are its
             // provider's, and are compared when they are submitted.
             std::vector<std::filesystem::path> writes{m.plan->stagingRoot};
-            if (m.opts.format == mcpp::pack::Format::Tar) writes.push_back(m.plan->archivePath);
+            if (m.plan->archive != mcpp::pack::ArchiveKind::None) writes.push_back(m.plan->archivePath);
             for (auto const& w : writes) {
                 auto [at, fresh] = writer.try_emplace(w.lexically_normal(), m.name);
                 if (!fresh)
@@ -1262,9 +1451,13 @@ PackOutcome run_pack(PackRun run) {
     // ─── Build first (pack implies a fresh build) ────────────────────
     mcpp::build::BuildOverrides base;
     if (run.opts.mode == mcpp::pack::Mode::Static && run.opts.targetTriple.empty())
-        base.target_triple = "x86_64-linux-musl";
+        base.target_triple = std::format("{}-linux-musl", mcpp::toolchain::platform::host_arch);
     else
         base.target_triple = run.opts.targetTriple;
+    // The linkage axis (SPEC-014 §1): the whole graph's dependency linkage for
+    // this build.
+    if (run.opts.linkage == mcpp::pack::Linkage::Static) base.dependency_linkage = "static";
+    if (run.opts.linkage == mcpp::pack::Linkage::Shared) base.dependency_linkage = "shared";
     // A bundled program leaves this machine: release is the fallback, not dev.
     // `[build] default-profile` still decides when the project states one.
     base.profile          = run.opts.profile;
@@ -1424,6 +1617,9 @@ PackOutcome run_pack(PackRun run) {
     out.stageDir      = first.stageDir;
     out.stageManifest = first.stageManifest;
     out.closure       = first.closure;
+    out.linkage       = first.linkage;
+    out.mode          = first.mode;
+    out.systems       = first.systems;
     return out;
 }
 

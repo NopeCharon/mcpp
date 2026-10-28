@@ -11,6 +11,7 @@ import mcpp.pm.compat;       // Legacy dependency-key compatibility helpers
 import mcpp.pm.index_spec;   // IndexSpec for [indices] section
 import mcpp.manifest.flag_words;
 import mcpp.targetside;
+import mcpp.manifest.platform;  // SPEC-013: [platform], the platform keys of [target.<sel>], [host]
 
 export namespace mcpp::manifest {
 
@@ -875,6 +876,11 @@ struct BuildConfig : BuildInputs {
     // configuration error, not something to merge: appending would produce an
     // argv that is neither one's, and it would fail at exec time with no
     // indication of which package contributed which token.
+    // The platform's fields a build program stated (protocol 17; SPEC-013
+    // §4.1): its link driver, link inputs, artifact names, seal steps and
+    // runner host, at the build-program tier. Filled by `apply`; prepare
+    // merges every program's into the build's platform statement.
+    mcpp::manifest::platform::Statement programPlatform;
     std::vector<std::string>            runner;
     // NAMED WAYS OF REACHING THE ARTEFACT, AND THE ENGINE KNOWS NONE OF
     // THEIR NAMES.
@@ -1855,6 +1861,20 @@ struct PackConfig {
     // assumption ("modern desktop Linux").
     std::vector<std::string>            alsoSkip;      // libs to ALSO skip on top of PEP 600
     std::vector<std::string>            forceBundle;   // libs to bundle even if PEP 600 says skip
+    // The three axes' project defaults (SPEC-014 §1): `linkage` ("static" |
+    // "shared"), `format` (the package format, as `--pkg-format` names it),
+    // `compress` (`<algorithm>[:<level>]`, as `--compress` takes it). Empty:
+    // unstated.
+    std::string                         linkage;
+    std::string                         format;
+    std::string                         compress;
+    // The signer (SPEC-014 §4): an argv run on each program, image and library
+    // of the staged tree, and on a single file, before the container is
+    // written; `{}` is the file.
+    std::vector<std::string>            sign;
+    // `false`: a pack of a platform's target packs that target alone, where
+    // the platform states `universal = true` (SPEC-014 §3).
+    std::optional<bool>                 universal;
 };
 
 // `[workspace]` — multi-package workspace support (0.0.11+).
@@ -2440,6 +2460,17 @@ struct Manifest {
 
     // [target.<triple>] tables — empty if user didn't declare any.
     std::map<std::string, TargetEntry> targetOverrides;
+
+    // PLATFORMS (SPEC-013; design 2026-10-28). `platform` is a platform
+    // package's own `[platform]` section, `platformDeclared` whether it has
+    // one. `platformOverrides` holds the platform part of every
+    // `[target.<selector>]` table, in file order (selection and per-field
+    // overrides; the engine orders matching selectors by specificity), and
+    // `hostPlatform` the `[host]` table: the platform of the host graph.
+    mcpp::manifest::platform::Statement              platform;
+    bool                                             platformDeclared = false;
+    std::vector<mcpp::manifest::platform::Override>  platformOverrides;
+    mcpp::manifest::platform::Override               hostPlatform;
 
     // [pack] — `mcpp pack` config (see docs/10-pack-and-release.md).
     PackConfig                         packConfig;

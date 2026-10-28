@@ -207,6 +207,38 @@ std::expected<void, std::string> step13_lockfile(PrepareState& state, BuildConte
             lock.packages.push_back(std::move(lp));
         }
 
+        // WHAT THE PROJECT'S OWN GRAPH REACHES (SPEC-013 §15.1): from the
+        // root and the selected members along the edges, never entering a
+        // package the platform added. A package the platform added, and one
+        // only those reach (its layers' implementations, its tools' and its
+        // plugin's libraries), is the platform's.
+        auto qualified_of = [](const mcpp::manifest::Manifest& m) {
+            auto n = mcpp::pm::compat::resolve_package_name(m.package.name, m.package.namespace_);
+            return mcpp::pm::compat::qualified_name(
+                n.namespace_.empty() ? std::string(mcpp::pm::kDefaultNamespace) : n.namespace_, n.shortName);
+        };
+        std::set<std::string> projectReaches;
+        {
+            const auto n = state.packages.size();
+            std::vector<bool> own(n, false);
+            std::vector<std::size_t> stack;
+            for (std::size_t i = 0; i < n; ++i)
+                if (i == 0 || state.packages[i].selectedMember) { own[i] = true; stack.push_back(i); }
+            while (!stack.empty()) {
+                const auto p = stack.back();
+                stack.pop_back();
+                for (auto const& e : state.dependencyEdges) {
+                    const auto d = e.dependencyPackageIndex;
+                    if (e.consumerPackageIndex != p || d >= n || own[d]) continue;
+                    if (state.platformInjected.contains(qualified_of(state.packages[d].manifest))) continue;
+                    own[d] = true;
+                    stack.push_back(d);
+                }
+            }
+            for (std::size_t i = 0; i < n; ++i)
+                if (own[i]) projectReaches.insert(qualified_of(state.packages[i].manifest));
+        }
+
         // Version deps: the whole resolved graph, at the versions actually
         // chosen. `resolved` is an ordered map, so the file is deterministic.
         std::set<std::string> versionLocked;
@@ -237,6 +269,12 @@ std::expected<void, std::string> step13_lockfile(PrepareState& state, BuildConte
             // prefix claimed otherwise. `index_package_digest` is FNV-1a on
             // every host.
             lp.hash = mcpp::pm::index_package_digest(sourceIndex, lp.name, lp.version);
+            // The platform's packages say so (SPEC-013 §15.1).
+            const auto qualified = mcpp::pm::compat::qualified_name(
+                key.ns.empty() ? std::string(mcpp::pm::kDefaultNamespace) : key.ns, key.shortName);
+            if (state.platform.active
+                && (state.platformInjected.contains(qualified) || !projectReaches.contains(qualified)))
+                lp.origin = "platform";
             // One entry per identity: a dependency declared by the root and by
             // a member under different spellings is one package.
             if (!versionLocked.insert(lock_identity(lp)).second) continue;
@@ -256,6 +294,63 @@ std::expected<void, std::string> step13_lockfile(PrepareState& state, BuildConte
             for (auto const& mp : state.overrides.workspace_request) planned.insert(mp);
             partialWorkspace = !std::ranges::includes(planned, all);
         }
+        // EACH ENTRY NAMES THE CONFIGURATIONS THAT RESOLVE IT (SPEC-013
+        // §15.1): this one's target is added to what it resolved, and taken
+        // from what it did not; an entry no configuration resolves any more is
+        // dropped. A build for this machine and a pack for an ok image then
+        // leave each other's entries as they were. An entry of this machine's
+        // own configuration alone says nothing (`targets` absent), so the lock
+        // of a project built only natively reads as it always has. (A partial
+        // workspace plan keeps the entries it did not resolve whole, below.)
+        {
+            // The native configuration is the one a build without --target
+            // resolves to: the project's `[build] target`, this machine's
+            // default target, or this machine's triple.
+            const auto canonical = [](const std::string& text) -> std::optional<std::string> {
+                auto t = mcpp::toolchain::triple::parse(text);
+                if (text.empty() || !t) return std::nullopt;
+                return t->str();
+            };
+            const auto native = [&] {
+                if (auto t = canonical(state.m->buildConfig.target)) return *t;
+                if (auto cfg = state.get_cfg(false); cfg)
+                    if (auto t = canonical((*cfg)->defaultTarget)) return *t;
+                return mcpp::toolchain::triple::host_triple().str();
+            }();
+            const auto here = canonical(state.overrides.target_triple).value_or(native);
+            auto targets_of = [&](const mcpp::lockfile::LockedPackage& p) {
+                return p.targets.empty() ? std::vector<std::string>{ native } : p.targets;
+            };
+            std::map<std::string, mcpp::lockfile::LockedPackage> was;
+            if (auto prior = mcpp::lockfile::load(state.workRoot / "mcpp.lock"))
+                for (auto const& p : prior->packages) was.emplace(lock_identity(p), p);
+            std::set<std::string> listed;
+            for (auto& p : lock.packages) {
+                const auto id = lock_identity(p);
+                listed.insert(id);
+                auto it = was.find(id);
+                if (it == was.end() || it->second.version != p.version) { p.targets = { here }; continue; }
+                p.targets = targets_of(it->second);
+                // The platform's only where every configuration that resolves
+                // it says so: one whose project reaches it (`os` on Linux
+                // reaches openkal) keeps it the project's.
+                const bool others = std::ranges::any_of(p.targets, [&](auto const& t) { return t != here; });
+                if (others && it->second.origin != "platform") p.origin.clear();
+                if (std::ranges::find(p.targets, here) == p.targets.end()) p.targets.push_back(here);
+            }
+            for (auto& [id, p] : was) {
+                if (partialWorkspace || listed.contains(id)) continue;
+                auto kept = p;
+                kept.targets = targets_of(p);
+                std::erase(kept.targets, here);
+                if (!kept.targets.empty()) lock.packages.push_back(std::move(kept));
+            }
+            for (auto& p : lock.packages) {
+                std::ranges::sort(p.targets);
+                if (p.targets == std::vector<std::string>{ native }) p.targets.clear();
+            }
+
+        }
         if (partialWorkspace) {
             if (auto prior = mcpp::lockfile::load(state.workRoot / "mcpp.lock")) {
                 // By identity, not by spelling: a prior entry that names a
@@ -274,6 +369,8 @@ std::expected<void, std::string> step13_lockfile(PrepareState& state, BuildConte
                     if (!indicesHere.contains(i.name)) lock.indices.push_back(i);
             }
         }
+        // One order whichever configuration wrote the file last: by identity.
+        std::ranges::stable_sort(lock.packages, {}, [](auto const& p) { return lock_identity(p); });
         if (!lock.packages.empty() || !lock.indices.empty()) {
             auto lockPath = state.workRoot / "mcpp.lock";
             // `--locked` ASSERTS THAT THIS RESOLUTION IS THE RECORDED ONE.
