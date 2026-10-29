@@ -727,3 +727,67 @@ TEST(PackDistribution, XpkgDescriptorNamesEachSystemsProgramDirectory) {
     EXPECT_NE(r->find("path.join(pkginfo.install_dir(), bindir[os.host()])"), std::string::npos) << *r;
     EXPECT_NE(r->find("name = \"okrun\""), std::string::npos) << *r;
 }
+
+// An entry describes packages of one leg for the system their program runs on
+// (SPEC-014 §8): a Linux, macOS or Windows program, or the carrier of an ok
+// image, of the system and architecture the package records. A leg whose
+// program is no program of a system -- a WebAssembly module, an Android
+// application, a bare-metal image, an ok image without its carrier -- is
+// refused, naming the package, the triple and the route that distributes it;
+// it was written `linux` before.
+TEST(PackDistribution, XpkgDescriptorDescribesProgramsOfASystem) {
+    auto one = [](std::string triple, std::string top, std::string program) {
+        d::Asset a;
+        a.file = top + ".tar.gz";
+        a.top = top;
+        a.sha256 = std::string(64, 'e');
+        a.pkg.name = "web";
+        a.pkg.version = "0.1.0";
+        a.pkg.legs = { triple };
+        a.pkg.program = program;
+        return a;
+    };
+    struct Row { const char* triple; const char* says; };
+    for (auto [triple, says] : { Row{ "wasm32-emscripten", "dist-web" },
+                                 Row{ "aarch64-linux-android", "Linux, macOS or Windows target" },
+                                 Row{ "riscv64-none-elf", "Linux, macOS or Windows target" },
+                                 Row{ "x86_64-openkal", "universal package" } }) {
+        auto r = d::xpkg_descriptor({ one(triple, std::format("web-0.1.0-{}", triple), "bin/web.js") },
+                                    "https://example.org/0.1.0");
+        ASSERT_FALSE(r) << triple << ": " << *r;
+        EXPECT_NE(r.error().find(std::format("is a package of {}, which is no program of Linux, "
+                                             "macOS or Windows", triple)), std::string::npos) << r.error();
+        EXPECT_NE(r.error().find(says), std::string::npos) << r.error();
+    }
+    for (auto [triple, system] : { std::pair{ "x86_64-linux-gnu", "linux" },
+                                   std::pair{ "aarch64-linux-musl", "linux" },
+                                   std::pair{ "aarch64-macos", "macosx" },
+                                   std::pair{ "x86_64-windows-msvc", "windows" } }) {
+        auto r = d::xpkg_descriptor({ one(triple, std::format("tool-0.1.0-{}", triple), "bin/tool") },
+                                    "https://example.org/0.1.0");
+        ASSERT_TRUE(r) << triple << ": " << r.error();
+        EXPECT_NE(r->find(std::format("        {} = {{", system)), std::string::npos) << *r;
+    }
+    // A one-leg ok image packed with its carrier on Linux: a Linux program of
+    // the image's architecture, as `systems` records it.
+    auto carried = one("x86_64-openkal", "app-0.1.0-x86_64-openkal-bundle-all", "bin/app");
+    carried.pkg.mode = "self-contained";
+    carried.pkg.systems = { "linux-x86_64" };
+    auto c = d::xpkg_descriptor({ carried }, "https://example.org/0.1.0");
+    ASSERT_TRUE(c) << c.error();
+    EXPECT_NE(c->find("archs = {\"x86_64\"}"), std::string::npos) << *c;
+    EXPECT_NE(c->find("        linux = {"), std::string::npos) << *c;
+    EXPECT_EQ(c->find("macosx = {"), std::string::npos) << *c;
+    EXPECT_NE(c->find("app-0.1.0-${arch}-openkal-bundle-all.tar.gz"), std::string::npos) << *c;
+    EXPECT_NE(c->find("path.join(pkginfo.install_dir(), \"bin\")"), std::string::npos) << *c;
+    // ...and on a macOS machine of the other architecture, a macOS program.
+    carried.pkg.systems = { "macos-aarch64" };
+    carried.pkg.legs = { "aarch64-openkal" };
+    carried.file = "app-0.1.0-aarch64-openkal-bundle-all.tar.gz";
+    carried.top = "app-0.1.0-aarch64-openkal-bundle-all";
+    auto m = d::xpkg_descriptor({ carried }, "https://example.org/0.1.0");
+    ASSERT_TRUE(m) << m.error();
+    EXPECT_NE(m->find("archs = {\"aarch64\"}"), std::string::npos) << *m;
+    EXPECT_NE(m->find("        macosx = {"), std::string::npos) << *m;
+    EXPECT_EQ(m->find("linux = {"), std::string::npos) << *m;
+}

@@ -311,13 +311,18 @@ mcpp self env --format json
                 "hosted": false, "fields": {"runner": {"value": ["okrun", "{}"], "source": "platform"}}},
   "tools":     {"okld": "/…/okld", "okrun": "/…/okrun"},
   "runner":    {"argv": ["okrun", "{}"], "host": "same-arch", "exclusive": false,
-                "program": "/…/okrun", "source": "platform"},
-  "runUnder":  []
+                "program": "/…/okrun", "arch": "x86_64", "built": true, "refusal": null,
+                "source": "platform"},
+  "runUnder":  [],
+  "runUnderProgram": null
 }
 ```
 
 未选择平台时 `platform` 为 `null`；其形状与 `plan` 事件的相同（§9）。运行器指名平台自己的工具时
-`runner.program` 为该工具，否则为本机找到的程序。`--host` 时，工程的构建程序已在宿主平台下构建过，才报告宿主平台
+`runner.program` 为该工具，否则为本机找到的程序。对目标图（2026.10.29.1+），该程序就是 `mcpp run` 与
+`mcpp test` 会启动的程序：`runner.arch` 为其架构；产物属于另一架构、运行器为 `same-arch` 且给出了执行宿主时，
+它是平台为该架构准备的运行器，报告第一次运行构建它的位置（此前 `built: false`；`self env` 不构建任何东西）。
+`runUnderProgram` 为执行宿主的程序，`runner.refusal` 为本机拒绝运行的原因（不拒绝时为 `null`）。`--host` 时，工程的构建程序已在宿主平台下构建过，才报告宿主平台
 的 `runner` 与 `tools`。工程源码会被拒绝的原因
 （图中没有 C++ 运行时而 `import std`）是一条代码为 `MCPP_CONFIGURATION_SOURCES_REFUSED` 的
 `warning` 诊断，配置照常报告。无法准备的配置带 `MCPP_CONFIGURATION_FAILED`，没有 `data`。
@@ -646,7 +651,7 @@ mcpp pack [target] [--pkg-format <f>] [--target <triple>...] --message-format js
 | `artifacts` | 每个产出的产物一条记录：`path`（绝对路径）、`type`（`file` 或 `directory`）、`format`（容器：`--pkg-format` 的取值；未给出时 Windows 程序为 `zip`，其余为 `tar`）、`targets`（进入该产物的每条腿的规范三元组），以及 `sha256`（文件的摘要；目录为 `null`；2026.10.27.1+）。被分派的格式报告本次请求引入的那些 action 的终端输出；一个多 `--target` 的 Android 打包报告一个产物，其 `targets` 列出每一条腿 |
 | `stage` | 该产物所来自的那棵树：`dir`、`manifest`（即下文的暂存清单）与 `closure`（`walked` 或 `not-walked`）；库包、没有暂存任何树的情形，以及对多个成员的打包，此字段为 `null` |
 | `linkage`、`mode`、`pkgFormat` *（2026.10.27.1+）* | 本次打包的三个选择（[10](10-pack-and-release.md)）：`linkage` 为 `static`、`shared` 或 `declared`；`pkgFormat` 为产物的 `format`（`tar`、`zip`、`dir`、`single-file` 或提供者的格式） |
-| `legs`、`systems` *（2026.10.27.1+）* | 每条腿的规范三元组（通用包列出其平台的每个目标），以及自带加载器的通用包所携带的每个运行器的 `<os>-<arch>` |
+| `legs`、`systems` *（2026.10.27.1+）* | 每条腿的规范三元组（通用包列出其平台的每个目标），以及自带加载器的通用包所携带的每个运行器的 `<os>-<arch>`，或单个 ok 映像的 self-contained 包中作为程序的载体的 `<os>-<arch>`（2026.10.29.1+） |
 | `stages` *（2026.10.1.1+）* | 只在对多个成员的打包（`--workspace`，或重复的 `-p`）中出现：每个成员一条记录，按 `[workspace] members` 的顺序，带 `member`（限定的包名），以及与 `stage` 相同的 `dir`、`manifest`、`closure` |
 
 对多个成员的打包，`artifacts` 按同样的成员顺序列出每个成员的产物，每条记录多出
@@ -919,7 +924,9 @@ mcpp pack --list-formats
 
 `data.formats` 列出引擎自己的格式（`tar`、`zip`、`dir`、`single-file`；`builtin: true`）以及已解析依赖
 图中某个包提供的每种格式（`builtin: false`，带 `providers`）。依赖图在 mcpp home 的
-一个目录中规划，因此不向工程写入任何东西。
+一个目录中规划，因此不向工程写入任何东西。带 `--target <triple>` 时（2026.10.29.1+；多次给出时取最后一个），
+规划的是该目标的依赖图，并列出其平台的格式：`mcpp pack --target x86_64-openkal --list-formats` 列出
+`okb`，由 `mcpplibs.openkal-platform` 提供。
 
 ## 当前边界
 

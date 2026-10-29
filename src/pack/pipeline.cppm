@@ -422,6 +422,16 @@ std::optional<std::string> refused_combination(const mcpp::build::BuildContext& 
     if (opts.format == mcpp::pack::Format::SingleFile && opts.mode == mcpp::pack::Mode::None)
         return std::string("--pkg-format single-file carries what the program runs, and the mode is "
                            "system ([pack] default_mode).\n  use: --mode vendored | self-contained");
+    // A single file is an executable of one system (the engine's launcher, or
+    // the platform's carrier); a WebAssembly module is no program of a system,
+    // and no launcher of `wasm32-linux-musl` (the row this would have tried)
+    // exists. The web is reached through a provider's page.
+    if (auto t = mcpp::toolchain::triple::parse(ctx.tc.targetTriple);
+        opts.format == mcpp::pack::Format::SingleFile && t && t->is_wasm())
+        return std::format("--pkg-format single-file makes an executable of one system, and {} "
+                           "builds a WebAssembly module a JavaScript engine runs.\n"
+                           "  use: --pkg-format tar | zip | dir, or a provider's format "
+                           "(dist-web of mcpp-plugins writes a page)", t->str());
     if (!opts.legTargets.empty() && !packs_universal(ctx, opts))
         return std::string("several --target name one package's legs only where the target's platform "
                            "packs them into one universal package (`[platform] universal = true`).\n"
@@ -1103,7 +1113,7 @@ std::optional<Refusal> stage_member(PackRun& run, GroupJob& g, MemberJob& m) {
     out.targets.push_back(canonical(plan->triple));
     for (auto const& leg : plan->extraSharedLegs) out.targets.push_back(leg.triple);
     for (auto const& leg : plan->loadedLegs) out.targets.push_back(leg.triple);
-    out.systems = mcpp::pack::distribution::loader_systems(plan->stagingRoot);
+    out.systems = mcpp::pack::carried_systems(*plan);
     if (m.stageFailure.empty()) {
         out.stageDir      = plan->stagingRoot;
         out.stageManifest = mcpp::pack::stage_manifest_path(plan->stagingRoot);

@@ -353,14 +353,23 @@ select as they do for a build ([35](35-platforms.md)).
                 "hosted": false, "fields": {"runner": {"value": ["okrun", "{}"], "source": "platform"}}},
   "tools":     {"okld": "/…/okld", "okrun": "/…/okrun"},
   "runner":    {"argv": ["okrun", "{}"], "host": "same-arch", "exclusive": false,
-                "program": "/…/okrun", "source": "platform"},
-  "runUnder":  []
+                "program": "/…/okrun", "arch": "x86_64", "built": true, "refusal": null,
+                "source": "platform"},
+  "runUnder":  [],
+  "runUnderProgram": null
 }
 ```
 
 `platform` is `null` when no platform is selected; its shape is the `plan`
 event's (§9). `runner.program` is the platform's own tool when the runner names
-one, else the program found on this machine. For `--host` the host platform's
+one, else the program found on this machine. For the target graph
+(2026.10.29.1+) the program is the one `mcpp run` and `mcpp test` would start:
+`runner.arch` is its architecture; with an execution host named for an artifact
+of another architecture and a `same-arch` runner, it is the platform's runner
+for that architecture, located where the first run builds it (`built: false`
+until then; `self env` builds nothing). `runUnderProgram` is the execution
+host's program, and `runner.refusal` the reason runs are refused on this
+machine (`null` when they are not). For `--host` the host platform's
 `runner` and `tools` are reported once the project's build programs have been
 built under it. A reason the project's sources would be refused for (an `import
 std` with no C++ run-time in the graph) is a `warning` diagnostic with the code
@@ -721,7 +730,7 @@ to stderr, including what the build programs and tools the pack starts print.
 | `artifacts` | one record per produced artifact: `path` (absolute), `type` (`file` or `directory`), `format` (the container: the `--pkg-format` value; when none is given, `zip` for a Windows program and `tar` otherwise), `targets` (the canonical triple of each leg that went into it) and `sha256` (a file's digest; `null` for a directory; 2026.10.27.1+). A dispatched format reports the terminal outputs of the actions the request introduced; a several-`--target` Android pack reports one artifact whose `targets` lists every leg |
 | `stage` | the tree the artifact was made from: `dir`, `manifest` (the stage manifest below) and `closure` (`walked` or `not-walked`); `null` for a library package, when no tree was staged, and for a pack of several members |
 | `linkage`, `mode`, `pkgFormat` *(2026.10.27.1+)* | the three choices of the pack ([10](10-pack-and-release.md)): `linkage` is `static`, `shared` or `declared`; `pkgFormat` is the `format` of the artifacts (`tar`, `zip`, `dir`, `single-file`, or a provided format) |
-| `legs`, `systems` *(2026.10.27.1+)* | the canonical triple of each leg (a universal package lists every target of its platform), and the `<os>-<arch>` of each runner a self-contained universal package carries |
+| `legs`, `systems` *(2026.10.27.1+)* | the canonical triple of each leg (a universal package lists every target of its platform), and the `<os>-<arch>` of each runner a self-contained universal package carries, or of the carrier that is the program of a self-contained package of one ok image (2026.10.29.1+) |
 | `stages` *(2026.10.1.1+)* | present only for a pack of several members (`--workspace`, or `-p` repeated): one record per member in `[workspace] members` order, with `member` (the qualified package name) and the `dir`, `manifest` and `closure` of `stage` |
 
 For a pack of several members `artifacts` lists every member's artifacts, in the
@@ -1029,7 +1038,10 @@ mcpp pack --list-formats
 `data.formats` lists the engine's own formats (`tar`, `zip`, `dir`, `single-file`; `builtin: true`)
 and each format a package of the resolved graph provides (`builtin: false`,
 with `providers`). The graph is planned in a directory of the mcpp home, so
-nothing is written into the project.
+nothing is written into the project. With `--target <triple>` (2026.10.29.1+;
+the last one when repeated) the graph is that target's, and the formats of its
+platform are listed: `mcpp pack --target x86_64-openkal --list-formats` names
+`okb`, provided by `mcpplibs.openkal-platform`.
 
 ## Current limitations
 
