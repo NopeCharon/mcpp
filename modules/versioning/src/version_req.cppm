@@ -4,6 +4,8 @@
 //   "1.2.3"        → caret-default: >=1.2.3, <2.0.0
 //   "^1.2.3"       → explicit caret
 //   "~1.2.3"       → tilde:           >=1.2.3, <1.3.0
+//   "^0", "^0.0"   → partial caret:   <1.0.0, <0.1.0 (an unwritten segment is a wildcard)
+//   "~1"           → partial tilde:   >=1.0.0, <2.0.0
 //   "=1.2.3"       → exact:           ==1.2.3
 //   ">=1.2, <2.0"  → comma-separated comparators (AND)
 //   "*"            → any
@@ -372,8 +374,13 @@ bool matches(const Requirement& r, const Version& v) {
             case Op::Le: if (!(v <= c.v)) return false; break;
             case Op::Caret: {
                 // ^X.Y.Z = >=X.Y.Z, <(X+1).0.0   (leftmost-nonzero rule)
-                // For simplicity here: bump major; if major==0 bump minor; if both 0 bump patch.
-                // Every branch must also zero the segments AFTER the bumped one,
+                // The bound bumps the leftmost non-zero segment, looking no
+                // further than the patch. A segment that is not written is a
+                // wildcard rather than a zero, so the search also stops at the
+                // last one written: `^0` is <1.0.0 and `^0.0` is <0.1.0, as in
+                // Cargo, while `^0.0.0` stays <0.0.1. Reading the absent
+                // segments as zeros made `^0` and `^0.0` admit 0.0.0 alone.
+                // The bump must also zero the segments AFTER the bumped one,
                 // or the upper bound inherits the constraint's own tail and
                 // wrongly excludes releases below it (^2026.7.27.3 would cut off
                 // 2027.0.0.0..2). The bound is a release, never a pre-release:
@@ -385,19 +392,23 @@ bool matches(const Requirement& r, const Version& v) {
                     ++upper.nums[idx];
                     upper.nums.resize(idx + 1);
                 };
-                if      (c.v.major() != 0) bump_at(0);
-                else if (c.v.minor() != 0) bump_at(1);
-                else                       bump_at(2);
+                const std::size_t written = std::clamp<std::size_t>(c.v.components(), 1, 3);
+                std::size_t at = written - 1;
+                for (std::size_t i = 0; i + 1 < written; ++i)
+                    if (c.v.seg(i) != 0) { at = i; break; }
+                bump_at(at);
                 if (!(v >= c.v && v < upper)) return false;
                 break;
             }
             case Op::Tilde: {
                 // ~X.Y.Z = >=X.Y.Z, <X.(Y+1).0
+                // ~X     = >=X.0.0, <(X+1).0.0 -- with the minor not written
+                // there is no minor to hold, so only the major is (Cargo).
                 Version upper = c.v;
                 upper.prerelease.clear();
-                upper.nums.resize(std::max<std::size_t>(upper.nums.size(), 2), 0);
-                ++upper.nums[1];
-                upper.nums.resize(2);
+                const std::size_t at = c.v.components() == 1 ? 0 : 1;
+                upper.nums.resize(at + 1);
+                ++upper.nums[at];
                 if (!(v >= c.v && v < upper)) return false;
                 break;
             }

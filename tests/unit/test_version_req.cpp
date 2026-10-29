@@ -64,6 +64,56 @@ TEST(VersionReq, MatchTilde) {
     EXPECT_FALSE(matches(*r, *parse_version("1.2.2")));
 }
 
+// A segment that is not written is a wildcard, not a zero (Cargo's partial
+// requirements). Reading `^0` as `^0.0.0` made it admit 0.0.0 alone.
+TEST(VersionReq, PartialCaretBoundsFollowTheWrittenSegments) {
+    auto major = parse_req("^0");     ASSERT_TRUE(major);
+    EXPECT_TRUE (matches(*major, *parse_version("0.0.0")));
+    EXPECT_TRUE (matches(*major, *parse_version("0.0.5")));
+    EXPECT_TRUE (matches(*major, *parse_version("0.9.3")));
+    EXPECT_FALSE(matches(*major, *parse_version("1.0.0")));
+
+    auto minor = parse_req("^0.0");   ASSERT_TRUE(minor);
+    EXPECT_TRUE (matches(*minor, *parse_version("0.0.0")));
+    EXPECT_TRUE (matches(*minor, *parse_version("0.0.7")));
+    EXPECT_FALSE(matches(*minor, *parse_version("0.1.0")));
+
+    // Every segment written: the leftmost-nonzero rule is unchanged.
+    auto patch = parse_req("^0.0.0"); ASSERT_TRUE(patch);
+    EXPECT_TRUE (matches(*patch, *parse_version("0.0.0")));
+    EXPECT_FALSE(matches(*patch, *parse_version("0.0.1")));
+
+    auto exact = parse_req("^0.0.3"); ASSERT_TRUE(exact);
+    EXPECT_TRUE (matches(*exact, *parse_version("0.0.3")));
+    EXPECT_FALSE(matches(*exact, *parse_version("0.0.4")));
+
+    auto one = parse_req("^1");       ASSERT_TRUE(one);
+    EXPECT_TRUE (matches(*one, *parse_version("1.9.9")));
+    EXPECT_FALSE(matches(*one, *parse_version("2.0.0")));
+
+    auto zeroFive = parse_req("^0.5"); ASSERT_TRUE(zeroFive);
+    EXPECT_TRUE (matches(*zeroFive, *parse_version("0.5.9")));
+    EXPECT_FALSE(matches(*zeroFive, *parse_version("0.6.0")));
+}
+
+TEST(VersionReq, PartialTildeWithOnlyAMajorHoldsTheMajor) {
+    auto r = parse_req("~1");   ASSERT_TRUE(r);
+    EXPECT_TRUE (matches(*r, *parse_version("1.0.0")));
+    EXPECT_TRUE (matches(*r, *parse_version("1.1.0")));
+    EXPECT_TRUE (matches(*r, *parse_version("1.9.9")));
+    EXPECT_FALSE(matches(*r, *parse_version("2.0.0")));
+    EXPECT_FALSE(matches(*r, *parse_version("0.9.9")));
+
+    auto zero = parse_req("~0");   ASSERT_TRUE(zero);
+    EXPECT_TRUE (matches(*zero, *parse_version("0.4.0")));
+    EXPECT_FALSE(matches(*zero, *parse_version("1.0.0")));
+
+    // With the minor written, tilde holds it, as before.
+    auto minor = parse_req("~1.2");   ASSERT_TRUE(minor);
+    EXPECT_TRUE (matches(*minor, *parse_version("1.2.9")));
+    EXPECT_FALSE(matches(*minor, *parse_version("1.3.0")));
+}
+
 TEST(VersionReq, MatchRangeAnd) {
     auto r = parse_req(">=1.2, <2.0");   ASSERT_TRUE(r);
     EXPECT_TRUE (matches(*r, *parse_version("1.2.0")));

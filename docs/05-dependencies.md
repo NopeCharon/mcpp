@@ -115,6 +115,8 @@ refused offline.
 [dependencies]
 foo = "^1.2.3"      # >= 1.2.3, < 2.0.0 (caret, default)
 bar = "~1.2.3"      # >= 1.2.3, < 1.3.0 (tilde)
+cat = "^0"          # >= 0.0.0, < 1.0.0 (a segment not written is a wildcard)
+dog = "~1"          # >= 1.0.0, < 2.0.0
 baz = "=1.2.3"      # Exact match
 qux = ">=1.0, <2.0" # Range combination
 ```
