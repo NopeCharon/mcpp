@@ -60,6 +60,47 @@ TEST(Toml, EscapedString) {
     EXPECT_EQ(d->get_string("s").value_or(""), std::string("a\tb\nc"));
 }
 
+// TOML 1.0's escapes: \b, \f and the Unicode forms were refused as "invalid
+// escape", so a valid manifest written with them could not be read.
+TEST(Toml, EveryTomlEscapeIsRead) {
+    auto d = t::parse(R"(s = "a\bb\fc")");
+    ASSERT_TRUE(d.has_value()) << d.error().message;
+    EXPECT_EQ(d->get_string("s").value_or(""), std::string("a\bb\fc"));
+
+    // One, two, three and four UTF-8 bytes, upper- and lower-case hex.
+    d = t::parse(R"(s = "\u0041 caf\u00e9 \u4E2D \U0001F600")");
+    ASSERT_TRUE(d.has_value()) << d.error().message;
+    EXPECT_EQ(d->get_string("s").value_or(""),
+              std::string("A caf\xC3\xA9 \xE4\xB8\xAD \xF0\x9F\x98\x80"));
+
+    d = t::parse("s = \"\"\"\nJos\\u00e9\\U0000004A\"\"\"");
+    ASSERT_TRUE(d.has_value()) << d.error().message;
+    EXPECT_EQ(d->get_string("s").value_or(""), std::string("Jos\xC3\xA9J"));
+
+    // A quoted key is a basic string too.
+    d = t::parse(R"("caf\u00e9" = 1)");
+    ASSERT_TRUE(d.has_value()) << d.error().message;
+    EXPECT_EQ(d->root().count("caf\xC3\xA9"), 1u);
+
+    // A literal string keeps its backslashes.
+    d = t::parse(R"(s = 'C:\u0041')");
+    ASSERT_TRUE(d.has_value()) << d.error().message;
+    EXPECT_EQ(d->get_string("s").value_or(""), R"(C:\u0041)");
+}
+
+TEST(Toml, AUnicodeEscapeNamesAScalarValue) {
+    EXPECT_FALSE(t::parse(R"(s = "\u12")").has_value());          // too few digits
+    EXPECT_FALSE(t::parse(R"(s = "\u12G4")").has_value());        // not hex
+    EXPECT_FALSE(t::parse(R"(s = "\U0001F60")").has_value());     // \U takes eight
+    EXPECT_FALSE(t::parse(R"(s = "\uD800")").has_value());        // a surrogate
+    EXPECT_FALSE(t::parse(R"(s = "\U00110000")").has_value());    // past U+10FFFF
+    EXPECT_FALSE(t::parse(R"(s = "\x41")").has_value());          // not TOML 1.0
+
+    auto bad = t::parse("s = \"ok\\uDFFF\"");
+    ASSERT_FALSE(bad.has_value());
+    EXPECT_NE(bad.error().message.find("\\uDFFF"), std::string::npos) << bad.error().message;
+}
+
 TEST(Toml, RejectUnterminatedString) {
     auto d = t::parse(R"(x = "no end)");
     EXPECT_FALSE(d.has_value());
