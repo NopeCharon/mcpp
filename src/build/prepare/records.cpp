@@ -132,22 +132,45 @@ std::expected<void, std::string> step13_lockfile(PrepareState& state, BuildConte
         // the spelling that existing committed locks hold, and it is the one
         // #329 already fixes for git entries, so it stays; the merge and the
         // `--locked` comparison work on the identity, not on the spelling.
+        //
+        // THE SPELLING DOES NOT DEPEND ON WHICH MEMBERS A COMMAND PLANS (#868).
+        // Reading the selected members made `mcpp build -p pack` write
+        // `tinyhttps` and `mcpp build -p model-gateway` `mcpplibs.tinyhttps`
+        // (and a different hash) from one tree: two members spelled it two
+        // ways. Where the project is a workspace (its lock is the workspace's)
+        // the manifests read are therefore the workspace's own, `[dependencies]`
+        // then `[workspace.dependencies]`, and then every member in the order
+        // `[workspace] members` lists them, selected or not; the first that
+        // declares the dependency gives its spelling.
+        std::vector<const mcpp::manifest::Manifest*> declaring;
+        std::vector<mcpp::manifest::Manifest> memberManifests;
+        if (state.wsManifest && !state.runtimeWorkspaceRoot.empty()) {
+            memberManifests.reserve(state.wsManifest->workspace.members.size());
+            // Each member's manifest as written, the way `workspace_members`
+            // reads it: the spelling is the member's own key, and the
+            // inheritance a planned member receives (with its notes) is not
+            // this question's.
+            for (auto const& mp : state.wsManifest->workspace.members)
+                if (auto mm = mcpp::manifest::load(state.runtimeWorkspaceRoot / mp / "mcpp.toml",
+                                                   {.insideWorkspace = true}))
+                    memberManifests.push_back(std::move(*mm));
+            declaring.push_back(&*state.wsManifest);
+            for (auto const& mm : memberManifests) declaring.push_back(&mm);
+        } else {
+            declaring.push_back(&*state.m);
+        }
         auto lock_name_for = [&](const ResolvedKey& k) -> std::string {
-            auto declared = [&](const mcpp::manifest::Manifest& mf)
+            auto declared_in = [&](const std::map<std::string, mcpp::manifest::DependencySpec>& deps)
                 -> std::optional<std::string> {
-                for (auto const& [n, s] : mf.dependencies) {
+                for (auto const& [n, s] : deps) {
                     const std::string sn = s.shortName.empty() ? n : s.shortName;
                     if (s.namespace_ == k.ns && sn == k.shortName) return n;
                 }
                 return std::nullopt;
             };
-            if (auto n = declared(*state.m)) return *n;
-            if (state.workspacePlan()) {
-                if (state.wsManifest)
-                    if (auto n = declared(*state.wsManifest)) return *n;
-                for (std::size_t i = 1; i < state.packages.size(); ++i)
-                    if (state.packages[i].selectedMember)
-                        if (auto n = declared(state.packages[i].manifest)) return *n;
+            for (const auto* mf : declaring) {
+                if (auto n = declared_in(mf->dependencies)) return *n;
+                if (auto n = declared_in(mf->workspace.dependencies)) return *n;
             }
             return mcpp::pm::compat::qualified_name(k.ns, k.shortName);
         };

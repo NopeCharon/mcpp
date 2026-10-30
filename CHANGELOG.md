@@ -4,6 +4,61 @@
 > Each `## [<version>]` section is that release's notes. Entries are written in English
 > from 2026.9.28.3 on; earlier entries remain as written.
 
+## [2026.10.31.1] - 2026-10-31
+
+### Added
+
+- **`features` in `mcpp --protocol-version`.** A client gates on a feature
+  rather than on a version number: `target-sets` and `pkg-format-list` name the
+  meanings 2026.10.30.1 introduced. A name is added when a client gates on it,
+  and is never renamed or removed (docs/50 §4). Every envelope's `mcpp` field
+  carries the same list beside the version, so one `self env` gives a client
+  both, and a job's envelope says when either has changed.
+- **`program` in `mcpp self env --format json`**: the file that is running. A
+  tool that ran `mcpp` through a version manager's shim in a project's directory
+  reads which mcpp the shim chose for that project. docs/50 states how a tool
+  runs mcpp for a project: in its root, by the name on `PATH` or a set path,
+  with `XLINGS_PROJECT_DIR` removed (design 2026-10-30 part 2 §4.0).
+
+- **One file for several systems: `--pkg-format polyglot`** (SPEC-014 §5.3,
+  #849). An ok image's single files of every leg and system are assembled into
+  one `<name>-<version>.exe`: the Windows program leads with a POSIX shell
+  script in its DOS header, the other systems' programs follow unchanged.
+  Windows starts it as itself (Authenticode signs it); Linux and macOS start it
+  through `sh`, which copies the system's program to the single-file cache once,
+  checks its sha256 and executes it. `mcpp run --pkg-format polyglot` starts it
+  through `sh`; `mcpp emit xpkg` refuses it; it is not in a `--pkg-format` list
+  (e2e 992).
+- **`mcpp run --pkg-format single-file`** runs the single file directly; it was
+  refused as an unknown format. `tar`, `zip` and `dir` are refused as containers
+  that are not programs.
+
+- **A tree's POSIX launcher names macOS's quarantine mark.** A package a browser
+  downloaded carries `com.apple.quarantine` on every file, and macOS refuses to
+  start an unsigned runner so marked; the launcher says so before it starts the
+  runner, with `xattr -dr com.apple.quarantine <package>` (SPEC-014 §4.3).
+
+### Fixed
+
+- **A workspace's lock entry is keyed the same way whatever members a command
+  plans** (#868). Two members spelling one dependency two ways
+  (`tinyhttps.workspace = true`, `[dependencies.mcpplibs] tinyhttps.workspace =
+  true`) made `-p` of each write its own key and hash. The key is the
+  workspace's spelling: its `[dependencies]`, `[workspace.dependencies]`, then
+  the members in the order `members` lists them (docs/07, e2e 990).
+- **A file `[build] ldflags` names by absolute path is a link input.** A
+  replaced prebuilt archive did not relink the program that names it; now every
+  link that carries the word depends on the file (docs/04, e2e 991).
+- **A partial caret or tilde requirement treats unwritten segments as
+  wildcards** (#866, NopeCharon): `^0` is `< 1.0.0`, `^0.0` is `< 0.1.0`, `~1` is
+  `< 2.0.0`. A bare requirement is a caret, so the bare partial spellings `"0"`
+  and `"0.0"` take the same bounds; before, they matched 0.0.0 alone (docs/05).
+- **The TOML reader accepts every escape TOML 1.0 defines** (#867, NopeCharon):
+  `\b`, `\f`, `\uXXXX` and `\UXXXXXXXX`. The writer escapes every control
+  character in turn (`\uXXXX` where TOML has no short form), so a normalised
+  manifest that holds one is still TOML; `\0` is this reader's extension and is
+  never written.
+
 ## [2026.10.30.1] - 2026-10-30
 
 ### Added
