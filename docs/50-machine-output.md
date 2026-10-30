@@ -349,7 +349,7 @@ select as they do for a build ([35](35-platforms.md)).
   "triple":    "x86_64-openkal",
   "graph":     "target",                      // or "host"
   "toolchain": {"compiler": "/…/xim-x-llvm/23.1.3/bin/clang++", "origin": "platform"},
-  "platform":  {"name": "mcpplibs.openkal-platform", "version": "0.17.3", "source": "built-in",
+  "platform":  {"name": "mcpplibs.openkal-platform", "version": "0.18.0", "source": "built-in",
                 "hosted": false, "fields": {"runner": {"value": ["okrun", "{}"], "source": "platform"}}},
   "tools":     {"okld": "/…/okld", "okrun": "/…/okrun"},
   "runner":    {"argv": ["okrun", "{}"], "host": "same-arch", "exclusive": false,
@@ -495,7 +495,7 @@ installation, which is located on the machine rather than installed by mcpp. A
 target row is `{target, note, toolchain, pin, status, default}`, and `status` is
 one of `installed` / `available` / `via dependency graph` / `planned`.
 A target row also carries `platform` (2026.10.27.1+): the platform package the
-target table selects for it (`mcpplibs.openkal-platform@0.17.3`), or `null`.
+target table selects for it (`mcpplibs.openkal-platform@0.18.0`), or `null`.
 
 **`toolchain` and `pin` are not the same field twice.** `toolchain` is what
 the row is associated with — the installed payload on an installed row, the
@@ -727,10 +727,12 @@ to stderr, including what the build programs and tools the pack starts print.
 
 | field | |
 |---|---|
-| `artifacts` | one record per produced artifact: `path` (absolute), `type` (`file` or `directory`), `format` (the container: the `--pkg-format` value; when none is given, `zip` for a Windows program and `tar` otherwise), `targets` (the canonical triple of each leg that went into it) and `sha256` (a file's digest; `null` for a directory; 2026.10.27.1+). A dispatched format reports the terminal outputs of the actions the request introduced; a several-`--target` Android pack reports one artifact whose `targets` lists every leg |
+| `artifacts` | one record per produced artifact: `path` (absolute), `type` (`file` or `directory`), `format` (the container: the `--pkg-format` value; when none is given, `zip` for a Windows program and `tar` otherwise), `targets` (the canonical triple of each leg that went into it) and `sha256` (a file's digest; `null` for a directory; 2026.10.27.1+). A dispatched format reports the terminal outputs of the actions the request introduced; a several-`--target` Android pack reports one artifact whose `targets` lists every leg; a pack of a package per leg (2026.10.30.1+) reports each package with its own leg |
 | `stage` | the tree the artifact was made from: `dir`, `manifest` (the stage manifest below) and `closure` (`walked` or `not-walked`); `null` for a library package, when no tree was staged, and for a pack of several members |
 | `linkage`, `mode`, `pkgFormat` *(2026.10.27.1+)* | the three choices of the pack ([10](10-pack-and-release.md)): `linkage` is `static`, `shared` or `declared`; `pkgFormat` is the `format` of the artifacts (`tar`, `zip`, `dir`, `single-file`, or a provided format) |
-| `legs`, `systems` *(2026.10.27.1+)* | the canonical triple of each leg (a universal package lists every target of its platform), and the `<os>-<arch>` of each runner a self-contained universal package carries, or of the carrier that is the program of a self-contained package of one ok image (2026.10.29.1+) |
+| `legs`, `systems` *(2026.10.27.1+)* | the canonical triple of each leg the command named (a target set expanded; 2026.10.30.1+), and the `<os>-<arch>` of each runner a self-contained tree of images carries |
+| `pkgFormats` *(2026.10.30.1+)* | every container written, in the order `--pkg-format` named them; `pkgFormat` is the first |
+| `runsOn` *(2026.10.30.1+)* | where the package runs, as its `mcpp-package.json` `runs_on` says: `{"self": ["linux-x86_64", …], "with": {"okrun": […]}}`; a single file's pairs are its files' |
 | `stages` *(2026.10.1.1+)* | present only for a pack of several members (`--workspace`, or `-p` repeated): one record per member in `[workspace] members` order, with `member` (the qualified package name) and the `dir`, `manifest` and `closure` of `stage` |
 
 For a pack of several members `artifacts` lists every member's artifacts, in the
@@ -946,6 +948,16 @@ A run ended by SIGINT, SIGTERM or SIGHUP leaves `cancelled` in both files
 {"schemaVersion":1,"kind":"mcpp.last-result","kindVersion":1,
  "data":{"result":"/…/target/x86_64-linux-gnu/c0641c458b2bde43/result.json","status":"ok","finishedAt":1792964065954}}
 ```
+
+**Several legs** *(2026.10.30.1+)*. A command over a target set, or over more
+than one `--target`, builds a leg per target ([SPEC-015](specs/target-sets.md)).
+Every leg writes its own `result.json`. The `mcpp.build` envelope's `data` is the
+first leg's record, its `status` is the legs' together, and `legs` holds every
+leg's record; each `artifact` and `diagnostic` event carries the `triple` of its
+leg. `.last-result.json` names the first leg's record and adds `legs`, one
+`{triple, result, status}` per leg. With one leg the envelope, the events and
+both files are as before. `self env --target <set>` adds `legs` to `mcpp.env`,
+one report per leg, the top-level fields being the first leg's.
 
 ### `mcpp.launch` — the way `mcpp run` starts the program
 

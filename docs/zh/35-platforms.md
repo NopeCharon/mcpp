@@ -32,12 +32,12 @@ mcpp run --target x86_64-openkal
 
 ```
     Resolved llvm@23.1.3 → x86_64-openkal → …/xim-x-llvm/23.1.3/bin/clang++
-             the platform's (openkal-platform 0.17.3), replacing your gcc@16.1.0 — override with `[target.x86_64-openkal] toolchain`
+             the platform's (openkal-platform 0.18.0), replacing your gcc@16.1.0 — override with `[target.x86_64-openkal] toolchain`
       Target x86_64-openkal → x86_64-unknown-none-elf
              compiler-runtime  compiler-rt    (openkal-llvm-runtime@0.16.6, platform)
              c-abi             musl           (openkal-musl@0.22.6, platform)
              c++-abi           libc++         (openkal-llvm-runtime@0.16.6, platform)
-    Platform openkal-platform 0.17.3 (built-in)
+    Platform openkal-platform 0.18.0 (built-in)
              tools             okld, okrun (openkal-tools@0.1.3, platform)
              runner            okrun (platform)
              link              lld, start ok_main (platform)
@@ -60,8 +60,8 @@ mcpp run --target x86_64-openkal
 | 编译 | `[platform.build]`、`[platform.build.'cfg(…)']` | 目标每个翻译单元的标志 |
 | 链接 | `[platform.link]` | `driver`、`flags`、`start`、`script`、`inputs`、名字 `exe` 与 `shared`、封装步骤 `seal` |
 | 运行 | `runner`、`runners` | `mcpp run` 与 `mcpp test` 怎样启动产物,以及具名的设备动作 |
-| 载体 | `carrier` | `mcpp pack` 为依赖加载器的产物按系统构建的程序:self-contained 的程序、通用包的运行器、单文件 |
-| 包 | `universal` | 任一目标的打包覆盖全部目标,成为一个包([10](10-pack-and-release.md)) |
+| 载体 | `carrier` | `mcpp pack` 为依赖加载器的产物按系统构建的程序:self-contained 树的运行器、单文件;一个表或表的列表,每项服务其 `hosts` 中的 `<os>-<arch>` |
+| 运行器存在之处 | `runner.hosts` | 运行器程序存在的 `<os>-<arch>`:需要它的包在哪里运行(`runs_on.with`,[10](10-pack-and-release.md)) |
 | 代码 | `plugin` | 在平台阶段运行的构建程序,陈述随依赖图而变的部分 |
 | 版本组 | `[platform.versions]` | 一个家族中每个包的一个版本 |
 | 宿主部分 | `[platform.hosted]` | 宿主三元组选用该平台时适用的部分 |
@@ -98,9 +98,9 @@ C++ 运行时的包同时提供编译器运行时,因此 `"c++-abi" = false` 只
 
 | 来源 | 写法 |
 |---|---|
-| 命令行 | `--platform openkal-platform@0.17.3`、`--platform path:../openkal-platform`、`--platform none` |
+| 命令行 | `--platform openkal-platform@0.18.0`、`--platform path:../openkal-platform`、`--platform none` |
 | 环境变量 | `MCPP_TARGET_X86_64_OPENKAL_PLATFORM=…` |
-| 工程 | `[target.<selector>] platform = "openkal-platform@0.17.3"`,或 `{ path = "…" }` |
+| 工程 | `[target.<selector>] platform = "openkal-platform@0.18.0"`,或 `{ path = "…" }` |
 | 本机 | `~/.mcpp/config.toml` 中的同一个键 |
 | 目标表 | 平台列(`mcpp toolchain list`) |
 
@@ -112,11 +112,11 @@ C++ 运行时的包同时提供编译器运行时,因此 `"c++-abi" = false` 只
 
 ```toml
 [host]
-platform = "openkal-platform@0.17.3"
+platform = "openkal-platform@0.18.0"
 ```
 
 ```
-        Host platform openkal-platform 0.17.3 (mcpp.toml:2): build programs are x86_64-openkal images run by okrun
+        Host platform openkal-platform 0.18.0 (mcpp.toml:2): build programs are x86_64-openkal images run by okrun
 ```
 
 此后每个构建程序都编译为本机架构的 ok 映像,在 Linux、macOS 与 Windows 上使用同一个工具链,经平台的运行器
@@ -130,7 +130,7 @@ platform = "openkal-platform@0.17.3"
 
 ```toml
 [target.'cfg(any(linux, macos, windows))']
-platform = "openkal-platform@0.17.3"
+platform = "openkal-platform@0.18.0"
 ```
 
 Windows 上这一安排对应 GNU ABI 的行(`--target x86_64-windows-gnu`);`[platform.hosted] targets` 之外的
@@ -142,7 +142,7 @@ Windows 上这一安排对应 GNU ABI 的行(`--target x86_64-windows-gnu`);`[pl
 另一个版本时,在任何编译之前拒绝:
 
 ```
-error: openkal-musl 0.22.2 is in this build, and the platform openkal-platform 0.17.3 is a version group that names openkal-musl 0.22.6.
+error: openkal-musl 0.22.2 is in this build, and the platform openkal-platform 0.18.0 is a version group that names openkal-musl 0.22.9.
        requested by: own
        The family's packages pin one another exactly, so two versions of one of
        them cannot be linked into one program. Either select the platform release
@@ -160,15 +160,14 @@ error: openkal-musl 0.22.2 is in this build, and the platform openkal-platform 0
 [package]
 namespace = "mcpplibs"
 name      = "openkal-platform"
-version   = "0.17.3"
-mcpp      = ">=2026.10.27.1"
+version   = "0.18.0"
+mcpp      = ">=2026.10.30.1"
 
 [platform]
 targets   = ["x86_64-openkal", "aarch64-openkal"]
 toolchain = "llvm@23.1.3"
 runner    = { cmd = ["okrun", "{}"], host = "same-arch" }
 carrier   = { package = "openkal-run@0.1.3", section = ".oke", main = "carrier/main.cpp" }
-universal = true
 plugin    = "build.mcpp"
 
 [platform.layers]
@@ -205,7 +204,7 @@ seal   = [["okld", "note", "{}"], ["okld", "check", "{}", "--with", "{needed}"]]
   action,例如由暂存树生成 `okb`)。板级支持包的构建程序在构建阶段陈述同样的字段
   ([34](34-authoring-a-bsp.md))。
 - **载体的入口读取它携带的内容。** mcpp 把携带的字节放在 `mcpp_carried_begin` 与 `mcpp_carried_end` 之间
-  (入口的名字在 `mcpp_carried_name`):程序为通用包的运行器时不携带任何内容,运行其第一个参数所指的映像;
+  (入口的名字在 `mcpp_carried_name`):程序为 self-contained 树的运行器时不携带任何内容,运行其第一个参数所指的映像;
   或映像本身;或映像引用其他映像时的单文件所携带的全部映像的一个 stored zip(`PK\x03\x04`,每个映像对齐到
   64 KiB)([SPEC-013](../specs/platforms.md) §11)。
 

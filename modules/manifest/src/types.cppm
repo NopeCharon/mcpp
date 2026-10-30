@@ -1128,6 +1128,10 @@ struct BuildConfig : BuildInputs {
     // a statement.
     bool                               abiExceptions = false;
     bool                               abiExceptionsDeclared = false;
+    // The model `exceptions` names on Emscripten (design 2026-10-29 §6):
+    // "wasm" (`-fwasm-exceptions`), "js" (`-fexceptions`), or empty for
+    // `exceptions = true`, which keeps its meaning since 2026.9.12.3: "js".
+    std::string                        abiExceptionsModel;
     std::string                         cStandard;
     // Escape hatch for the hermetic link check: a sandbox toolchain whose
     // CRT/loader resolve OUTSIDE the sandbox is a hard error by default
@@ -1683,6 +1687,7 @@ struct ConditionalConfig {
     // `[target.<sel>.abi] exceptions` -- see BuildConfig::abiExceptions.
     bool                                abiExceptions = false;
     bool                                abiExceptionsDeclared = false;
+    std::string                         abiExceptionsModel;
     // `[target.<sel>.build] dialect_cxxflags` -- a GRAPH-WIDE switch under a
     // target condition (issue #717, design 2026-09-27 §6). Like `abiThreads`/
     // `abiExceptions` above, only the ROOT's value is rendered; unlike them it
@@ -1833,11 +1838,12 @@ struct LibConfig {
 
 // `[pack]` — `mcpp pack` configuration. See docs/10-pack-and-release.md.
 //
-// `default_mode` picks the bundling strategy when the user runs bare
-// `mcpp pack` (no `--mode` flag):
-//   "static"          — full musl static, no PT_INTERP / RUNPATH
-//   "bundle-project"  — bundle only project's third-party .so (default)
-//   "bundle-all"      — bundle every dynamic dep including libc / libstdc++
+// `default_mode` picks the mode when the user runs bare `mcpp pack` (no
+// `--mode` flag), as `--mode` names it (SPEC-014 §1):
+//   "system"                            — the machine provides the libraries
+//   "vendored" (alias "bundle-project") — the project's libraries travel (default)
+//   "self-contained" (alias "bundle-all") — the machine provides nothing
+//   "static"                            — `--linkage static --mode self-contained"
 struct PackConfig {
     std::string                         defaultMode;   // empty → "bundle-project"
     // THERE IS DELIBERATELY NO `[pack] profile`. Which profile `mcpp pack`
@@ -1862,19 +1868,26 @@ struct PackConfig {
     std::vector<std::string>            alsoSkip;      // libs to ALSO skip on top of PEP 600
     std::vector<std::string>            forceBundle;   // libs to bundle even if PEP 600 says skip
     // The three axes' project defaults (SPEC-014 §1): `linkage` ("static" |
-    // "shared"), `format` (the package format, as `--pkg-format` names it),
-    // `compress` (`<algorithm>[:<level>]`, as `--compress` takes it). Empty:
-    // unstated.
+    // "shared"), `format` (the package formats, as `--pkg-format` names them:
+    // a string, or a list of containers of one staged tree), `compress`
+    // (`<algorithm>[:<level>]`, as `--compress` takes it), `systems` (as
+    // `--systems` names them). Empty: unstated.
     std::string                         linkage;
-    std::string                         format;
+    std::vector<std::string>            format;
     std::string                         compress;
+    std::vector<std::string>            systems;
     // The signer (SPEC-014 §4): an argv run on each program, image and library
     // of the staged tree, and on a single file, before the container is
     // written; `{}` is the file.
     std::vector<std::string>            sign;
-    // `false`: a pack of a platform's target packs that target alone, where
-    // the platform states `universal = true` (SPEC-014 §3).
+    // `[pack] universal`, read only to answer it (COMPAT(pack-universal)):
+    // `true` is refused with `[pack] targets = ["openkal"]`, `false` is said
+    // and ignored (design 2026-10-29 §13.2). A pack's targets are its legs.
     std::optional<bool>                 universal;
+    // The targets `mcpp pack` acts on when the command names none (SPEC-015
+    // §3.3): targets and target sets, as `--target` takes them (`openkal`,
+    // `x86_64-linux-musl`). Empty: unstated, the build's target.
+    std::vector<std::string>            targets;
 };
 
 // `[workspace]` — multi-package workspace support (0.0.11+).

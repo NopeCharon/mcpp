@@ -40,12 +40,12 @@ mcpp run --target x86_64-openkal
 
 ```
     Resolved llvm@23.1.3 → x86_64-openkal → …/xim-x-llvm/23.1.3/bin/clang++
-             the platform's (openkal-platform 0.17.3), replacing your gcc@16.1.0 — override with `[target.x86_64-openkal] toolchain`
+             the platform's (openkal-platform 0.18.0), replacing your gcc@16.1.0 — override with `[target.x86_64-openkal] toolchain`
       Target x86_64-openkal → x86_64-unknown-none-elf
              compiler-runtime  compiler-rt    (openkal-llvm-runtime@0.16.6, platform)
              c-abi             musl           (openkal-musl@0.22.6, platform)
              c++-abi           libc++         (openkal-llvm-runtime@0.16.6, platform)
-    Platform openkal-platform 0.17.3 (built-in)
+    Platform openkal-platform 0.18.0 (built-in)
              tools             okld, okrun (openkal-tools@0.1.3, platform)
              runner            okrun (platform)
              link              lld, start ok_main (platform)
@@ -71,8 +71,8 @@ for this machine and one for an ok image leave each other's entries in place.
 | the compile | `[platform.build]`, `[platform.build.'cfg(…)']` | flags for every unit of the target |
 | the link | `[platform.link]` | `driver`, `flags`, `start`, `script`, `inputs`, the names `exe` and `shared`, the `seal` steps |
 | the run | `runner`, `runners` | how `mcpp run` and `mcpp test` start an artifact, and named device actions |
-| the carrier | `carrier` | the program `mcpp pack` builds of a loaded artifact for a system: the self-contained program, a universal package's runner, a single file |
-| the package | `universal` | a pack of any target covers all of them, in one package ([10](10-pack-and-release.md)) |
+| the carrier | `carrier` | the program `mcpp pack` builds of a loaded artifact for a system: a self-contained tree's runner, a single file; a table or a list of tables, each serving the `<os>-<arch>` pairs of its `hosts` |
+| where the runner exists | `runner.hosts` | the `<os>-<arch>` pairs the runner's program exists for: where a package that needs it runs (`runs_on.with`, [10](10-pack-and-release.md)) |
 | the code | `plugin` | a build program run in the platform phase, for what depends on the graph |
 | the group | `[platform.versions]` | one version of each package of a family |
 | the host part | `[platform.hosted]` | what a host triple takes when it selects the platform |
@@ -113,9 +113,9 @@ The first of these that answers selects the target's platform:
 
 | Source | Spelling |
 |---|---|
-| the command line | `--platform openkal-platform@0.17.3`, `--platform path:../openkal-platform`, `--platform none` |
+| the command line | `--platform openkal-platform@0.18.0`, `--platform path:../openkal-platform`, `--platform none` |
 | the environment | `MCPP_TARGET_X86_64_OPENKAL_PLATFORM=…` |
-| the project | `[target.<selector>] platform = "openkal-platform@0.17.3"`, or `{ path = "…" }` |
+| the project | `[target.<selector>] platform = "openkal-platform@0.18.0"`, or `{ path = "…" }` |
 | this machine | the same key in `~/.mcpp/config.toml` |
 | the target table | the platform column (`mcpp toolchain list`) |
 
@@ -129,11 +129,11 @@ its own conventions. `[host] platform` selects a platform for them instead:
 
 ```toml
 [host]
-platform = "openkal-platform@0.17.3"
+platform = "openkal-platform@0.18.0"
 ```
 
 ```
-        Host platform openkal-platform 0.17.3 (mcpp.toml:2): build programs are x86_64-openkal images run by okrun
+        Host platform openkal-platform 0.18.0 (mcpp.toml:2): build programs are x86_64-openkal images run by okrun
 ```
 
 Every build program then compiles as an ok image of this machine's
@@ -151,7 +151,7 @@ implementation:
 
 ```toml
 [target.'cfg(any(linux, macos, windows))']
-platform = "openkal-platform@0.17.3"
+platform = "openkal-platform@0.18.0"
 ```
 
 On Windows the arrangement is the GNU ABI's row (`--target x86_64-windows-gnu`);
@@ -165,7 +165,7 @@ packages pin one another exactly. A graph that holds another version of one of
 them is refused before anything compiles:
 
 ```
-error: openkal-musl 0.22.2 is in this build, and the platform openkal-platform 0.17.3 is a version group that names openkal-musl 0.22.6.
+error: openkal-musl 0.22.2 is in this build, and the platform openkal-platform 0.18.0 is a version group that names openkal-musl 0.22.9.
        requested by: own
        The family's packages pin one another exactly, so two versions of one of
        them cannot be linked into one program. Either select the platform release
@@ -184,15 +184,14 @@ abridged:
 [package]
 namespace = "mcpplibs"
 name      = "openkal-platform"
-version   = "0.17.3"
-mcpp      = ">=2026.10.27.1"
+version   = "0.18.0"
+mcpp      = ">=2026.10.30.1"
 
 [platform]
 targets   = ["x86_64-openkal", "aarch64-openkal"]
 toolchain = "llvm@23.1.3"
 runner    = { cmd = ["okrun", "{}"], host = "same-arch" }
 carrier   = { package = "openkal-run@0.1.3", section = ".oke", main = "carrier/main.cpp" }
-universal = true
 plugin    = "build.mcpp"
 
 [platform.layers]
@@ -237,7 +236,7 @@ seal   = [["okld", "note", "{}"], ["okld", "check", "{}", "--with", "{needed}"]]
   phase ([34](34-authoring-a-bsp.md)).
 - **The carrier's entry reads what it carries.** mcpp places the carried bytes
   between `mcpp_carried_begin` and `mcpp_carried_end` (the entry's name at
-  `mcpp_carried_name`): nothing, when the program is a universal package's
+  `mcpp_carried_name`): nothing, when the program is a self-contained tree's
   runner and runs the image its first argument names; the image itself; or a
   stored zip of the images (`PK\x03\x04`, each aligned to 64 KiB) for a
   single file of an image that names others ([SPEC-013](specs/platforms.md)

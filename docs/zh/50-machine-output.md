@@ -307,7 +307,7 @@ mcpp self env --format json
   "triple":    "x86_64-openkal",
   "graph":     "target",                      // or "host"
   "toolchain": {"compiler": "/…/xim-x-llvm/23.1.3/bin/clang++", "origin": "platform"},
-  "platform":  {"name": "mcpplibs.openkal-platform", "version": "0.17.3", "source": "built-in",
+  "platform":  {"name": "mcpplibs.openkal-platform", "version": "0.18.0", "source": "built-in",
                 "hosted": false, "fields": {"runner": {"value": ["okrun", "{}"], "source": "platform"}}},
   "tools":     {"okld": "/…/okld", "okrun": "/…/okrun"},
   "runner":    {"argv": ["okrun", "{}"], "host": "same-arch", "exclusive": false,
@@ -438,7 +438,7 @@ mcpp toolchain list --format json
 的形状是 `{target, note, toolchain, pin, status, default}`，`status` 取
 `installed` / `available` / `via dependency graph` / `planned` 之一。
 目标行另有 `platform`（2026.10.27.1+）：目标表为该目标选择的平台包
-（`mcpplibs.openkal-platform@0.17.3`），或 `null`。
+（`mcpplibs.openkal-platform@0.18.0`），或 `null`。
 
 **`toolchain` 与 `pin` 不是把同一个字段写了两遍。** `toolchain` 表示这一行
 关联到什么 —— 已装的行是装好的载荷，词表行是它自己的约定。`pin` 只承载目标
@@ -648,10 +648,12 @@ mcpp pack [target] [--pkg-format <f>] [--target <triple>...] --message-format js
 
 | 字段 | |
 |---|---|
-| `artifacts` | 每个产出的产物一条记录：`path`（绝对路径）、`type`（`file` 或 `directory`）、`format`（容器：`--pkg-format` 的取值；未给出时 Windows 程序为 `zip`，其余为 `tar`）、`targets`（进入该产物的每条腿的规范三元组），以及 `sha256`（文件的摘要；目录为 `null`；2026.10.27.1+）。被分派的格式报告本次请求引入的那些 action 的终端输出；一个多 `--target` 的 Android 打包报告一个产物，其 `targets` 列出每一条腿 |
+| `artifacts` | 每个产出的产物一条记录：`path`（绝对路径）、`type`（`file` 或 `directory`）、`format`（容器：`--pkg-format` 的取值；未给出时 Windows 程序为 `zip`，其余为 `tar`）、`targets`（进入该产物的每条腿的规范三元组），以及 `sha256`（文件的摘要；目录为 `null`；2026.10.27.1+）。被分派的格式报告本次请求引入的那些 action 的终端输出；一个多 `--target` 的 Android 打包报告一个产物，其 `targets` 列出每一条腿；每腿一个包的打包（2026.10.30.1+）报告每个包及其自己的腿 |
 | `stage` | 该产物所来自的那棵树：`dir`、`manifest`（即下文的暂存清单）与 `closure`（`walked` 或 `not-walked`）；库包、没有暂存任何树的情形，以及对多个成员的打包，此字段为 `null` |
 | `linkage`、`mode`、`pkgFormat` *（2026.10.27.1+）* | 本次打包的三个选择（[10](10-pack-and-release.md)）：`linkage` 为 `static`、`shared` 或 `declared`；`pkgFormat` 为产物的 `format`（`tar`、`zip`、`dir`、`single-file` 或提供者的格式） |
-| `legs`、`systems` *（2026.10.27.1+）* | 每条腿的规范三元组（通用包列出其平台的每个目标），以及自带加载器的通用包所携带的每个运行器的 `<os>-<arch>`，或单个 ok 映像的 self-contained 包中作为程序的载体的 `<os>-<arch>`（2026.10.29.1+） |
+| `legs`、`systems` *（2026.10.27.1+）* | 命令命名的每条腿的规范三元组（目标集合已展开；2026.10.30.1+），以及自带运行器的映像树所携带的每个运行器的 `<os>-<arch>` |
+| `pkgFormats` *（2026.10.30.1+）* | 写出的全部容器，按 `--pkg-format` 命名的顺序；`pkgFormat` 为第一个 |
+| `runsOn` *（2026.10.30.1+）* | 包在哪里运行，同其 `mcpp-package.json` 的 `runs_on`：`{"self": ["linux-x86_64", …], "with": {"okrun": […]}}`；单文件为各文件的组合 |
 | `stages` *（2026.10.1.1+）* | 只在对多个成员的打包（`--workspace`，或重复的 `-p`）中出现：每个成员一条记录，按 `[workspace] members` 的顺序，带 `member`（限定的包名），以及与 `stage` 相同的 `dir`、`manifest`、`closure` |
 
 对多个成员的打包，`artifacts` 按同样的成员顺序列出每个成员的产物，每条记录多出
@@ -845,6 +847,13 @@ CI 按 `launch` 启动程序，与 `mcpp run` 的启动一致。
 {"schemaVersion":1,"kind":"mcpp.last-result","kindVersion":1,
  "data":{"result":"/…/target/x86_64-linux-gnu/c0641c458b2bde43/result.json","status":"ok","finishedAt":1792964065954}}
 ```
+
+**多条腿** *（2026.10.30.1+）*。对目标集合或多个 `--target` 的命令每个目标构建一条腿
+（[SPEC-015](../specs/target-sets.md)），每条腿写自己的 `result.json`。`mcpp.build` 信封的 `data`
+为第一条腿的记录，`status` 汇总全部腿，`legs` 含每条腿的记录；每个 `artifact` 与 `diagnostic`
+事件带其腿的 `triple`。`.last-result.json` 指向第一条腿的记录，并增加 `legs`，每条腿一项
+`{triple, result, status}`。只有一条腿时信封、事件与两个文件与此前相同。`self env --target <集合>`
+在 `mcpp.env` 中增加 `legs`，每条腿一份报告，顶层字段取第一条腿。
 
 ### `mcpp.launch` —— `mcpp run` 启动程序的方式
 

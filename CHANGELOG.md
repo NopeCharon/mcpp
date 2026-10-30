@@ -4,6 +4,117 @@
 > Each `## [<version>]` section is that release's notes. Entries are written in English
 > from 2026.9.28.3 on; earlier entries remain as written.
 
+## [2026.10.30.1] - 2026-10-30
+
+### Added
+
+- **Target sets (SPEC-015).** A `--target` whose first segment is a system
+  word names every row of the target table with that system and environment:
+  `openkal` is `x86_64-openkal` and `aarch64-openkal`, `linux-musl` the musl
+  rows this mcpp builds. Each member is a leg. `build` builds every leg (planned
+  one after another, built at once); `run` runs the first leg this machine
+  reaches, its own architecture first; `test` runs the legs it reaches, reports
+  the others built and not run, and fails when no test ran. The `mcpp.build`
+  envelope adds `legs`, the events their `triple`; `self env` adds `legs`
+  (e2e 963). `[build] target` takes one target.
+- **Tests built once, run elsewhere.** `mcpp test --no-run --archive <file>`
+  writes every leg's tests with `mcpp-tests.json`; `mcpp test --archive <file>`
+  in a checkout runs what this machine reaches and builds nothing. The archive
+  is a tar compressed as its name states (`.tar.gz`, `.tgz`, `.tar.zst`,
+  `.tar.xz`, `.tar`); another name is refused before the build (e2e 964). A
+  leg of the host's own system runs from an archive as an openkal leg does
+  (e2e 989, on every system); on macOS the first build of this release started
+  none of them, giving each an environment entry of an empty name.
+- **The build's contract, `${mcpp.contract}`.** Every configuration writes
+  `mcpp-contract.json` beside its compile database: the compiler of each
+  language with the words every unit is compiled with (target, sysroot,
+  target-side headers, platform and profile flags), and the link driver, its
+  words and the archiver. A build program's action names it with
+  `${mcpp.contract}` and reads it while ninja runs, so a foreign build system
+  compiles for the target as the engine does; the engine's own C++ dialect and
+  module words are not in it (e2e 982). mcpp-plugins 0.21.0's `deps-cmake`
+  compiles a cross build's subproject from it.
+- **`[platform] runner.hosts`, carrier entries and `descriptor_keys`.** A
+  platform states the `<os>-<arch>` pairs its runner exists for, any number of
+  carrier entries each for the pairs in its `hosts` (an entry of a carrier
+  model this mcpp does not build is skipped with a warning), and the
+  descriptor blocks its targets read (SPEC-013 §1.1, §10, §11, §14).
+- **`runs_on` in `mcpp-package.json`.** Where a package runs is computed once
+  when it is packed: `self`, the pairs it runs on with what it carries, and
+  `with.<runner>`, the pairs it runs on given the machine's runner.
+
+### Changed
+
+- **A pack holds the legs it names (SPEC-014 2.0).** `--target
+  x86_64-openkal` packs that architecture; `--target openkal` packs both into
+  one tree. The platform no longer widens a pack: `[platform] universal`,
+  `[pack] universal` and `--no-universal` lose their effect, with a message
+  that names the new spelling (`[pack] targets = ["openkal"]`; docs/51).
+  Images of a platform with a runner have one layout whatever the number of
+  legs: `bin/<name>`, `bin/<name>.exe`, `lib/<arch>/`, and with
+  `--mode self-contained` `libexec/<runner>/<os>-<arch>/`. The image embedded
+  in a carrier belongs to `--pkg-format single-file` only. A set of native
+  programs is a package per leg (e2e 955, 983, 984).
+- **The Windows launcher is a program.** `bin/<name>.exe` replaces
+  `bin/<name>.cmd`: no "Terminate batch job" prompt, and the process is named
+  after the package. The POSIX launcher hands over to it under Git Bash, MSYS
+  and Cygwin.
+- **`--systems` takes `<os>`, `<os>-<arch>` and `all`, and `[pack] systems`.**
+  `--pkg-format` takes a list of containers of one staged tree (`tar,okb`),
+  built once (e2e 985). Single files cover legs × systems (e2e 986).
+- **The pack summary names where the package runs.** `Runs on` and one `Not
+  covered` line per pair the package does not reach; `mcpp.pack` adds
+  `pkgFormats` and `runsOn`. A tree that runs nowhere is refused.
+- **A target reads the descriptor blocks its row names, never the build
+  machine's (#851).** A target that is not Linux, macOS or Windows read the
+  block of the system mcpp ran on, so a Web build took a dependency's `linux`
+  block on Linux and its `windows` block on Windows, and an ok image the block
+  of whichever system built it. Each row now names its blocks in order:
+  `wasm32-emscripten` reads `emscripten`, then `linux`; `<arch>-openkal`
+  `openkal`, then `linux` (a platform may state its own); iOS `ios`, then
+  `macosx`; bare metal `none`. Version resolution, the synthesised manifest
+  and the index refresh read the same block (unit `DescriptorKeys`).
+- **The Web link carries the profile's optimisation level (#851).** emcc runs
+  wasm-opt and minifies the JavaScript launcher at the link, which had no
+  `-O`: a release Web program was linked at `-O0`. The hello world's
+  JavaScript is 13 KB rather than 66 KB (e2e 981).
+- **`[target.<sel>.abi] exceptions` takes the model (#851).** `"wasm"` selects
+  WebAssembly's exception handling (`-fwasm-exceptions`), `"js"` the
+  JavaScript model; `true` keeps the JavaScript model it has selected since
+  2026.9.12.3. The model is part of every cache key (e2e 981).
+- **`mcpp emit xpkg` names where a package runs (#860).** A
+  self-contained universal package's entry named every system with every
+  image architecture, so an Intel Mac installed a package that carries no
+  runner for it. Each system's block names the architectures `runs_on` gives:
+  the carried runners for a self-contained package, the pairs the platform's
+  runner exists for otherwise.
+
+### Fixed
+
+- **A name two dependencies answer to is no package's (#852).** Two
+  dependencies whose manifests both say `rules` warned on every build, and the
+  bare name went to one of them. It is now published for neither:
+  `MCPP_DEP_AMBIGUOUS_RULES` lists the qualified names, each qualified name
+  keeps its own directory, and `dep_dir("rules")` ends the build program naming
+  both (e2e 980).
+- **Programs start in the Android app sandbox again (#857).** Under `run-as`
+  (SELinux `runas_app`) every program mcpp started failed with "not found"
+  since 2026.10.26.2. A static strace showed one failing call, before any
+  process was created: the root directory opened for reading, which the
+  domain may search but not read. openkal-linux 0.18.3 opens every directory
+  handle with `O_PATH`; mcpp is built on mcpplibs.os 0.2.3, which pins it, and
+  openkal-platform 0.18.0 carries it to every ok image and hosted program.
+- **A gzip stream over 4 GiB.** zlib counts in 32 bits, and mcpp handed it the
+  whole tree at once: a `.tar.gz` of more than 4 GiB was refused as "an input
+  over 4 GiB", by `mcpp pack` and by a test archive alike. Input and output
+  now pass in pieces of 1 GiB, so such a tree is one gzip member as any other.
+- **A program that cannot be started is reported with the system's account.**
+  Every condition beyond not found, permission and not a program was reported
+  as "error 5" (EIO), the system's own message dropped. The classification now
+  covers invalid, no memory, directory, not supported and too large, and the
+  report of `mcpp test` and `mcpp test --archive` carries what was being done
+  and the kernel layer's value.
+
 ## [2026.10.29.1] - 2026-10-29
 
 ### Fixed

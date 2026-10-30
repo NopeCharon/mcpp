@@ -98,8 +98,8 @@ enum class Linkage { Unstated, Static, Shared };
 // single file, a dispatched format).
 enum class ArchiveKind { None, Tar, Zip };
 
-// One more architecture of a universal package (SPEC-014 §3): a leg of the
-// platform's targets other than the one the pack built first, built by the
+// One more architecture of a tree (design 2026-10-29 §4.2): a leg the
+// command named other than the one the pack built first, built by the
 // pipeline before staging. `artifact` is that leg's program image; the images
 // it names are found beside it, as for the first leg.
 struct LoadedLeg {
@@ -138,17 +138,20 @@ struct Options {
     bool                            formatStated = false;
     mcpp::pack::compress::Choice    compression;
     bool                            compressionFromFlag = false;   // --compress, not [pack]
-    // Universal packages (SPEC-014 §3). `universal`: nullopt follows the
-    // platform's `universal`; false packs the selected target alone. When the
-    // pipeline decides a universal package it sets `universalName` (the
-    // platform's name, which names the package instead of a triple) and
-    // `systems` (the systems whose loaders a self-contained package carries,
-    // `<os>`, from `--systems`; empty: this machine's).
-    std::optional<bool>             universal;
+    // THE TREE OF A PLATFORM WITH A RUNNER (design 2026-10-29 §4.2, §4.3):
+    // `tree` is set by the pipeline for an image of such a platform, whatever
+    // the number of legs -- `bin/<name>`, `bin/<name>.exe`, `lib/<arch>/` --
+    // and `universalName` (the platform's name, which names the package
+    // instead of a triple) when the tree holds more than one leg. `systems`:
+    // the runners a self-contained package carries, or the systems a single
+    // file is made for, each `<os>`, `<os>-<arch>` or `all` (`--systems`;
+    // empty: this machine's).
+    bool                            tree = false;
     std::string                     universalName;
     std::vector<std::string>        systems;
-    // Several `--target` naming a universal platform's targets: the legs, in
-    // place of the platform's whole `targets` (SPEC-014 §1.4).
+    bool                            systemsFromManifest = false;   // `[pack] systems`, not --systems
+    // The legs a pack of several targets stages into one tree (design
+    // 2026-10-29 §4.2): the command's targets, a set expanded.
     std::vector<std::string>        legTargets;
     // `[pack] sign`: run on each program, image, library and loader of the
     // staged tree before the container is written, `{}` the file.
@@ -164,7 +167,14 @@ struct Options {
     // programs have declared what they provide. It arrives before anything is
     // compiled, which is the earliest point at which it can be exact.
     std::string                     formatName;
+    // `--pkg-format` naming several containers (design 2026-10-29 §4.6):
+    // every format, in order, the first being `format`/`formatName`; each
+    // after the first is written from the same staged tree. Empty: one.
+    std::vector<std::string>        formats;
     std::filesystem::path           output;        // empty = derive from manifest
+    // `-o <directory>/` (design 2026-10-29 §4.2, §4.6): every file the pack
+    // writes is written below it under its default name.
+    std::filesystem::path           outputDir;
     std::string                     targetTriple;  // empty = host
     // Where a dependency NAME may be resolved to a file.
     //
@@ -282,7 +292,7 @@ struct Plan {
     // `shared`, or `declared` (each library as it declares itself). Set by the
     // caller from the build.
     std::string                          linkageName = "declared";
-    // The other legs of a universal package (SPEC-014 §3), set by the caller
+    // The other legs of a tree or a single file (SPEC-014 §3), set by the caller
     // after `make_plan` as `extraSharedLegs` is.
     std::vector<LoadedLeg>               loadedLegs;
     std::string                          packageName;
@@ -540,14 +550,31 @@ run(const Plan& plan, const mcpp::config::GlobalConfig& cfg);
 std::expected<std::vector<std::filesystem::path>, Error> single_file(const Plan& plan);
 
 // The row a program of `system` (linux | macos | windows) and `arch` is built
-// on -- an image's single file, a universal package's runner -- when this mcpp
+// on -- an image's single file, a self-contained tree's runner -- when this mcpp
 // builds no program for it: a row its table states as planned (`x86_64-macos`)
 // or does not state (`aarch64-windows-gnu`). Empty when it builds one.
 std::string unbuilt_row(std::string_view system, std::string_view arch);
 
+// The systems `--systems` names for an architecture (design 2026-10-29
+// §4.1): an `<os>`, an `<os>-<arch>` of that architecture, or every system
+// for `all`; this machine's system when it names none.
+std::vector<std::string> systems_for(const std::vector<std::string>& stated, std::string_view arch);
+
+// The single files of an image (design 2026-10-29 §4.5): one per leg and
+// system of the leg's architecture, the legs in the plan's order. `skipped`
+// is why a row `--systems all` reaches is made nowhere (this mcpp builds no
+// carrier for it); empty for a row that is made.
+struct SingleFileRow { std::string system, arch, skipped; };
+std::vector<SingleFileRow> single_file_rows(const Plan& plan);
+
+// `-o` names a directory (design 2026-10-29 §4.2, §4.5): it ends in a
+// separator or is an existing directory. A pack writing more than one file
+// writes each under it with its default name.
+bool output_names_directory(const std::filesystem::path& output);
+
 // The `<os>-<arch>` of the loaders a package carries (`systems` of its
 // `mcpp-package.json` and of the `mcpp.pack` envelope, SPEC-014 §4.5): a
-// self-contained universal package's under `libexec/<runner>/`, and for a
+// self-contained tree's under `libexec/<runner>/`, and for a
 // self-contained package of one image its carrier, which is the program -- of
 // this machine's system and the image's architecture. `mcpp emit xpkg` reads
 // it as the system the carrier runs on (§8).
@@ -555,7 +582,7 @@ std::vector<std::string> carried_systems(const Plan& plan);
 
 // THE PLATFORM'S RUNNER FOR ANOTHER ARCHITECTURE (SPEC-013 §10, §11): the
 // carrier built with nothing carried, for this machine's system and `arch`,
-// named `name` -- the program a self-contained universal package carries under
+// named `name` -- the program a self-contained tree carries under
 // `libexec/<name>/<os>-<arch>/`, and the one `mcpp run` and `mcpp test` hand an
 // execution host of that architecture. Built under
 // `<projectRoot>/target/carrier-pack/<name>-<os>-<arch>/`; returns the program.
@@ -570,6 +597,11 @@ runner_program(const mcpp::platform::Resolved& platform, const std::filesystem::
 // does it before writing a container; a dispatched format whose tree was
 // staged without its closure is finalized by the caller.
 std::expected<void, Error> finalize_staged(const Plan& plan);
+
+// One more engine container (`tar` or `zip`) of a tree already staged and
+// finalized, under its default name beside the plan's own (design 2026-10-29
+// §4.6): a `--pkg-format` list writes each container from one tree.
+std::expected<std::filesystem::path, Error> write_another_container(const Plan& plan, ArchiveKind kind);
 
 // Helpers used by cli.cppm to render mode names + parse `--mode`.
 // Canonical name shown in `--help`/diagnostics (renamed for legibility).
@@ -822,12 +854,12 @@ make_plan(const mcpp::manifest::Manifest& manifest,
                 mcpp::pack::compress::name(opts.compression.algorithm))});
         p.opts.compression = {};
     }
-    // A universal package is named after its platform, not a triple: it is
+    // A tree of several legs is named after its platform, not a triple: it is
     // the same package on every system and architecture of the platform.
     const std::string nameTriple = opts.universalName.empty() ? p.triple : opts.universalName;
     auto distDir = projectRoot / "target" / "dist";
     if (opts.output.empty()) {
-        p.archivePath = distDir / detail::default_archive_name(
+        p.archivePath = (opts.outputDir.empty() ? distDir : opts.outputDir) / detail::default_archive_name(
             p.packageName, p.packageVersion, nameTriple, opts.mode,
             p.archive == ArchiveKind::None ? ArchiveKind::Tar : p.archive,
             opts.compression.algorithm);
@@ -1605,11 +1637,11 @@ std::expected<void, Error> finalize_tree(const Plan& plan) {
     for (auto const& l : plan.loadedLegs) pkg.legs.push_back(l.triple);
     for (auto const& l : plan.extraSharedLegs) pkg.legs.push_back(l.triple);
     d::Stated stated;
-    if (!plan.opts.universalName.empty()) {
+    if (plan.opts.tree) {
         pkg.runner = plan.platform.fields.runner.cmd;
         const auto stem = fs::path(plan.binaryName).stem().string();
         stated.role["bin/" + stem] = "launcher";
-        stated.role["bin/" + stem + ".cmd"] = "launcher";
+        stated.role["bin/" + stem + ".exe"] = "launcher";
         std::vector<std::pair<std::string, std::string>> legs{
             { canonical(plan.triple), [&] { auto t = mcpp::toolchain::triple::parse(plan.triple);
                                             return t ? t->arch : plan.triple; }() } };
@@ -1637,13 +1669,40 @@ std::expected<void, Error> finalize_tree(const Plan& plan) {
         // of; an index entry reads it there (SPEC-014 §8).
         pkg.systems = carried_systems(plan);
     }
+    // Where it runs, once (design 2026-10-29 §4.4): every reader of the
+    // package -- an index entry, a merge, the summary -- asks here.
+    d::compute_runs_on(pkg, plan.platform.active ? plan.platform.fields.runner.hosts : std::vector<std::string>{},
+                       plan.platform.active && plan.platform.fields.runner.host == "any");
+    // A package of images starts on Windows through its `.exe`; without one
+    // it does not run there.
+    if (!pkg.runner.empty()
+        && !fs::is_regular_file(plan.stagingRoot / "bin" / (fs::path(plan.binaryName).stem().string() + ".exe"), ec)) {
+        auto windows = [](std::string const& p) { return p.starts_with("windows-"); };
+        std::erase_if(pkg.runsOnSelf, windows);
+        for (auto& [r, pairs] : pkg.runsOnWith) std::erase_if(pairs, windows);
+        std::erase_if(pkg.runsOnWith, [](auto const& kv) { return kv.second.empty(); });
+    }
+    // A TREE THAT RUNS NOWHERE IS NOT A PACKAGE (design 2026-10-29 §4.4): it
+    // carries no runner a system can start, and the platform names no
+    // system of its legs' architectures its runner exists for.
+    if (plan.opts.tree && pkg.runsOnSelf.empty() && pkg.runsOnWith.empty()) {
+        auto const& runner = plan.platform.fields.runner;
+        return std::unexpected(Error{std::format(
+            "{} runs on no system: it carries no runner built here{}, and {} names no system of "
+            "its architectures its runner `{}` exists for (runner.hosts).\n  use: --mode "
+            "self-contained --systems <a system this mcpp builds for>",
+            plan.binaryName, plan.opts.mode == Mode::BundleAll ? "" : " (--mode vendored)",
+            plan.platform.display(), runner.cmd.empty() ? std::string() : runner.cmd.front())});
+    }
     // What `[pack] include` named is the package's resource, whatever its name.
     for (auto const& rel : *included) stated.role[rel] = "resource";
     auto described = d::describe(plan.stagingRoot, pkg, stated);
     if (!described) return std::unexpected(Error{described.error()});
     if (plan.opts.sign.empty()) return {};
     for (auto const& f : described->files) {
-        if (f.role != "program" && f.role != "image" && f.role != "library" && f.role != "loader")
+        // Every program of `bin/` and `libexec/`, the Windows launcher with them.
+        if (f.role != "program" && f.role != "image" && f.role != "library" && f.role != "loader"
+            && !(f.role == "launcher" && f.path.ends_with(".exe")))
             continue;
         std::vector<std::string> argv;
         for (auto const& a : plan.opts.sign)
@@ -2224,13 +2283,13 @@ run_wasm(const Plan& plan)
 //                   built by mcpp with that system's own conventions -- the
 //                   bootstrap boundary (§6.2), so no platform is selected for it.
 //
-// A UNIVERSAL PACKAGE (SPEC-014 §3, §4.2) holds every target of a platform
-// that states `universal = true`: one `lib/<arch>/` per leg, launchers in
-// `bin/` that pick the machine's architecture and start the platform's
-// runner, and under `self-contained` the runner's program for each system of
-// `--systems` and each architecture -- the carrier built with nothing carried,
-// which runs the image its first argument names -- under
-// `libexec/<runner>/<os>-<arch>/`.
+// THE TREE (SPEC-014 §3, §4.2) is the one layout of an image of a platform
+// that states a runner, whatever the number of legs: one `lib/<arch>/` per
+// leg, launchers in `bin/` that pick the machine's architecture and start the
+// platform's runner, and under `self-contained` the runner's program for each
+// system of `--systems` and each architecture of the legs -- the carrier built
+// with nothing carried, which runs the image its first argument names --
+// under `libexec/<runner>/<os>-<arch>/`.
 //
 // `--linkage static` is a property of the image (no `.okso`), and `--mode
 // static` is `--linkage static --mode self-contained`.
@@ -2448,12 +2507,17 @@ std::expected<std::filesystem::path, Error>
 carrier_build(const Plan& plan, const CarrierBuild& b)
 {
     namespace fs = std::filesystem;
-    auto const& c = plan.platform.fields.carrier;
-    if (!plan.platform.active || !c.set)
+    // The carrier entry serving this program's system and architecture
+    // (design 2026-10-29 §4.5).
+    const auto* entry = plan.platform.active
+        ? mcpp::manifest::platform::carrier_for(plan.platform.fields, std::format("{}-{}", b.system, b.arch))
+        : nullptr;
+    if (!entry)
         return std::unexpected(Error{std::format(
-            "--mode self-contained of {} builds a program of the machine over its platform's "
-            "carrier, and {} states none ([platform] carrier = {{ package, section, main }}).",
-            plan.binaryName, plan.platform.display())});
+            "--mode self-contained of {} builds a program of {}-{} over its platform's carrier, and "
+            "{} states none for it ([platform] carrier = {{ package, section, main, hosts }}).",
+            plan.binaryName, b.system, b.arch, plan.platform.display())});
+    auto const& c = *entry;
     std::error_code ec;
     if (c.main.empty() || !fs::is_regular_file(c.main, ec))
         return std::unexpected(Error{std::format(
@@ -2560,8 +2624,9 @@ run_loaded(const Plan& plan)
     };
     const bool bundles = plan.opts.mode != Mode::None;
 
-    if (plan.opts.universalName.empty()) {
-        // ONE LEG: the image in `bin/`, the images it names beside it, or
+    if (!plan.opts.tree) {
+        // NO TREE (a single file's staging, or a platform that states no
+        // runner): the image in `bin/`, the images it names beside it, or
         // under `self-contained` the carrier that carries it (M3).
         std::vector<fs::path> needed;
         if (bundles) {
@@ -2593,13 +2658,12 @@ run_loaded(const Plan& plan)
             if (auto r = copy(n, plan.stagingRoot / "bin" / n.filename()); !r) return r;
         if (auto r = stage_runtime_files(plan, staged.parent_path()); !r) return r;
     } else {
-        // A UNIVERSAL PACKAGE: a `lib/<arch>/` per leg, the launchers, and the
-        // runner's program per system and architecture under `self-contained`.
+        // THE TREE: a `lib/<arch>/` per leg, the launchers, and the runner's
+        // program per system and architecture under `self-contained`.
         auto const& runner = plan.platform.fields.runner;
         if (!runner.set || runner.cmd.empty())
             return std::unexpected(Error{std::format(
-                "a universal package of {} starts its images through the platform's runner, and "
-                "{} states none.\n  use: --no-universal",
+                "the tree of {} starts its images through the platform's runner, and {} states none",
                 plan.binaryName, plan.platform.display())});
         struct Leg { std::string triple, arch; fs::path artifact; };
         std::vector<Leg> legs{ { plan.triple, arch_of(plan.triple), plan.builtBinary } };
@@ -2609,9 +2673,6 @@ run_loaded(const Plan& plan)
         launch.runner = runner.cmd;
         for (auto const& leg : legs) launch.entry[leg.arch] = leg.artifact.filename().string();
         if (plan.opts.mode == Mode::BundleAll) launch.loader = fs::path(runner.cmd.front()).stem().string();
-        // A word a `.cmd` cannot hold is refused now, before anything is staged.
-        if (auto ok = mcpp::pack::distribution::launchable(launch); !ok)
-            return std::unexpected(Error{ok.error()});
         for (auto const& leg : legs) {
             const auto dir = plan.stagingRoot / "lib" / leg.arch;
             if (auto r = copy(leg.artifact, dir / leg.artifact.filename()); !r) return r;
@@ -2624,10 +2685,8 @@ run_loaded(const Plan& plan)
             if (auto r = stage_runtime_files(plan, dir, leg.artifact.parent_path()); !r) return r;
         }
         if (plan.opts.mode == Mode::BundleAll) {
-            std::vector<std::string> systems = plan.opts.systems;
-            if (systems.empty()) systems.emplace_back(host_system());
-            for (auto const& system : systems)
-                for (auto const& leg : legs) {
+            for (auto const& leg : legs)
+                for (auto const& system : mcpp::pack::systems_for(plan.opts.systems, leg.arch)) {
                     // A row this mcpp builds no program for (a planned
                     // target, `x86_64-macos`) carries no runner: said, and
                     // the package's metadata lists the systems it carries.
@@ -2657,8 +2716,40 @@ run_loaded(const Plan& plan)
         fs::permissions(posix, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec
                                | fs::perms::others_read | fs::perms::others_exec,
                         fs::perm_options::replace, ec);
-        std::ofstream(plan.stagingRoot / "bin" / (launch.name + ".cmd"), std::ios::binary | std::ios::trunc)
-            << mcpp::pack::distribution::windows_launcher(launch);
+        // The Windows launcher, a program (design 2026-10-29 §4.3): built for
+        // x86_64 Windows, which an arm64 Windows machine also runs. A host
+        // that builds no program for that row leaves it out, says so, and
+        // the package's `runs_on` names no Windows pair.
+        // Over the platform's hosted arrangement where it serves the row, as
+        // the runners are: the same program whichever machine packs it.
+        const auto row = program_row("windows", "x86_64", true, &plan.platform);
+        if (!row_is_built(row)) {
+            mcpp::ui::warning(std::format(
+                "no Windows launcher in the package: this mcpp builds no program for {}; the package "
+                "does not run on Windows", row.triple));
+        } else {
+            const auto dir = plan.projectRoot / "target" / "launcher-pack" / launch.name;
+            fs::create_directories(dir / "src", ec);
+            fs::remove(dir / "mcpp.lock", ec);
+            auto write = [&](const fs::path& p, std::string_view text) -> bool {
+                std::ofstream out(p, std::ios::binary | std::ios::trunc);
+                out.write(text.data(), static_cast<std::streamsize>(text.size()));
+                return bool(out);
+            };
+            if (!write(dir / "mcpp.toml", mcpp::pack::distribution::exe_launcher_manifest(
+                           launch.name, plan.packageVersion)
+                           + static_row_pin(row, plan.platform.fields.toolchain.set
+                                                     ? plan.platform.fields.toolchain.value : std::string()))
+                || !write(dir / "src" / "main.cpp", mcpp::pack::distribution::exe_launcher_main(launch)))
+                return std::unexpected(Error{std::format("cannot write the launcher's sources under {}",
+                                                         dir.string())});
+            auto packed = pack_generated_program(dir, row);
+            if (!packed) return std::unexpected(packed.error());
+            fs::copy_file(*packed / (launch.name + ".exe"), plan.stagingRoot / "bin" / (launch.name + ".exe"),
+                          fs::copy_options::overwrite_existing, ec);
+            if (ec) return std::unexpected(Error{std::format("cannot place the Windows launcher: {}",
+                                                             ec.message())});
+        }
     }
 
     copy_if_exists(plan.projectRoot / "README.md", plan.stagingRoot);
@@ -3274,8 +3365,65 @@ run(const Plan& plan, const mcpp::config::GlobalConfig& cfg)
     }
 }
 
+std::expected<std::filesystem::path, Error> write_another_container(const Plan& plan, ArchiveKind kind) {
+    Plan q = plan;
+    q.archive = kind;
+    if (kind == ArchiveKind::Zip
+        && (q.opts.compression.algorithm == mcpp::pack::compress::Algorithm::Zstd
+            || q.opts.compression.algorithm == mcpp::pack::compress::Algorithm::Xz))
+        q.opts.compression = {};
+    q.archivePath = (q.opts.outputDir.empty() ? q.projectRoot / "target" / "dist" : q.opts.outputDir)
+                  / detail::default_archive_name(
+        q.packageName, q.packageVersion, q.opts.universalName.empty() ? q.triple : q.opts.universalName,
+        q.opts.mode, kind, q.opts.compression.algorithm);
+    if (auto r = detail::write_container(q); !r) return std::unexpected(r.error());
+    return q.archivePath;
+}
+
 std::expected<void, Error> finalize_staged(const Plan& plan) {
     return detail::finalize_tree(plan);
+}
+
+std::vector<std::string> systems_for(const std::vector<std::string>& stated, std::string_view arch) {
+    if (stated.empty()) return { std::string(detail::host_system()) };
+    std::vector<std::string> out;
+    auto add = [&](std::string os) {
+        if (std::ranges::find(out, os) == out.end()) out.push_back(std::move(os));
+    };
+    for (auto const& e : stated) {
+        if (e == "all") {
+            for (auto os : { "linux", "macos", "windows" }) add(os);
+            continue;
+        }
+        const auto dash = e.find('-');
+        if (dash == std::string::npos) add(e);
+        else if (std::string_view(e).substr(dash + 1) == arch) add(e.substr(0, dash));
+    }
+    return out;
+}
+
+std::vector<SingleFileRow> single_file_rows(const Plan& plan) {
+    std::vector<std::string> archs{ detail::arch_of(plan.triple) };
+    for (auto const& l : plan.loadedLegs) archs.push_back(l.arch);
+    const bool all = std::ranges::find(plan.opts.systems, "all") != plan.opts.systems.end();
+    std::vector<SingleFileRow> rows;
+    for (auto const& arch : archs)
+        for (auto const& system : systems_for(plan.opts.systems, arch)) {
+            SingleFileRow r{ system, arch, {} };
+            if (all)
+                if (auto row = unbuilt_row(system, arch); !row.empty())
+                    r.skipped = std::format("no carrier row: this mcpp builds no program for {}", row);
+            rows.push_back(std::move(r));
+        }
+    return rows;
+}
+
+bool output_names_directory(const std::filesystem::path& output) {
+    if (output.empty()) return false;
+    const auto text = output.native();
+    if (text.back() == '/' || text.back() == '\\') return true;
+    std::error_code ec;
+    return std::filesystem::is_directory(output, ec);
 }
 
 std::string unbuilt_row(std::string_view system, std::string_view arch) {
@@ -3286,7 +3434,7 @@ std::string unbuilt_row(std::string_view system, std::string_view arch) {
 std::vector<std::string> carried_systems(const Plan& plan) {
     // The one-leg tree of a single file holds the images, not the carrier
     // (`run_loaded`): the carrier is the file, made per system of `--systems`.
-    if (plan.opts.universalName.empty() && plan.targetIsLoaded && plan.opts.mode == Mode::BundleAll
+    if (!plan.opts.tree && plan.targetIsLoaded && plan.opts.mode == Mode::BundleAll
         && plan.opts.format != Format::SingleFile)
         return { std::format("{}-{}", detail::host_system(), detail::arch_of(plan.triple)) };
     return mcpp::pack::distribution::loader_systems(plan.stagingRoot);
@@ -3295,13 +3443,14 @@ std::vector<std::string> carried_systems(const Plan& plan) {
 std::expected<std::filesystem::path, Error>
 runner_program(const mcpp::platform::Resolved& platform, const std::filesystem::path& projectRoot,
                std::string_view name, std::string_view arch, bool build) {
-    if (!platform.active || !platform.fields.carrier.set)
+    const std::string system(detail::host_system());
+    if (!platform.active
+        || !mcpp::manifest::platform::carrier_for(platform.fields, std::format("{}-{}", system, arch)))
         return std::unexpected(Error{std::format(
             "the runner `{}` of {} runs on a machine of the artifact's architecture, {}, and its "
-            "program for that architecture is the platform's carrier, which {} does not state "
-            "([platform] carrier = {{ package, section, main }})",
-            name, platform.display(), arch, platform.display())});
-    const std::string system(detail::host_system());
+            "program for that architecture is the platform's carrier, which {} does not state for "
+            "{}-{} ([platform] carrier = {{ package, section, main, hosts }})",
+            name, platform.display(), arch, platform.display(), system, arch)});
     if (auto why = detail::unbuilt_carrier(platform, system, arch, false))
         return std::unexpected(Error{*why});
     const auto program = detail::packed_program(detail::carrier_dir(projectRoot, name, system, arch),
@@ -3328,8 +3477,8 @@ std::expected<std::vector<std::filesystem::path>, Error> single_file(const Plan&
     const auto distDir = plan.projectRoot / "target" / "dist";
     auto output_for = [&](std::string_view qualifier, std::string_view suffix) {
         if (plan.opts.output.empty())
-            return distDir / std::format("{}-{}-{}{}", plan.packageName, plan.packageVersion,
-                                         qualifier, suffix);
+            return (plan.opts.outputDir.empty() ? distDir : plan.opts.outputDir)
+                 / std::format("{}-{}-{}{}", plan.packageName, plan.packageVersion, qualifier, suffix);
         if (!plan.opts.output.has_parent_path()) return distDir / plan.opts.output;
         return plan.opts.output;
     };
@@ -3338,42 +3487,65 @@ std::expected<std::vector<std::filesystem::path>, Error> single_file(const Plan&
         // THE IMAGE, OR THE IMAGES AS ONE STORED ZIP: what the carrier's
         // entry reads between `mcpp_carried_begin` and `mcpp_carried_end`
         // (SPEC-013 §11): the image alone when it names no other, else every
-        // image of `bin/` as members of a zip whose data lies on 64 KiB
-        // boundaries, the entry named by `mcpp_carried_name`.
-        std::vector<fs::path> images;
-        for (auto const& e : fs::directory_iterator(plan.stagingRoot / "bin", ec))
-            if (e.is_regular_file(ec)) images.push_back(e.path());
-        std::ranges::sort(images);
-        fs::path carried = plan.stagingRoot / "bin" / plan.binaryName;
-        if (images.size() > 1) {
-            carried = plan.projectRoot / "target" / "carrier-pack"
-                    / (fs::path(plan.binaryName).stem().string() + ".carried.zip");
+        // image it needs as members of a zip whose data lies on 64 KiB
+        // boundaries, the entry named by `mcpp_carried_name`. One file per
+        // leg and system of the leg's architecture (design 2026-10-29 §4.5):
+        // the first leg's images are the staged `bin/`, another leg's are its
+        // artifact and the images that artifact names.
+        struct Leg { std::string arch; std::vector<fs::path> images; fs::path carried; };
+        std::vector<Leg> legs;
+        {
+            Leg first{ detail::arch_of(plan.triple), {}, {} };
+            for (auto const& e : fs::directory_iterator(plan.stagingRoot / "bin", ec))
+                if (e.is_regular_file(ec)) first.images.push_back(e.path());
+            legs.push_back(std::move(first));
+        }
+        for (auto const& l : plan.loadedLegs) {
+            auto n = detail::needed_images(l.artifact, plan.binaryName);
+            if (!n) return std::unexpected(n.error());
+            Leg leg{ l.arch, { l.artifact }, {} };
+            leg.images.insert(leg.images.end(), n->begin(), n->end());
+            legs.push_back(std::move(leg));
+        }
+        for (auto& leg : legs) {
+            std::ranges::sort(leg.images);
+            leg.carried = leg.images.empty() ? plan.stagingRoot / "bin" / plan.binaryName : leg.images.front();
+            if (leg.images.size() < 2) continue;
+            leg.carried = plan.projectRoot / "target" / "carrier-pack"
+                        / std::format("{}-{}.carried.zip", fs::path(plan.binaryName).stem().string(), leg.arch);
+            fs::create_directories(leg.carried.parent_path(), ec);
             std::vector<mcpp::pack::zip::Entry> entries;
-            for (auto const& i : images) entries.push_back({ i.filename().string(), i, false, {} });
+            for (auto const& i : leg.images) entries.push_back({ i.filename().string(), i, false, {} });
             mcpp::pack::zip::WriteOptions o;
             o.align = 65536;
-            if (auto r = mcpp::pack::zip::write(carried, entries, o); !r)
+            if (auto r = mcpp::pack::zip::write(leg.carried, entries, o); !r)
                 return std::unexpected(Error{r.error()});
         }
-        auto t = mcpp::toolchain::triple::parse(plan.triple);
-        const std::string arch = t ? t->arch : std::string(mcpp::toolchain::platform::host_arch);
-        std::vector<std::string> systems = plan.opts.systems;
-        if (systems.empty()) systems.emplace_back(detail::host_system());
-        if (systems.size() > 1 && !plan.opts.output.empty())
+        struct File { std::string system, arch; fs::path carried; };
+        std::vector<File> files;
+        for (auto const& r : single_file_rows(plan)) {
+            if (!r.skipped.empty()) continue;
+            files.push_back({ r.system, r.arch, std::ranges::find(legs, r.arch, &Leg::arch)->carried });
+        }
+        if (files.empty())
+            return std::unexpected(Error{std::string(
+                "--systems names no system this mcpp makes a single file for, of the legs' "
+                "architectures")});
+        if (files.size() > 1 && !plan.opts.output.empty())
             return std::unexpected(Error{std::format(
-                "--output names one file, and --systems makes one single file per system ({}).\n"
-                "  use: leave --output out; each file is named <name>-<version>-<os>-<arch>",
-                systems.size())});
-        for (auto const& system : systems) {
+                "--output names one file, and this pack makes {} single files (one per leg and "
+                "system).\n  use: -o <directory>/ (each file is named <name>-<version>-<os>-<arch>)",
+                files.size())});
+        for (auto const& f : files) {
             const auto stem = fs::path(plan.binaryName).stem().string();
-            auto packed = detail::carrier_build(plan, { carried, plan.binaryName, stem, system, arch, true });
+            auto packed = detail::carrier_build(plan, { f.carried, plan.binaryName, stem, f.system, f.arch, true });
             if (!packed) return std::unexpected(packed.error());
-            const auto suffix = system == "windows" ? std::string(".exe") : std::string();
+            const auto suffix = f.system == "windows" ? std::string(".exe") : std::string();
             const auto program = *packed / (stem + suffix);
             if (!fs::is_regular_file(program, ec))
                 return std::unexpected(Error{std::format("the carrier built for {}-{} has no {}",
-                                                         system, arch, program.filename().string())});
-            const auto out = output_for(std::format("{}-{}", system, arch), suffix);
+                                                         f.system, f.arch, program.filename().string())});
+            const auto out = output_for(std::format("{}-{}", f.system, f.arch), suffix);
             fs::create_directories(out.parent_path(), ec);
             fs::copy_file(program, out, fs::copy_options::overwrite_existing, ec);
             if (ec) return std::unexpected(Error{std::format("cannot write {}: {}", out.string(), ec.message())});

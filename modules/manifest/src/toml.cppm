@@ -12,6 +12,7 @@ import std;
 import mcpp.invocation;
 import mcpp.source_kind;
 import mcpp.libs.toml;
+import mcpp.toolchain.triple;
 import mcpp.pm.dep_spec;
 import mcpp.version_req;
 import mcpp.pm.dependency_selector;
@@ -1049,6 +1050,10 @@ std::expected<Manifest, ManifestError> parse_document(const t::Document& documen
         // §2.5): the platform reader type-checks every entry.
         "platform.link.inputs",
         "target.*.link.inputs",
+        // `carrier = [{ package, section, main, hosts }, ...]` (design
+        // 2026-10-29 §4.5): the platform reader type-checks every entry.
+        "platform.carrier",
+        "target.*.carrier",
     };
     if (auto badPath = find_disallowed_array_of_tables(doc->root(), "", kAllowedArraysOfTables)) {
         return std::unexpected(error(origin, std::format(
@@ -1056,7 +1061,7 @@ std::expected<Manifest, ManifestError> parse_document(const t::Document& documen
             "array-of-tables syntax is only supported for [[build.flags]], "
             "[[features.<name>.flags]], [[runtime.requirements]], "
             "[[runtime.artifacts]], [[runtime.deploy]], [[platform.link.inputs]], "
-            "and [xlings] deps entries",
+            "[[platform.carrier]] and [xlings] deps entries",
             *badPath, *badPath)));
     }
 
@@ -2946,7 +2951,17 @@ std::expected<Manifest, ManifestError> parse_document(const t::Document& documen
         m.buildConfig.buildProgramTimeoutSecs = static_cast<int>(secs);
     }
     if (auto v = doc->get_string("build.c_standard"))     m.buildConfig.cStandard = *v;
-    if (auto v = doc->get_string("build.target"))         m.buildConfig.target = *v;
+    if (auto v = doc->get_string("build.target")) {
+        // One target: `build`, `run` and `test` act on it by default, and a
+        // default that built every architecture would charge each build for
+        // all of them (SPEC-015 §3.3).
+        if (mcpp::toolchain::target_set::is_set_spelling(*v))
+            return std::unexpected(error(origin, std::format(
+                "[build].target = '{}' names a target set; [build] target names one target "
+                "(`x86_64-openkal`). A set is written in [pack] targets, or as `--target {}`",
+                *v, *v)));
+        m.buildConfig.target = *v;
+    }
     // `jobs` accepts a number or "auto"; both arrive as text and are validated
     // where they are used, so a bad value warns at build time instead of making
     // the whole manifest unloadable. (A published package carrying an unknown
@@ -3784,10 +3799,11 @@ std::expected<Manifest, ManifestError> parse_document(const t::Document& documen
     // [pack] — `mcpp pack` configuration. See docs/10-pack-and-release.md.
     if (auto v = doc->get_string("pack.default_mode")) {
         const auto& s = *v;
-        if (s != "static" && s != "bundle-project" && s != "bundle-all") {
+        if (s != "system" && s != "vendored" && s != "self-contained" && s != "static"
+            && s != "bundle-project" && s != "bundle-all") {
             return std::unexpected(error(origin, std::format(
-                "[pack].default_mode = '{}' invalid; expected "
-                "'static' | 'bundle-project' | 'bundle-all'", s)));
+                "[pack].default_mode = '{}' invalid; expected 'system' | 'vendored' | "
+                "'self-contained' | 'static' (aliases: 'bundle-project', 'bundle-all')", s)));
         }
         m.packConfig.defaultMode = s;
     }
@@ -3813,7 +3829,12 @@ std::expected<Manifest, ManifestError> parse_document(const t::Document& documen
                 "[pack].linkage = '{}' invalid; expected 'static' | 'shared'", *v)));
         m.packConfig.linkage = *v;
     }
-    if (auto v = doc->get_string("pack.format"))   m.packConfig.format = *v;
+    // `[pack] format` and `[pack] systems`: a string or a list (design
+    // 2026-10-29 §4.1, §4.6), checked with the flags that take the same words.
+    if (auto v = doc->get_string("pack.format")) m.packConfig.format = { *v };
+    else if (auto a = doc->get_string_array("pack.format")) m.packConfig.format = *a;
+    if (auto v = doc->get_string("pack.systems")) m.packConfig.systems = { *v };
+    else if (auto a = doc->get_string_array("pack.systems")) m.packConfig.systems = *a;
     if (auto v = doc->get_string("pack.compress")) m.packConfig.compress = *v;
     if (auto v = doc->get_string_array("pack.sign")) {
         if (v->empty())
@@ -3822,6 +3843,23 @@ std::expected<Manifest, ManifestError> parse_document(const t::Document& documen
         m.packConfig.sign = *v;
     }
     if (auto v = doc->get_bool("pack.universal")) m.packConfig.universal = *v;
+    // `[pack] targets` (SPEC-015 §3.3): a string or a list; each a target or a
+    // target set. A set's members are known only with the platform the
+    // command selects, so a set is checked for its form here and expanded
+    // where the command reads it.
+    {
+        std::vector<std::string> targets;
+        if (auto v = doc->get_string("pack.targets")) targets.push_back(*v);
+        else if (auto a = doc->get_string_array("pack.targets")) targets = *a;
+        for (auto const& t : targets) {
+            if (mcpp::toolchain::target_set::is_set_spelling(t) || mcpp::toolchain::triple::parse(t))
+                continue;
+            return std::unexpected(error(origin, std::format(
+                "[pack].targets: '{}' is neither a target (`x86_64-linux-musl`) nor a target set "
+                "(`openkal`, `linux-musl`)", t)));
+        }
+        m.packConfig.targets = std::move(targets);
+    }
 
     // [target.<triple>] — per-target overrides. We accept both GCC
     // (x86_64-linux-musl) and Rust-style (x86_64-unknown-linux-musl)
@@ -4217,14 +4255,21 @@ std::expected<Manifest, ManifestError> parse_document(const t::Document& documen
                         return std::unexpected(error(origin, std::format(
                             "[target.{}.abi] has no member '{}'; the members are: "
                             "threads, exceptions", triple, ak)));
-                    if (!av.is_bool())
-                        return std::unexpected(error(origin, std::format(
-                            "[target.{}.abi].{} must be true or false", triple, ak)));
+                    // `exceptions` also takes the model on Emscripten (design
+                    // 2026-10-29 §6): "wasm" or "js"; `true` keeps "js".
+                    const bool model = ak == "exceptions" && av.is_string()
+                        && (av.as_string() == "wasm" || av.as_string() == "js");
+                    if (!av.is_bool() && !model)
+                        return std::unexpected(error(origin, ak == "exceptions"
+                            ? std::format("[target.{}.abi].exceptions must be true, false, "
+                                          "\"wasm\" or \"js\"", triple)
+                            : std::format("[target.{}.abi].{} must be true or false", triple, ak)));
                     if (ak == "threads") {
                         cc.abiThreads = av.as_bool();
                         cc.abiThreadsDeclared = true;
                     } else {
-                        cc.abiExceptions = av.as_bool();
+                        cc.abiExceptions = model || av.as_bool();
+                        cc.abiExceptionsModel = model ? av.as_string() : std::string();
                         cc.abiExceptionsDeclared = true;
                     }
                 }

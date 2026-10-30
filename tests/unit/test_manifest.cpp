@@ -3835,9 +3835,10 @@ TEST(PlatformAxis, HostAndTargetAreNotInterchangeable) {
     EXPECT_EQ(TargetPlatform::for_os("macosx").key(), "macosx");
     EXPECT_EQ(TargetPlatform::for_os("windows").key(), "windows");
     EXPECT_EQ(TargetPlatform::for_os("linux").key(), "linux");
-    // An absent/unknown os token keeps the pre-#254 behaviour: host.
-    EXPECT_EQ(TargetPlatform::for_os("").key(),
-              HostPlatform::current().key());
+    // A token naming none of the three reads its own block, never the
+    // host's (design 2026-10-29 §5.1, #851).
+    EXPECT_EQ(TargetPlatform::for_os("emscripten").key(), "emscripten");
+    EXPECT_EQ(TargetPlatform::for_os("none").key(), "none");
 }
 
 // The behaviour half: a descriptor's per-OS section must be spliced for the
@@ -7067,4 +7068,86 @@ TEST(Manifest, OnlyEntryTargetsStillInferTheLibrary) {
     }));
     std::error_code ec;
     std::filesystem::remove_all(tmp, ec);
+}
+
+// ── [pack] targets and [build] target (SPEC-015 §3.3) ────────────────────────
+
+TEST(Manifest, PackTargetsTakeTargetsAndSets) {
+    auto list = mcpp::manifest::parse_string(R"(
+[package]
+name = "p"
+version = "0.1.0"
+[pack]
+targets = ["openkal", "x86_64-linux-musl"]
+)");
+    ASSERT_TRUE(list.has_value()) << list.error().format();
+    EXPECT_EQ(list->packConfig.targets, (std::vector<std::string>{"openkal", "x86_64-linux-musl"}));
+    auto one = mcpp::manifest::parse_string(R"(
+[package]
+name = "p"
+version = "0.1.0"
+[pack]
+targets = "linux-musl"
+)");
+    ASSERT_TRUE(one.has_value()) << one.error().format();
+    EXPECT_EQ(one->packConfig.targets, (std::vector<std::string>{"linux-musl"}));
+}
+
+// `[pack] format` and `[pack] systems` are a string or a list, and
+// `default_mode` takes the canonical names (design 2026-10-29 §4.1, §4.6).
+TEST(Manifest, PackFormatAndSystemsAreAStringOrAList) {
+    auto m = mcpp::manifest::parse_string(R"(
+[package]
+name = "p"
+version = "0.1.0"
+[pack]
+default_mode = "self-contained"
+format = ["tar", "okb"]
+systems = "linux-aarch64"
+)");
+    ASSERT_TRUE(m.has_value()) << m.error().format();
+    EXPECT_EQ(m->packConfig.defaultMode, "self-contained");
+    EXPECT_EQ(m->packConfig.format, (std::vector<std::string>{"tar", "okb"}));
+    EXPECT_EQ(m->packConfig.systems, (std::vector<std::string>{"linux-aarch64"}));
+    auto one = mcpp::manifest::parse_string(R"(
+[package]
+name = "p"
+version = "0.1.0"
+[pack]
+format = "zip"
+)");
+    ASSERT_TRUE(one.has_value()) << one.error().format();
+    EXPECT_EQ(one->packConfig.format, (std::vector<std::string>{"zip"}));
+}
+
+TEST(Manifest, PackTargetsRefuseWhatIsNeitherATargetNorASet) {
+    auto m = mcpp::manifest::parse_string(R"(
+[package]
+name = "p"
+version = "0.1.0"
+[pack]
+targets = ["not a target"]
+)");
+    ASSERT_FALSE(m.has_value());
+    EXPECT_NE(m.error().format().find("neither a target"), std::string::npos);
+}
+
+TEST(Manifest, BuildTargetIsOneTarget) {
+    auto m = mcpp::manifest::parse_string(R"(
+[package]
+name = "p"
+version = "0.1.0"
+[build]
+target = "openkal"
+)");
+    ASSERT_FALSE(m.has_value());
+    EXPECT_NE(m.error().format().find("names a target set"), std::string::npos);
+    auto ok = mcpp::manifest::parse_string(R"(
+[package]
+name = "p"
+version = "0.1.0"
+[build]
+target = "x86_64-openkal"
+)");
+    ASSERT_TRUE(ok.has_value()) << ok.error().format();
 }

@@ -116,6 +116,34 @@ TEST(PackCompress, EveryCodecRoundTrips) {
     EXPECT_EQ(*back, text);
 }
 
+// The name of a tar archive states its compression, the inverse of
+// tar_extension; a test archive is written and read by it.
+TEST(PackCompress, ATarNameStatesItsCompression) {
+    for (auto a : { c::Algorithm::Gzip, c::Algorithm::Zstd, c::Algorithm::Xz, c::Algorithm::None })
+        EXPECT_EQ(c::tar_algorithm(std::format("t{}", c::tar_extension(a))), a) << c::name(a);
+    EXPECT_EQ(c::tar_algorithm("t.tgz"), c::Algorithm::Gzip);
+    EXPECT_FALSE(c::tar_algorithm("t.zip"));
+    EXPECT_FALSE(c::tar_algorithm("t.gz"));
+    EXPECT_FALSE(c::tar_algorithm("tests"));
+}
+
+// zlib counts in 32 bits; the input is handed over in pieces, so one gzip
+// member holds more than one piece (1 GiB) and comes back whole. A member cut
+// short is refused, not waited on.
+TEST(PackCompress, AGzipMemberLargerThanOnePieceRoundTrips) {
+    std::string big((std::size_t{1} << 30) + 4096, '\0');
+    big.replace(big.size() - 7, 7, "the end");
+    auto packed = c::bytes(big, *c::parse("gzip:1"));
+    ASSERT_TRUE(packed) << packed.error();
+    auto back = c::decompress(*packed, c::Algorithm::Gzip);
+    ASSERT_TRUE(back) << back.error();
+    EXPECT_EQ(back->size(), big.size());
+    EXPECT_TRUE(back->ends_with("the end"));
+    big = {};
+    back = {};
+    EXPECT_FALSE(c::decompress(std::string_view(*packed).substr(0, packed->size() / 2), c::Algorithm::Gzip));
+}
+
 TEST(PackDistribution, Sha256OfKnownVectors) {
     EXPECT_EQ(d::sha256(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
     EXPECT_EQ(d::sha256("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
@@ -175,7 +203,6 @@ TEST(PackDistribution, LaunchersPickTheArchitectureAndTheRunner) {
     l.runner = { "okrun", "{}" };
     l.entry = { { "x86_64", "hello.oke" }, { "aarch64", "hello.oke" } };
     l.loader = "okrun";
-    ASSERT_TRUE(d::launchable(l));
     const auto sh = d::posix_launcher(l);
     EXPECT_TRUE(sh.starts_with("#!/bin/sh\n"));
     EXPECT_NE(sh.find("x86_64|amd64|AMD64) arch=x86_64"), std::string::npos);
@@ -186,10 +213,8 @@ TEST(PackDistribution, LaunchersPickTheArchitectureAndTheRunner) {
     // The package is found through a link to the launcher, without readlink -f.
     EXPECT_NE(sh.find("readlink -- \"$self\""), std::string::npos);
     EXPECT_EQ(sh.find("readlink -f"), std::string::npos);
-    const auto cmd = d::windows_launcher(l);
-    EXPECT_NE(cmd.find("PROCESSOR_ARCHITEW6432"), std::string::npos);
-    EXPECT_NE(cmd.find("libexec\\okrun\\windows-%arch%\\okrun.exe"), std::string::npos);
-    EXPECT_NE(cmd.find("\"%runner%\" \"%image%\" %*"), std::string::npos);
+    // A POSIX shell on Windows hands over to the program of the same name.
+    EXPECT_NE(sh.find("MINGW*|MSYS*|CYGWIN*) exec \"$top/bin/\"'hello'.exe \"$@\""), std::string::npos) << sh;
 }
 
 // The runner's words expand as `mcpp run` expands them: a word's `{}` is the
@@ -201,32 +226,36 @@ TEST(PackDistribution, LaunchersExpandTheRunnerAsMcppRunDoes) {
     l.runner = { "okrun", "--image={}", "it's" };
     EXPECT_NE(d::posix_launcher(l).find("exec \"$runner\" '--image='\"$image\" 'it'\\''s' \"$@\""),
               std::string::npos) << d::posix_launcher(l);
-    EXPECT_NE(d::windows_launcher(l).find("\"%runner%\" \"--image=%image%\" \"it's\" %*"), std::string::npos)
-        << d::windows_launcher(l);
     l.runner = { "okrun", "--quiet" };
     EXPECT_NE(d::posix_launcher(l).find("exec \"$runner\" '--quiet' \"$image\" \"$@\""), std::string::npos)
         << d::posix_launcher(l);
-    EXPECT_NE(d::windows_launcher(l).find("\"%runner%\" \"--quiet\" \"%image%\" %*"), std::string::npos)
-        << d::windows_launcher(l);
 }
 
-// A .cmd doubles `%` in what it states literally, and a word it cannot state
-// (a double quote) is refused: the .cmd written for it runs nothing.
-TEST(PackDistribution, AWindowsLauncherEscapesWhatItStates) {
+// The Windows launcher is a program (design 2026-10-29 §4.3): its source states
+// the launch as constants, finds the package from its own path, reads the
+// machine's architecture, and expands the runner's words as `mcpp run` does.
+// Any word is stated, quotes and percent signs included: a raw string holds it.
+TEST(PackDistribution, TheWindowsLauncherIsAProgram) {
     d::Launch l;
     l.name = "hello";
-    l.entry = { { "x86_64", "hello.oke" } };
-    l.runner = { "ok%run", "--load=50%", "{}" };
-    const auto cmd = d::windows_launcher(l);
-    EXPECT_NE(cmd.find("set \"runner=ok%%run\""), std::string::npos) << cmd;
-    EXPECT_NE(cmd.find("\"%runner%\" \"--load=50%%\" \"%image%\" %*"), std::string::npos) << cmd;
-    l.runner = { "okrun", "--say=\"hi\"", "{}" };
-    auto ok = d::launchable(l);
-    ASSERT_FALSE(ok);
-    EXPECT_NE(ok.error().find("double quote"), std::string::npos) << ok.error();
-    const auto refused = d::windows_launcher(l);
-    EXPECT_EQ(refused.find("%runner%"), std::string::npos) << refused;
-    EXPECT_NE(refused.find("exit /b 126"), std::string::npos) << refused;
+    l.entry = { { "x86_64", "hello.oke" }, { "aarch64", "hello.oke" } };
+    l.runner = { "okrun", "--say=\"50%\"", "{}" };
+    l.loader = "okrun";
+    const auto src = d::exe_launcher_main(l);
+    EXPECT_NE(src.find("import mcpplibs.os;"), std::string::npos) << src;
+    EXPECT_NE(src.find("os::env::image()"), std::string::npos) << src;
+    EXPECT_NE(src.find("PROCESSOR_ARCHITEW6432"), std::string::npos) << src;
+    EXPECT_NE(src.find("R\"mcpp(--say=\"50%\")mcpp\""), std::string::npos) << src;
+    // One program for every set of legs: the entry's name, the architectures
+    // the directories under `lib/`.
+    EXPECT_NE(src.find("kEntry = R\"mcpp(hello.oke)mcpp\""), std::string::npos) << src;
+    EXPECT_EQ(src.find("R\"mcpp(aarch64)mcpp\""), std::string::npos) << src;
+    EXPECT_NE(src.find("fs::directory_iterator(top / \"lib\""), std::string::npos) << src;
+    EXPECT_NE(src.find("(\"windows-\" + arch)"), std::string::npos) << src;
+    EXPECT_NE(src.find("os::process::exec"), std::string::npos) << src;
+    const auto manifest = d::exe_launcher_manifest("hello", "1.0.0");
+    EXPECT_NE(manifest.find("os = \"0.2.1\""), std::string::npos) << manifest;
+    EXPECT_NE(manifest.find("[targets.hello]"), std::string::npos) << manifest;
 }
 
 // The POSIX launcher, run through a link to it from another directory, finds
@@ -544,6 +573,73 @@ TEST(PackMerge, AFileThatIsNotItsDigestIsRefused) {
     EXPECT_FALSE(fs::exists(t.path / "out"));
 }
 
+// THE LAUNCHERS ARE DERIVED (design 2026-10-29 §4.3): two one-leg trees whose
+// POSIX launchers differ merge into the tree of both, its launcher written for
+// both legs; the Windows launcher, one program for every set of legs, is taken
+// once. A package written before `runs_on` existed is given its pairs.
+TEST(PackMerge, TheLaunchersAreWrittenForTheMergedLegs) {
+    Tmp t;
+    auto a = leg_package(t.path / "a", "x86_64-openkal", "x86_64");
+    auto b = leg_package(t.path / "b", "aarch64-openkal", "aarch64");
+    for (auto const& [root, arch] : { std::pair{ a, "x86_64" }, std::pair{ b, "aarch64" } }) {
+        write(root / "bin/app", std::format("#!/bin/sh\n# the launcher of {}\n", arch));
+        write(root / "bin/app.exe", std::format("MZ the program of {}", arch));
+        auto pkg = d::read(root);
+        ASSERT_TRUE(pkg) << pkg.error();
+        d::Stated stated;
+        stated.role["bin/app"] = "launcher";
+        stated.role["bin/app.exe"] = "launcher";
+        ASSERT_TRUE(d::describe(root, *pkg, stated));
+    }
+    d::MergeRequest req;
+    req.inputs = { a, b };
+    req.format = "dir";
+    req.output = t.path / "out";
+    auto r = d::merge(req);
+    ASSERT_TRUE(r) << r.error();
+    const auto script = slurp(*r / "bin/app");
+    EXPECT_NE(script.find("'x86_64') entry='app.oke'"), std::string::npos) << script;
+    EXPECT_NE(script.find("'aarch64') entry='app.oke'"), std::string::npos) << script;
+    EXPECT_EQ(slurp(*r / "bin/app.exe"), "MZ the program of x86_64");
+    auto merged = d::read(*r);
+    ASSERT_TRUE(merged) << merged.error();
+    ASSERT_TRUE(merged->runsOnSet);
+    ASSERT_TRUE(merged->runsOnWith.contains("okrun"));
+    EXPECT_NE(std::ranges::find(merged->runsOnWith["okrun"], "macos-aarch64"), merged->runsOnWith["okrun"].end());
+    for (auto const& f : merged->files)
+        EXPECT_EQ(d::sha256_file(*r / f.path), f.sha256) << f.path;
+}
+
+// Merged without `-o`, a tree of a platform's legs is named after the platform
+// (design 2026-10-29 §4.2).
+TEST(PackMerge, AMergedTreeIsNamedAfterThePlatform) {
+    Tmp t;
+    std::vector<fs::path> inputs;
+    for (auto [leg, arch] : { std::pair{ "x86_64-openkal", "x86_64" }, std::pair{ "aarch64-openkal", "aarch64" } }) {
+        const auto root = t.path / arch / std::format("app-1.0-{}", leg);
+        write(root / "lib" / arch / "app.oke", std::format("image of {}", arch));
+        d::Package p;
+        p.name = "app";
+        p.version = "1.0";
+        p.platform = "mcpplibs.openkal-platform@0.18.0";
+        p.legs = { leg };
+        p.runner = { "okrun", "{}" };
+        p.entry = { { arch, std::format("lib/{}/app.oke", arch) } };
+        ASSERT_TRUE(d::describe(root, p, {}));
+        inputs.push_back(root);
+    }
+    std::error_code ec;
+    const auto cwd = fs::current_path();
+    fs::current_path(t.path, ec);
+    d::MergeRequest req;
+    req.inputs = inputs;
+    req.format = "dir";
+    auto r = d::merge(req);
+    fs::current_path(cwd, ec);
+    ASSERT_TRUE(r) << r.error();
+    EXPECT_EQ(r->filename(), "app-1.0-openkal");
+}
+
 // The legs merge into a new directory; an output that exists, or is an input,
 // is refused, and an input written with a trailing separator is its directory.
 TEST(PackMerge, TheOutputIsNewOrAPackage) {
@@ -620,6 +716,59 @@ TEST(PackMerge, TheCompressionFitsTheContainer) {
     ASSERT_TRUE(fits) << fits.error();
 }
 
+// #860 (design 2026-10-29 §4.4): a self-contained tree of images runs where
+// it carries a runner, and its entry names exactly those pairs -- macOS aarch64
+// only, Windows x86_64 only -- with no runner to install. A package that needs
+// the machine's runner names the pairs the platform's runner exists for.
+TEST(PackDistribution, AnEntryNamesWhereThePackageRuns) {
+    d::Asset a;
+    a.file = "mcpp-ide-0.1.1-openkal.tar.gz";
+    a.sha256 = std::string(64, 'c');
+    a.top = "mcpp-ide-0.1.1-openkal";
+    a.pkg.name = "mcpp-ide";
+    a.pkg.version = "0.1.1";
+    a.pkg.mode = "self-contained";
+    a.pkg.runner = { "okrun", "{}" };
+    a.pkg.legs = { "x86_64-openkal", "aarch64-openkal" };
+    a.pkg.entry = { { "x86_64", "lib/x86_64/mcpp-ide.oke" }, { "aarch64", "lib/aarch64/mcpp-ide.oke" } };
+    a.pkg.systems = { "linux-aarch64", "linux-x86_64", "macos-aarch64", "windows-x86_64" };
+    const std::vector<std::string> hosts = { "linux-x86_64", "linux-aarch64", "macos-aarch64",
+                                             "macos-x86_64", "windows-x86_64" };
+    d::compute_runs_on(a.pkg, hosts, false);
+    EXPECT_EQ(a.pkg.runsOnSelf, a.pkg.systems);
+    ASSERT_TRUE(a.pkg.runsOnWith.contains("okrun"));
+    EXPECT_EQ(a.pkg.runsOnWith.at("okrun"), (std::vector<std::string>{"macos-x86_64"}));
+    auto r = d::xpkg_descriptor({ a }, "https://example.org/v0.1.1");
+    ASSERT_TRUE(r) << r.error();
+    auto block = [&](std::string_view system) {
+        const auto at = r->find(std::format("        {} = {{", system));
+        return at == std::string::npos ? std::string() : r->substr(at, r->find("        },", at) - at);
+    };
+    EXPECT_NE(block("macosx").find("[\"aarch64\"]"), std::string::npos) << *r;
+    EXPECT_EQ(block("macosx").find("[\"x86_64\"]"), std::string::npos) << *r;
+    EXPECT_NE(block("windows").find("[\"x86_64\"]"), std::string::npos) << *r;
+    EXPECT_EQ(block("windows").find("[\"aarch64\"]"), std::string::npos) << *r;
+    EXPECT_EQ(r->find("deps = {"), std::string::npos) << *r;
+
+    a.pkg.mode = "vendored";
+    a.pkg.systems.clear();
+    d::compute_runs_on(a.pkg, hosts, false);
+    EXPECT_TRUE(a.pkg.runsOnSelf.empty());
+    EXPECT_EQ(a.pkg.runsOnWith.at("okrun").size(), hosts.size());
+    auto v = d::xpkg_descriptor({ a }, "https://example.org/v0.1.1");
+    ASSERT_TRUE(v) << v.error();
+    EXPECT_NE(v->find("deps = { \"xim:okrun\" }"), std::string::npos) << *v;
+
+    // A platform that states no hosts for its runner is read as every system
+    // of each architecture, as before runs_on existed.
+    d::compute_runs_on(a.pkg, {}, false);
+    EXPECT_EQ(a.pkg.runsOnWith.at("okrun").size(), 6u);
+
+    // The document carries it, and a reader takes it back.
+    auto j = d::to_json(a.pkg);
+    EXPECT_NE(j.find("\"runs_on\""), std::string::npos) << j;
+}
+
 // The entry is named after the command a person runs, not the package, and
 // moves the archive's own top-level directory into place.
 TEST(PackDistribution, XpkgDescriptorNamesTheCommandAndTheArchiveTop) {
@@ -635,7 +784,7 @@ TEST(PackDistribution, XpkgDescriptorNamesTheCommandAndTheArchiveTop) {
     ASSERT_TRUE(u) << u.error();
     EXPECT_NE(u->find("name = \"mcppls\""), std::string::npos) << *u;
     EXPECT_NE(u->find("xvm.add(\"mcppls\", opts)"), std::string::npos) << *u;
-    EXPECT_NE(u->find("opts.alias = \"mcppls.cmd\""), std::string::npos) << *u;
+    EXPECT_NE(u->find("opts.alias = \"mcppls.exe\""), std::string::npos) << *u;
     EXPECT_NE(u->find("for _, ext in ipairs({ \".zip\" }) do"), std::string::npos) << *u;
     EXPECT_NE(u->find("local top = pkginfo.install_file()"), std::string::npos) << *u;
     EXPECT_NE(u->find("os.mv(top, pkginfo.install_dir())"), std::string::npos) << *u;
@@ -751,7 +900,7 @@ TEST(PackDistribution, XpkgDescriptorDescribesProgramsOfASystem) {
     for (auto [triple, says] : { Row{ "wasm32-emscripten", "dist-web" },
                                  Row{ "aarch64-linux-android", "Linux, macOS or Windows target" },
                                  Row{ "riscv64-none-elf", "Linux, macOS or Windows target" },
-                                 Row{ "x86_64-openkal", "universal package" } }) {
+                                 Row{ "x86_64-openkal", "--target openkal" } }) {
         auto r = d::xpkg_descriptor({ one(triple, std::format("web-0.1.0-{}", triple), "bin/web.js") },
                                     "https://example.org/0.1.0");
         ASSERT_FALSE(r) << triple << ": " << *r;
