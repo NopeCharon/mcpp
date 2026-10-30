@@ -4,6 +4,39 @@
 > Each `## [<version>]` section is that release's notes. Entries are written in English
 > from 2026.9.28.3 on; earlier entries remain as written.
 
+## [2026.10.31.2] - 2026-10-31
+
+### Added
+
+- **`mcpp test <name> --print-launch`** (feature `test-launch`, docs/50 §9):
+  the one test the pattern names, built as `mcpp test` builds it and described
+  as `mcpp test` would start it -- its runner, the environment the run adds, the
+  arguments after `--` -- in the `mcpp.launch` envelope `mcpp run
+  --print-launch` prints, with `test` naming it. A debugger starts what it
+  describes (an IDE debugging a test or one of its cases, design 2026-10-30
+  part 2 §7.4). A pattern several tests contain resolves to the test named
+  exactly; one naming several, `--list`, `--no-run`, `--archive`,
+  `--message-format json`, several legs and several members are refused.
+
+### Fixed
+
+- **The build's contract states the target side** (`${mcpp.contract}`,
+  docs/30). Its words held the configuration's own flags only: a foreign build
+  reading it for an ok image (`<arch>-openkal`) had neither the C library's and
+  the C++ runtime's headers nor `__OPENKAL__`, and could not compile
+  `<stdio.h>`. They now end with what every unit receives from beneath it: the
+  platform's layers' include directories and flags, the engine's predefines
+  (`__MCPP_TARGET_<OS>__`, `__OPENKAL__`) and the realised C environment. e2e 994
+  compiles a C and a C++ unit for the target with the contract alone.
+- **A package's Windows launcher builds whichever openkal-platform release the
+  project selects** (SPEC-014 §4.3). The launcher (`bin/<name>.exe`) is mcpp's
+  program, and its `mcpplibs.os` pins one openkal release; it was built over the
+  project's platform, so a platform whose version group names a newer openkal
+  (openkal-platform 0.19.0) gave its graph two openkal releases and `mcpp pack`
+  stopped. It is now built over the platform mcpp's openkal rows pin, the one
+  its `mcpplibs.os` was released against. e2e 995 packs a project that selects
+  openkal-platform 0.19.0 with its Windows launcher.
+
 ## [2026.10.31.1] - 2026-10-31
 
 ### Added
