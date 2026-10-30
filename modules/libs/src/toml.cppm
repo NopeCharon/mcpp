@@ -186,6 +186,75 @@ inline bool is_bare_key_char(char c) {
         || (c >= '0' && c <= '9') || c == '_' || c == '-';
 }
 
+// A Unicode scalar value as UTF-8.
+inline void append_utf8(std::string& out, std::uint32_t cp) {
+    auto byte = [&](std::uint32_t b) { out.push_back(static_cast<char>(b)); };
+    if (cp < 0x80) {
+        byte(cp);
+    } else if (cp < 0x800) {
+        byte(0xC0 | (cp >> 6));
+        byte(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        byte(0xE0 | (cp >> 12));
+        byte(0x80 | ((cp >> 6) & 0x3F));
+        byte(0x80 | (cp & 0x3F));
+    } else {
+        byte(0xF0 | (cp >> 18));
+        byte(0x80 | ((cp >> 12) & 0x3F));
+        byte(0x80 | ((cp >> 6) & 0x3F));
+        byte(0x80 | (cp & 0x3F));
+    }
+}
+
+// The escape after a backslash in a basic string, appended to `out`; the
+// lexer stands on the character after the backslash and is left after the
+// escape. TOML 1.0's set, plus `\0`, which this reader has always accepted.
+// `\uXXXX` and `\UXXXXXXXX` name a Unicode scalar value and are written out
+// as UTF-8; a surrogate or a value above U+10FFFF is not one, and is refused.
+inline std::expected<void, ParseError> read_escape(Lexer& L, std::string& out) {
+    const Position at = L.position();
+    const char esc = L.peek();
+    switch (esc) {
+        case 'b': out.push_back('\b'); break;
+        case 't': out.push_back('\t'); break;
+        case 'n': out.push_back('\n'); break;
+        case 'f': out.push_back('\f'); break;
+        case 'r': out.push_back('\r'); break;
+        case '"': out.push_back('"'); break;
+        case '\\': out.push_back('\\'); break;
+        case '0': out.push_back('\0'); break;
+        case 'u':
+        case 'U': {
+            const std::size_t digits = esc == 'u' ? 4 : 8;
+            std::uint32_t cp = 0;
+            for (std::size_t i = 1; i <= digits; ++i) {
+                const char h = L.peek(i);
+                std::uint32_t d = 0;
+                if      (h >= '0' && h <= '9') d = static_cast<std::uint32_t>(h - '0');
+                else if (h >= 'a' && h <= 'f') d = static_cast<std::uint32_t>(h - 'a' + 10);
+                else if (h >= 'A' && h <= 'F') d = static_cast<std::uint32_t>(h - 'A' + 10);
+                else return std::unexpected(ParseError{
+                    std::format("invalid escape '\\{}': expected {} hex digits", esc, digits),
+                    at});
+                cp = (cp << 4) | d;
+            }
+            if ((cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF)
+                return std::unexpected(ParseError{
+                    std::format("invalid escape '\\{}{}': not a Unicode scalar value",
+                                esc, L.src.substr(L.pos + 1, digits)),
+                    at});
+            append_utf8(out, cp);
+            for (std::size_t i = 0; i < digits; ++i) L.advance();
+            break;
+        }
+        default:
+            return std::unexpected(ParseError{
+                std::format("invalid escape '\\{}'", esc), at});
+    }
+    L.advance();
+    return {};
+}
+
 // """multi-line basic""" / '''multi-line literal''' strings (TOML 1.0).
 // Entered from read_string once it has seen the triple quote. A newline
 // immediately after the opening delimiter is trimmed (spec); basic form
@@ -221,19 +290,7 @@ inline std::expected<std::string, ParseError> read_multiline_string(Lexer& L, ch
                 continue;
             }
             L.advance();
-            char esc = L.peek();
-            switch (esc) {
-                case 'n': out.push_back('\n'); break;
-                case 't': out.push_back('\t'); break;
-                case 'r': out.push_back('\r'); break;
-                case '"': out.push_back('"'); break;
-                case '\\': out.push_back('\\'); break;
-                case '0': out.push_back('\0'); break;
-                default:
-                    return std::unexpected(ParseError{
-                        std::format("invalid escape '\\{}'", esc), L.position()});
-            }
-            L.advance();
+            if (auto e = read_escape(L, out); !e) return std::unexpected(e.error());
             continue;
         }
         out.push_back(c);
@@ -256,19 +313,7 @@ inline std::expected<std::string, ParseError> read_string(Lexer& L) {
         char c = L.peek();
         if (c == '\\' && quote == '"') {
             L.advance();
-            char esc = L.peek();
-            switch (esc) {
-                case 'n': out.push_back('\n'); break;
-                case 't': out.push_back('\t'); break;
-                case 'r': out.push_back('\r'); break;
-                case '"': out.push_back('"'); break;
-                case '\\': out.push_back('\\'); break;
-                case '0': out.push_back('\0'); break;
-                default:
-                    return std::unexpected(ParseError{
-                        std::format("invalid escape '\\{}'", esc), L.position()});
-            }
-            L.advance();
+            if (auto e = read_escape(L, out); !e) return std::unexpected(e.error());
         } else if (c == '\n') {
             return std::unexpected(ParseError{"unterminated string", L.position()});
         } else {
