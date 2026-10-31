@@ -32,6 +32,15 @@ std::expected<std::string, DetectError> run_capture(const std::vector<std::strin
                                                     const mcpp::run::Env& env = {},
                                                     bool withErrors = false);
 
+// Whether a build with this compiler can write compressed debug sections
+// (`-gz=zlib`): the linker its driver runs must read them. An `ld.lld` built
+// without zlib refuses `--compress-debug-sections` while clang says nothing
+// (measured on windows-2022, where the xim LLVM 23.1.3 has no ld.lld and its
+// driver runs the image's own); a GCC configured without support refuses `-gz`.
+// An LLVM toolchain is asked by one real link, a GCC by its driver (`-###`);
+// the answer is kept (design 2026-10-31 §4.1).
+bool compresses_debug_sections(const std::filesystem::path& compiler, const mcpp::run::Env& env = {});
+
 std::string extract_version(std::string_view s);
 std::string first_line_of(std::string_view s);
 std::string lower_copy(std::string_view s);
@@ -157,6 +166,81 @@ std::filesystem::path probe_cache_file(const std::string& key) {
     return mcpp::home::root() / "cache" / "probe" / (mcpp::toolchain::hash_string(key) + ".out");
 }
 }  // namespace
+
+bool compresses_debug_sections(const std::filesystem::path& compiler, const mcpp::run::Env& env) {
+    // An LLVM toolchain's ELF link is lld's, and lld is what refuses the
+    // option without zlib -- clang does not even warn. Asked by one real link:
+    // an empty unit with debug information, compiled for an ELF target and
+    // linked compressed. The answer, either way, is kept beside the probe cache
+    // under the identity of that lld (its path, size and time).
+    if (compiler.filename().string().find("clang") != std::string::npos) {
+        // The linker the driver runs for an ELF target, found the way it finds
+        // it (`-print-prog-name`): the Windows-hosted LLVM 23.1.3 has no ld.lld
+        // of its own, and its driver runs the one on PATH -- on a CI image,
+        // another LLVM's, built without zlib.
+        std::filesystem::path lld;
+        if (auto r = run_capture({compiler.string(), "-print-prog-name=ld.lld"}, env)) {
+            const auto named = std::filesystem::path(trim_line(first_line_of(*r)));
+            std::error_code fec;
+            if (named.is_absolute() && std::filesystem::exists(named, fec)) lld = named;
+        }
+        if (lld.empty()) return false;   // no ELF linker to compress with
+        {
+            const auto name = lld.filename().string();
+            std::error_code lec;
+            const auto work = mcpp::home::root() / "cache" / "probe" / "debug-compression";
+            const auto identity = std::format("{}|{}|{}", lld.generic_string(),
+                std::filesystem::file_size(lld, lec),
+                std::filesystem::last_write_time(lld, lec).time_since_epoch().count());
+            const auto answer = work / (mcpp::toolchain::hash_string(identity) + ".answer");
+            if (std::ifstream in(answer); in) {
+                std::string v;
+                in >> v;
+                if (v == "yes" || v == "no") return v == "yes";
+            }
+            std::filesystem::create_directories(work, lec);
+            const auto src = work / "empty.c";
+            if (!std::filesystem::exists(src, lec)) std::ofstream(src, std::ios::binary).flush();
+            const auto obj = work / "empty.o";
+            const auto out = work / "empty.so";
+            auto compiled = mcpp::run::execute(
+                {compiler.string(), "--target=x86_64-unknown-linux-gnu", "-g", "-c", "-x", "c",
+                 src.string(), "-o", obj.string()},
+                {.env = env, .host_tool = true, .streams = mcpp::run::Streams::merged,
+                 .report_spawn_failure = false});
+            if (compiled.exit_code != 0) return false;   // not asked; nothing kept
+            std::vector<std::string> link{lld.string()};
+            if (name.starts_with("lld")) { link.push_back("-flavor"); link.push_back("gnu"); }
+            for (auto const& a : {std::string("--compress-debug-sections=zlib"), std::string("-shared"),
+                                  obj.string(), std::string("-o"), out.string()})
+                link.push_back(a);
+            auto linked = mcpp::run::execute(link, {.env = env, .host_tool = true,
+                                                    .streams = mcpp::run::Streams::merged,
+                                                    .report_spawn_failure = false});
+            const bool yes = linked.exit_code == 0;
+            mcpp::log::verbose("toolchain", std::format("{} writes compressed debug sections: {}{}",
+                               lld.string(), yes ? "yes" : "no",
+                               yes ? std::string{} : " (" + first_line_of(linked.output) + ")"));
+            if (mcpp::effects::writes_global_cache()) std::ofstream(answer) << (yes ? "yes\n" : "no\n");
+            return yes;
+        }
+    }
+    // An empty C file the driver may name: `-###` reads no input, but a driver
+    // checks that it exists.
+    const auto empty = mcpp::home::root() / "cache" / "probe" / "empty.c";
+    std::error_code ec;
+    if (!std::filesystem::exists(empty, ec)) {
+        std::filesystem::create_directories(empty.parent_path(), ec);
+        std::ofstream(empty, std::ios::binary).flush();
+    }
+    auto r = run_capture({compiler.string(), "-gz=zlib", "-###", "-c", "-x", "c",
+                          empty.string(), "-o", (empty.parent_path() / "empty.o").string()},
+                         env, /*withErrors=*/true);
+    if (!r) return false;
+    return r->find("cannot compress debug sections") == std::string::npos
+        && r->find("-gz is not supported") == std::string::npos
+        && r->find("unsupported option '-gz") == std::string::npos;
+}
 
 std::expected<std::string, DetectError> run_capture(const std::vector<std::string>& argv,
                                                     const mcpp::run::Env& env, bool withErrors) {
